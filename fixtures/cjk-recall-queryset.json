@@ -1,0 +1,7 @@
+[
+  {"q": "visibleReplies", "lang": "en", "ground_truth_token": "visibleReplies", "min_hits": 1},
+  {"q": "turnCompletionIdleTimeoutMs", "lang": "en", "ground_truth_token": "turnCompletionIdleTimeoutMs", "min_hits": 1},
+  {"q": "蒸馏桥", "lang": "zh", "ground_truth_token": "蒸馏桥", "min_hits": 1},
+  {"q": "共享记忆层", "lang": "zh", "ground_truth_token": "共享记忆层", "min_hits": 1},
+  {"q": "Portola", "lang": "en", "ground_truth_token": "Portola", "min_hits": 1}
+]
