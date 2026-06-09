@@ -1,0 +1,2 @@
+gbrain 0.42.37.0 (bun install -g github:garrytan/gbrain)
+PGLite 沙盒模式 + --no-embedding（M0 只验结构；嵌入是 M1）
