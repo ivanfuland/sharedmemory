@@ -1,0 +1,15 @@
+{
+  "api_style": "text-cli",
+  "note": "gbrain 0.42.37 CLI 文本优先：put 收 stdin markdown；get/search/timeline 输出文本（--json 多被忽略）；backlinks --json 输出 JSON。契约测试解析文本。",
+  "cmd": {
+    "put": "put", "get": "get", "timeline_add": "timeline-add",
+    "timeline": "timeline", "search": "search", "link": "link",
+    "backlinks": "backlinks"
+  },
+  "timeline_native_dedup": true,
+  "key_retrieval": "timeline-text-scan",
+  "stale_marker": "(stale)",
+  "stale_note": "原生 stale 标记出现在 search 文本行尾；由 dream 周期清除。M0 沙盒无法同步强制 stale 正例（需 dream/桥真实写入），M3 验证；M0 验标记可解析 + 干净页非 stale。",
+  "search_line_regex": "^\\[(?P<score>[-0-9.]+)\\]\\s+(?P<slug>\\S+)\\s+--\\s+(?P<snippet>.*?)(?P<stale>\\s+\\(stale\\))?$",
+  "provenance_via": "put --source-kind/--source-uri/--ingested-via（timeline-add 无 source；来源编码进 text 或页 frontmatter）"
+}
