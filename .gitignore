@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# 沙盒运行产物（可重建，不进 git）
+sandbox/
+*.db-wal
+*.db-shm
+# 探测到的真实数据快照（可能含隐私，绝不进 git）
+fixtures/real-snapshots/
