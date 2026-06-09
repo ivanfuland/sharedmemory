@@ -19,3 +19,8 @@
 - 噪声/来源过滤用 `agents.slug`（claude_code/codex/openclaw/*）
 - workspace 可空（~0.05%），桥须容忍
 - canonical DB ~1.2GB，frankensqlite 写、标准 sqlite3 只读兼容
+
+## 读腿/写腿（Task 7）
+- 读腿：canonical JOIN read_sql 可执行，必需字段非空 ✓
+- 写腿：gbrain timeline-add reconcile 幂等（原生去重）✓
+- 守门：test_exactly_one_read_path_active 确认恰 canonical 成立
