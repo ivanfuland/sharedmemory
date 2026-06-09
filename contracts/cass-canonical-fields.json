@@ -1,0 +1,9 @@
+{
+  "data_dir": "/home/ivan/.local/share/coding-agent-search",
+  "canon_db": "/home/ivan/.local/share/coding-agent-search/agent_search.db",
+  "msg_table": "messages",
+  "cursor_col": "id",
+  "read_sql": "SELECT m.id AS cursor, m.role AS role, m.content AS content, m.created_at AS timestamp, a.slug AS agent, COALESCE(w.path,'') AS workspace, c.id AS session, c.source_path || ':' || m.idx AS provenance FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN agents a ON a.id=c.agent_id LEFT JOIN workspaces w ON w.id=c.workspace_id",
+  "required_aliases": ["role", "content", "timestamp", "agent", "session", "provenance"],
+  "nullable_note": "workspace 可空（~0.05% conversation 无 workspace_id），故不入 required_aliases；蒸馏桥过滤时容忍 workspace 空"
+}
