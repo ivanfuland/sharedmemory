@@ -31,3 +31,26 @@
 ## 契约测试调整方向
 plan 的 6 类按真实 API 重写：put(stdin md)/get(md)/timeline-add(位置参)/timeline/search(body)/backlinks/serve--http(OAuth)。
 stale 用原生 `(stale)` 标记；dedup 用 timeline 原生去重 + timeline 文本扫描；class5 走 serve --http OAuth。
+
+## serve --http 真实鉴权（Task 5 实测）
+- OAuth 2.1：`/.well-known/oauth-authorization-server` 暴露 `/authorize` `/token`，PKCE S256
+- admin bootstrap token 打到 stdout（64-hex），`/admin` UI 登录
+- **无 `gbrain auth` CLI**——scoped client 经 /admin UI 或 `--enable-dcr`（DCR 默认关）
+- 核心安全属性已验：`POST /mcp` 无 token / bogus token → **401**（鉴权 HTTP 层强制）
+- **细粒度 scope/source 负例（read-only 写拒 / bridge 越权 source 拒）依赖 OAuth client provisioning → 归 M2**（三端 scoped client 实际接入时验）
+
+## 中文 wikilink（Task 5 实测，spec §5 P0 出口④ 通过）
+- 中文 slug 页可建；body `[[中文slug]]` 自动抽成 backlink（link_type=mentions, source=markdown）
+- 显式 `gbrain link <from> <to>` → link_type=involves, source=manual
+- `backlinks <slug> --json` 返回结构化 directional 数组 `[{from_slug,to_slug,link_type,...}]`
+- 结论：**中文 wikilink 原生可用，无需拼音 slug 降级**
+
+## 六类契约 M0 落地状态
+| 类 | 真实 API 验证 | M0 测试 |
+| --- | --- | --- |
+| 1 成功 | put(stdin md)+timeline-add+get+timeline | ✓ |
+| 2 key 回查 | timeline 文本扫描（search 不索引 timeline） | ✓ |
+| 3 幂等 | timeline-add 原生去重 | ✓ |
+| 4 冲突 | 两条独立 timeline 并存 | ✓ |
+| 5 权限 | serve --http OAuth，HTTP 层鉴权强制 401 | ✓（scope 细粒度→M2） |
+| 6 stale | 原生 (stale) 标记可解析 + 干净页控制组 | ✓（同步强制正例→M3 dream） |
