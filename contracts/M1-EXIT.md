@@ -26,9 +26,10 @@ infra/gbrain/gbrain-pg-up.sh                        # init（幂等：config.jso
 - **GBrain Postgres 只需 vector+pg_trgm+pgcrypto，无 zhparser**（schema.sql:3-6）→ stock pgvector 镜像即可，无自建 Dockerfile。
 
 ## 基准数字（`config/m1-benchmarks.json`，corpus span 8.0d / 300 样本）
-- 嵌入吞吐（LiteLLM/text-embedding-3-small）：best **batch 64 → 12.8 embeds/s**（p95 5.59s/batch）；batch 32 → 9.5；
-- 蒸馏延迟（gpt-5.4-mini）：conc1 p95 **1.73s**，conc2 p95 3.63s（抖动），conc4 p95 2.16s；error_rate 全 0
-- **derived_config**（M3 消费）：`embed_batch_size=64`、`distill_concurrency=1`（保守：conc2 p95 略超 2×conc1 阈值）、`distill_timeout_s=90`
+- 嵌入吞吐（LiteLLM/text-embedding-3-small）：best **batch 64 → 13.3 embeds/s**（p95 5.03s/batch）；batch 32 → 8.9；batch 16 → 6.6
+- 蒸馏延迟（gpt-5.4-mini）：conc1 p95 **2.17s**，conc2 p95 8.62s（抖动），conc4 p95 3.79s；error_rate 全 0
+- **derived_config**（M3 消费）：`embed_batch_size=64`、`distill_concurrency=1`（保守：conc2 p95 8.62s 超 2×conc1 阈值）、`distill_timeout_s=90`
+> 注：云端延迟有抖动，数字随跑波动（如 conc2 p95 在 3.6~8.6s 间）；以 `config/m1-benchmarks.json` 当前值为准。
 - 注：「完整夜批 ≤2h」时间门 M3 真桥验（M1 仅延迟 probe + 参数）
 
 ## 对 M3 的修正（执行时实测发现）
