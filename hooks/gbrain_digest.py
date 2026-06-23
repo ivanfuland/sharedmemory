@@ -24,7 +24,14 @@ _STALE = re.compile(r"^\[[0-9.]+\]\s+\S+\s+\(stale\)")
 
 
 def _load_threshold() -> float:
-    """从 config/m2-thresholds.json 读 query_threshold，缺失则用保守默认。"""
+    """阈值解析优先级：GBRAIN_DIGEST_THRESHOLD 环境变量 > config/m2-thresholds.json > DEFAULT_THRESHOLD。
+    GBRAIN_DIGEST_THRESHOLD 用于调优/测试（如一致性测试置 0.0 确保种子页必中）；生产环境不设。"""
+    env_val = os.environ.get("GBRAIN_DIGEST_THRESHOLD")
+    if env_val is not None:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass  # 畸形值跌入下一层
     try:
         here = os.path.dirname(__file__)
         cfg = os.path.join(here, "..", "config", "m2-thresholds.json")
