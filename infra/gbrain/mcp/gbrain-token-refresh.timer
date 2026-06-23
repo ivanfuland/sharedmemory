@@ -1,0 +1,23 @@
+# gbrain-token-refresh.timer — daily slow rotation for gbrain MCP tokens
+#
+# ★ DEFERRED ACTIVATION — DO NOT INSTALL THIS UNIT AUTOMATICALLY ★
+# Installation command (run manually in a terminal):
+#   cp ~/.../gbrain-token-refresh.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now gbrain-token-refresh.timer
+#
+# Rationale: token_ttl=30d means no mid-session 401. Daily rotation ensures
+#   the on-disk token is always fresh (< 1 day old, ~30 days TTL remaining).
+#   Next CC session startup reads the freshly written .mcp.json token.
+
+[Unit]
+Description=Refresh gbrain MCP tokens daily (token_ttl=30d, slow rotation)
+
+[Timer]
+# Run 2 min after boot (covers cases where daily window was missed during downtime)
+OnBootSec=2min
+# Then run every 24h from the last activation
+OnUnitActiveSec=24h
+
+[Install]
+WantedBy=timers.target
