@@ -54,18 +54,17 @@ M2 Task3 产物：共享 builder + 三端 adapter，hub 本地 gbrain CLI 读路
 
 **语义动作**：在 Codex 会话启动时注入记忆层相关结论。
 
-**宿主契约**（probed 2026-06-23）：
+**宿主契约**（probed 2026-06-23，Task6 实证修正）：
 - `~/.codex/hooks.json` **不存在**，Codex 无内置 hook 系统。
-- Codex 通过 `~/.codex/AGENTS.md`（及项目级 AGENTS.md）在会话启动时注入上下文。
-- `~/.codex/memories/` 目录存在，adapter 将 digest 写入 `memories/gbrain-digest.md`（Codex 启动时自动加载该目录下 `.md` 文件）。
-- 输出格式为 Markdown 纯文本（非 JSON），由 Codex 运行时拼入 system context。
+- **`~/.codex/memories/` 不会自动加载**（Task6 投资证实测）；Codex 在会话启动时自动加载的是 **`~/.codex/AGENTS.md`**（`user_instructions`，经 AgentsMdManager）。
+- 故 adapter **向 `~/.codex/AGENTS.md` 顶部 prepend** `<!-- gbrain-digest:begin -->`…`<!-- gbrain-digest:end -->` 包裹的 digest 块（幂等，首次备份 `.bak`，同 OpenClaw 方案）。目标文件可由 `CODEX_AGENTS_FILE` env 覆盖（测试用）。
+- 输出由 Codex 运行时作为 user_instructions 拼入；只在会话启动那一刻读取，内容靠定时刷新（非每会话实时查询）。
 
-**Task6 接线位置**：
-1. 验证 `~/.codex/memories/` 自动注入行为是否符合预期。
-2. 若不支持，改为在 `~/.codex/AGENTS.md` 顶部添加 `<!-- gbrain-digest:begin -->` 块（同 OpenClaw 方案）。
-3. 或通过 Codex config 注册 startup script（若后续版本支持）。
+**Task6 接线位置（live 激活延后，见 `contracts/M2-EXIT.md` 激活清单）**：
+1. 由刷新机制（如每日 timer）跑 `codex_sessionstart.sh` 把最新 digest prepend 进 `~/.codex/AGENTS.md`。
+2. Codex 下次会话启动自动读取该文件。
 
-**回滚**：删除 `~/.codex/memories/gbrain-digest.md` 即可。
+**回滚**：删除 `~/.codex/AGENTS.md` 中 `<!-- gbrain-digest:begin -->` 到 `<!-- gbrain-digest:end -->` 的块，或用 `.bak` 恢复。
 
 ---
 
