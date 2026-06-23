@@ -1,6 +1,6 @@
 services:
   pg-memory:
-    image: pgvector/pgvector:pg17        # stock，pgvector 内置；pg_trgm/pgcrypto 是 contrib 自带
+    image: pgvector/pgvector:pg17@sha256:be400b50812ab2cc908ed78593fda2e51e3b45fe774fa637f1c7b16e68531d95   # stock pgvector，digest 锁版本（pg_trgm/pgcrypto contrib 自带）
     container_name: pg-memory
     restart: unless-stopped
     ports: ["127.0.0.1:5433:5432"]       # 仅 localhost

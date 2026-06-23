@@ -19,10 +19,12 @@ SCHEMA = {
 }
 
 def _validate(d):
-    assert isinstance(d, dict) and set(d) >= {"entities", "facts"}
+    # 精确 key 匹配 = 验 schema 的 additionalProperties:false（>= 会放过 provider 没真守 strict 的额外字段）
+    assert isinstance(d, dict) and set(d) == {"entities", "facts"}, f"顶层非 strict（有额外字段?）: {set(d)}"
     assert isinstance(d["entities"], list) and isinstance(d["facts"], list)
     for e in d["entities"]:
-        assert isinstance(e, dict) and isinstance(e.get("name"), str) and isinstance(e.get("kind"), str)
+        assert isinstance(e, dict) and set(e) == {"name", "kind"}, f"entity 非 strict: {e}"
+        assert isinstance(e["name"], str) and isinstance(e["kind"], str)
     for f in d["facts"]:
         assert isinstance(f, str)
     return d

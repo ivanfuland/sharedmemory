@@ -16,6 +16,9 @@ def test_gbrain_required_extensions_creatable():
     assert {"vector", "pg_trgm", "pgcrypto"} <= set(have), f"缺扩展: {have}"
 
 def test_pgvector_1536_column():
-    _q("CREATE TABLE IF NOT EXISTS _m1_probe(v vector(1536));")   # 对齐 text-embedding-3-small
-    assert _q("SELECT '[1,2,3]'::vector;") == "[1,2,3]"
+    _q("DROP TABLE IF EXISTS _m1_probe;")                         # 防旧表残留绕过维度验证
+    _q("CREATE TABLE _m1_probe(v vector(1536));")                 # 对齐 text-embedding-3-small
+    vec = "[" + ",".join(["0.1"] * 1536) + "]"
+    _q(f"INSERT INTO _m1_probe(v) VALUES ('{vec}');")             # 真插 1536 维 → 列宽不符会报错
+    assert _q("SELECT vector_dims(v) FROM _m1_probe LIMIT 1;") == "1536"
     _q("DROP TABLE _m1_probe;")

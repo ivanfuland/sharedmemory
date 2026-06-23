@@ -35,6 +35,7 @@ def _embed(texts):
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {EMBED_KEY}"})
     with urllib.request.urlopen(req, timeout=120) as r:
         data = json.load(r)["data"]
+    assert len(data) == len(texts), f"返回 {len(data)} != 输入 {len(texts)}（部分返回 → 吞吐虚高）"
     assert all(len(d["embedding"]) == 1536 for d in data), "嵌入维度 != 1536（LiteLLM 没透传 dimensions？）"
     return [d["embedding"] for d in data]
 
@@ -74,8 +75,11 @@ def bench_distill():
     return out
 
 def pick_distill_concurrency(dis):
+    # conc1 自身就有错误 → 无安全并发，不伪装成可用配置（codex PR review P1）
+    if dis["conc1"]["error_rate"] > 0:
+        return 1, f"⚠无安全并发：conc1 error_rate={dis['conc1']['error_rate']}（M3 须查云端/降并发）"
     base = dis["conc1"]["p95_s"] or 0.0
-    best, reason = 1, f"默认 conc1（p95={base}s）"
+    best, reason = 1, f"conc1（error_rate=0, p95={base}s）"
     for conc in (2, 4):
         d = dis[f"conc{conc}"]
         if d["error_rate"] == 0 and (base == 0 or d["p95_s"] <= 2 * base):

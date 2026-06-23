@@ -1,4 +1,4 @@
-import json, os, pathlib, re, subprocess
+import json, os, pathlib, re, subprocess, uuid
 import pytest
 
 GH = os.environ.get("GBRAIN_HOME")
@@ -28,14 +28,19 @@ def test_config_dims_and_route():
         f"嵌入须走 openrouter recipe 才路由 LiteLLM: {cfg.get('embedding_model')}"
 
 def test_embed_roundtrip_proves_vector_path():
-    """★硬门 = gbrain embed 的 fail-loud（embed.ts/gateway.ts：endpoint/key 错 → exit 1；
-    维度 != 1536 → 插 vector(1536) 报错 → exit 1）。put/embed 链路 rc==0 = 经 LiteLLM 嵌入真通
-    （openrouter recipe 唯一端点=OPENROUTER_BASE_URL=LiteLLM，无官网旁路 → 成功即证流量过 LiteLLM）。
-    加无关 distractor，零字符重叠语义 query 经 query --no-expand 应把【光合作用】排第一
-    （命中只能来自向量；distractor 排不过 = 排除退化向量）。FAIL 则停手查 LiteLLM 路由/key，不强推。"""
-    slug = "topics/光合作用"
-    _gb("put", slug, stdin="# 光合作用\n绿叶在阳光下把二氧化碳转化为糖分。\n")
-    _gb("put", "topics/股票交易", stdin="# 股票交易\n证券市场买卖股票赚取价差收益\n")   # 无关 distractor，正文零字符重叠
-    _gb("embed", slug); _gb("embed", "topics/股票交易")   # rc==0 即证真往返（fail-loud）
-    hit = _slugs(_gb("query", "--no-expand", "植物如何制造养料"))   # 与两页正文均零字符重叠
-    assert hit and hit[0] == slug, f"语义最近页应排第一（向量没通/退化？）: {hit!r}"
+    """★硬门：**唯一 slug**（uuid）确保每跑都是新页 → `gbrain put` 必发起真嵌入（put 自动 embed）。
+    端点/key 坏时：put 走 noEmbed（无向量），随后 `gbrain embed` 强制嵌入并 fail-loud(exit 1) → 测试炸；
+    即便绕过，零字符重叠 query（--no-expand，词法无从命中）也找不到该页 → hit[0]!=slug → 测试炸。
+    固定 slug 会 fake-green（重跑时 put 无内容变更 no-op、旧向量仍在；codex PR review P0 实证）。
+    distractor + 语义 query 把【光合作用】排第一 = 向量召回正确（排除退化向量）。用完 delete 清理。"""
+    uid = uuid.uuid4().hex[:8]
+    slug, dist = f"topics/光合作用-{uid}", f"topics/股票交易-{uid}"
+    try:
+        _gb("put", slug, stdin="# 光合作用\n绿叶在阳光下把二氧化碳转化为糖分。\n")   # put 自动嵌入（真打 LiteLLM）
+        _gb("put", dist, stdin="# 股票交易\n证券市场买卖股票赚取价差收益\n")   # 无关 distractor，零字符重叠
+        _gb("embed", slug); _gb("embed", dist)         # 端点坏时（put noEmbed）这里强制嵌入并 fail-loud
+        hit = _slugs(_gb("query", "--no-expand", "植物如何制造养料"))   # 与两页正文均零字符重叠
+        assert hit and hit[0] == slug, f"语义最近页应排第一（向量没通/退化？）: {hit!r}"
+    finally:
+        for s in (slug, dist):
+            subprocess.run(["gbrain", "delete", s], capture_output=True, text=True, env={**os.environ})
