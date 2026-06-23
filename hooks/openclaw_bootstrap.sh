@@ -9,11 +9,11 @@
 #                  ~/.openclaw/agents/<name>/agent/codex-home/AGENTS.md 有专属 AGENTS.md）。
 #                  本 adapter 向 agent 的 AGENTS.md 头部 prepend digest 段落（幂等：先清旧注入块）。
 #                  目标 agent 由 $OPENCLAW_AGENT 环境变量指定（缺省 main）。
-#                  Task6 将接线到 OpenClaw 的 agent 启动流程（例如 `openclaw config set` 注册
-#                  startup_script，或 AGENTS.md @import 方式），并按真实机制调整注入路径。
+#                  目标文件默认 ~/.openclaw/agents/$OPENCLAW_AGENT/agent/codex-home/AGENTS.md，
+#                  可由 $OPENCLAW_AGENTS_FILE 覆盖（测试时指向 temp 文件，生产时缺省不变）。
 # Fallback       : 任何错误 → 在 stdout 输出一行状态 "[记忆层] <状态>"，不修改任何文件，exit 0。
 #
-# NOTE: 该 adapter 修改 AGENTS.md 前会备份原文件（.gbrain-digest.bak），Task6 接线验证后可移除备份。
+# NOTE: 该 adapter 修改 AGENTS.md 前会备份原文件（.gbrain-digest.bak），幂等：仅首次写 bak。
 
 set +e
 
@@ -39,7 +39,8 @@ DIGEST_JSON="$(
 )" || DIGEST_JSON=""
 
 # 注入到 agent 的 codex-home/AGENTS.md（fail-soft）
-python3 - "$DIGEST_JSON" "$AGENT" <<'PY'
+# 目标文件：$OPENCLAW_AGENTS_FILE（测试覆盖） 或默认 ~/.openclaw/agents/$AGENT/agent/codex-home/AGENTS.md
+python3 - "$DIGEST_JSON" "$AGENT" "${OPENCLAW_AGENTS_FILE:-}" <<'PY'
 import json, os, sys
 
 try:
@@ -49,6 +50,12 @@ except Exception:
     d = {}
 
 agent = sys.argv[2] if len(sys.argv) > 2 else "main"
+# 目标文件：argv[3] 覆盖（测试用）或默认 ~/.openclaw/agents/$agent/agent/codex-home/AGENTS.md
+agents_file_override = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else ""
+agents_md = agents_file_override if agents_file_override else os.path.expanduser(
+    f"~/.openclaw/agents/{agent}/agent/codex-home/AGENTS.md"
+)
+
 ctx = d.get("context") or ""
 status = d.get("status") or "记忆层：不可用（hook 兜底）"
 content = ctx if ctx else f"[记忆层] {status}"
@@ -56,10 +63,6 @@ content = ctx if ctx else f"[记忆层] {status}"
 INJECT_BEGIN = "<!-- gbrain-digest:begin -->"
 INJECT_END   = "<!-- gbrain-digest:end -->"
 inject_block = f"{INJECT_BEGIN}\n{content}\n{INJECT_END}\n\n"
-
-agents_md = os.path.expanduser(
-    f"~/.openclaw/agents/{agent}/agent/codex-home/AGENTS.md"
-)
 
 try:
     if os.path.isfile(agents_md):
