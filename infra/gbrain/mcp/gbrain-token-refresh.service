@@ -1,0 +1,29 @@
+# gbrain-token-refresh.service — 慢轮转：每日重换 token + 重写宿主 MCP 配置
+#
+# ★ DEFERRED ACTIVATION — DO NOT INSTALL THIS UNIT AUTOMATICALLY ★
+# Installation command (run manually in a terminal):
+#   cp ~/.../gbrain-token-refresh.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now gbrain-token-refresh.timer
+#
+# Design: token_ttl=30d → live sessions never see mid-session 401.
+#   Timer re-mints daily so the on-disk token stays fresh (<1d old, ~30d TTL remaining).
+#   CC: connect-cc.sh re-mints + `gbrain connect --install` rewrites .mcp.json
+#     (next session startup picks the fresh token).
+#   codex/openclaw: token-refresh.sh刷 token 文件；各自 connect 脚本接线后追加同形
+#     ExecStart（见 tailnet-serve.md "扩展接线" 段）。
+
+[Unit]
+Description=Rotate gbrain MCP tokens + rewrite host MCP config (daily slow rotation)
+After=network.target
+
+[Service]
+Type=oneshot
+# CC: re-mint + gbrain connect --install → rewrites ~/.claude/.mcp.json
+ExecStart=%h/projects/sharedmemory/infra/gbrain/mcp/connect-cc.sh
+# codex: re-mint token file (add connect-codex.sh ExecStart here after wiring)
+ExecStart=%h/projects/sharedmemory/infra/gbrain/mcp/token-refresh.sh HUB_CODEX
+# openclaw: re-mint token file (add connect-openclaw.sh ExecStart here after wiring)
+ExecStart=%h/projects/sharedmemory/infra/gbrain/mcp/token-refresh.sh HUB_OPENCLAW
+StandardOutput=journal
+StandardError=journal
