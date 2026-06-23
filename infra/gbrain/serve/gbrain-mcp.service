@@ -1,0 +1,20 @@
+[Unit]
+Description=GBrain HTTP MCP server (shared memory layer M2)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GBRAIN_HOME=%h/projects/sharedmemory/sandbox/gbrain-pg
+# 用 install 脚本 bash-source 后再生成的 systemd-safe env（已剥行内注释/引号），不直接 EnvironmentFile 原始 config.env
+# systemd EnvironmentFile 不做 shell source 语义（行内 # 注释、引号、export 前缀都会解析异常）
+EnvironmentFile=%h/projects/sharedmemory/infra/gbrain/serve/env.generated
+ExecStart=%h/.bun/bin/gbrain serve --http --port 7777 --token-ttl 3600 --suppress-bootstrap-token
+Restart=on-failure
+RestartSec=3
+# 端口/进程清理：SIGINT 优雅退出（与测试 fixture 一致）
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
