@@ -1,0 +1,93 @@
+{
+  "query_threshold": 0.75,
+  "max_inject_tokens": 1500,
+  "status": "uncalibrated_default",
+  "method": "内容不足（n_pos=0<5 或 max_tp=0=0）→ 退保守默认 0.75，不称已标定；P4 内容灌入后重跑",
+  "labeled_n": 30,
+  "positive_labels": 0,
+  "max_tp": 0,
+  "calibrated_against": "M2-seed-corpus",
+  "recalibrate_after": "P4",
+  "sweep": [
+    {
+      "threshold": 0.5,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.55,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.6,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.65,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.7,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.75,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.8,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.85,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.9,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "threshold": 0.95,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    }
+  ]
+}
