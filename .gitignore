@@ -8,3 +8,9 @@ sandbox/
 *.db-shm
 # 探测到的真实数据快照（可能含隐私，绝不进 git）
 fixtures/real-snapshots/
+# M1 secrets（密码/API key，绝不进 git）
+infra/pg-memory/.env
+infra/gbrain/config.env
+infra/distill/config.env
+infra/distill/audit.log
+sandbox/gbrain-pg/

@@ -1,0 +1,15 @@
+services:
+  pg-memory:
+    image: pgvector/pgvector:pg17        # stock，pgvector 内置；pg_trgm/pgcrypto 是 contrib 自带
+    container_name: pg-memory
+    restart: unless-stopped
+    ports: ["127.0.0.1:5433:5432"]       # 仅 localhost
+    env_file: .env
+    environment:
+      POSTGRES_DB: gbrain
+      POSTGRES_USER: gbrain              # 默认 superuser，GBrain init 可 CREATE EXTENSION
+    volumes:
+      - pgmem-data:/var/lib/postgresql/data
+    shm_size: 256mb
+volumes:
+  pgmem-data:
