@@ -1,0 +1,72 @@
+{
+  "corpus_span_days": 8.0,
+  "embedding": {
+    "batch": 64,
+    "n": 300,
+    "samples": 5,
+    "warmup": 1,
+    "embeds_per_s": 12.8,
+    "p50_batch_s": 4.7887,
+    "p95_batch_s": 5.5945,
+    "dim": 1536,
+    "provider": "litellm/text-embedding-3-small",
+    "sweep": [
+      {
+        "batch": 16,
+        "n": 300,
+        "samples": 19,
+        "warmup": 1,
+        "embeds_per_s": 6.9,
+        "p50_batch_s": 2.2406,
+        "p95_batch_s": 2.803
+      },
+      {
+        "batch": 32,
+        "n": 300,
+        "samples": 10,
+        "warmup": 1,
+        "embeds_per_s": 9.5,
+        "p50_batch_s": 3.0666,
+        "p95_batch_s": 4.239
+      },
+      {
+        "batch": 64,
+        "n": 300,
+        "samples": 5,
+        "warmup": 1,
+        "embeds_per_s": 12.8,
+        "p50_batch_s": 4.7887,
+        "p95_batch_s": 5.5945
+      }
+    ]
+  },
+  "distill": {
+    "conc1": {
+      "samples": 4,
+      "errors": 0,
+      "error_rate": 0.0,
+      "p50_s": 1.6889,
+      "p95_s": 1.728
+    },
+    "conc2": {
+      "samples": 8,
+      "errors": 0,
+      "error_rate": 0.0,
+      "p50_s": 1.8064,
+      "p95_s": 3.631
+    },
+    "conc4": {
+      "samples": 16,
+      "errors": 0,
+      "error_rate": 0.0,
+      "p50_s": 1.8471,
+      "p95_s": 2.1642
+    }
+  },
+  "derived_config": {
+    "embed_batch_size": 64,
+    "distill_concurrency": 1,
+    "distill_concurrency_reason": "止于 conc1（conc2 error_rate=0.0/p95=3.631s 超阈）",
+    "distill_timeout_s": 90
+  }
+}
