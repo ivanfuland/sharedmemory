@@ -16,3 +16,5 @@ infra/distill/config.env
 infra/distill/audit.log
 sandbox/gbrain-pg/
 .superpowers/
+# M2 Task2 generated env（bash-sourced clean re-emit，含 secret，绝不进 git）
+infra/gbrain/serve/env.generated
