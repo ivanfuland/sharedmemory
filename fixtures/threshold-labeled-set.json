@@ -1,0 +1,185 @@
+{
+  "note": "≥30 条 workspace 相关查询 + 人工标注 relevant slugs。M2 保守初值用；P4 内容灌入后重标重跑。Brain 当前只含 M1 测试页（约 14 条 contract/张三/共享记忆层 噪声页），真实 workspace 内容尚未灌入，故几乎所有 relevant 列表合理为空（irrelevant_ok=true）——这是诚实标注，不是标注缺失。",
+  "queries": [
+    {
+      "q": "共享记忆层 架构 决策",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "M2 spec 核心；brain 无对应实质页"
+    },
+    {
+      "q": "渲染管线 高帧率 优化",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Ivan 核心技术方向；brain 无对应页"
+    },
+    {
+      "q": "LFT 量化交易 回测 Qlib",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "LFT 副轴；brain 无对应页"
+    },
+    {
+      "q": "Portola 小星球 Flutter Unity",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Portola 项目；brain 无对应页"
+    },
+    {
+      "q": "OpenClaw 升级 运维 doctor",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "OpenClaw 运维；brain 无对应页"
+    },
+    {
+      "q": "决策方法论 约束优先 系统设计",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Ivan 决策操作系统；brain 无对应页"
+    },
+    {
+      "q": "GPU-driven Rendering TBR 移动端",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "渲染技术深度；brain 无对应页"
+    },
+    {
+      "q": "gbrain 阈值 标定 precision recall",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "本 Task 内容；brain 无对应页"
+    },
+    {
+      "q": "SessionStart digest 注入 hook",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Task3 产出；brain 无对应页"
+    },
+    {
+      "q": "vLLM 本地推理 RTX 4090",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "本地 LLM 推理栈；brain 无对应页"
+    },
+    {
+      "q": "Obsidian 知识库 笔记同步",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "知识管理工具；brain 无对应页"
+    },
+    {
+      "q": "Inngest 工作流 异步任务",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "jarvis-workflow-ts；brain 无对应页"
+    },
+    {
+      "q": "Trinity bot agent 平台",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Trinity-CN 项目；brain 无对应页"
+    },
+    {
+      "q": "Telegram bot 消息推送 频道",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "TG 集成；brain 无对应页"
+    },
+    {
+      "q": "帧同步 弱网络 对战",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "手游同步方案；brain 无对应页"
+    },
+    {
+      "q": "Unity 热更 Lua AB 包",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "手游热更方案；brain 无对应页"
+    },
+    {
+      "q": "claude-mem 记忆层 BGE-M3 向量",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "claude-mem MCP；brain 无对应页"
+    },
+    {
+      "q": "PostgreSQL gbrain pg-memory",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "M1 基建核心；brain 无充实页"
+    },
+    {
+      "q": "网易雷火 全明星街球 客户端主程",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Ivan 当前职位；brain 无对应页"
+    },
+    {
+      "q": "Docker compose 服务 systemd 自启",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "基础设施运维；brain 无对应页"
+    },
+    {
+      "q": "回测 walk-forward 分布 sensitivity",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "LFT 教训；brain 无对应页"
+    },
+    {
+      "q": "OpenClaw messages.visibleReplies codex agent",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "OpenClaw codex dispatch 铁律；brain 无对应页"
+    },
+    {
+      "q": "Next.js App Router edge runtime nodejs",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "踩坑教训；brain 无对应页"
+    },
+    {
+      "q": "共享记忆层 M1 M2 蒸馏 种子",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "SharedMemory 项目主线；brain 仅有噪声测试页"
+    },
+    {
+      "q": "Portola BridgeContract Flutter Unity native",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Portola 架构原则；brain 无对应页"
+    },
+    {
+      "q": "tailscale serve 内网穿透 HTTPS",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "网络工具踩坑；brain 无对应页"
+    },
+    {
+      "q": "LFT alpha 分位数 双门 P25",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "LFT 验证方法论；brain 无对应页"
+    },
+    {
+      "q": "MOBA 手游 客户端 架构",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "Ivan 历史项目领域；brain 无对应页"
+    },
+    {
+      "q": "Phaser 2D 游戏引擎 HTML5",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "AI Vibe Coding 游戏栈；brain 无对应页"
+    },
+    {
+      "q": "skills sync rsync my-skills GitHub Actions",
+      "relevant": [],
+      "irrelevant_ok": true,
+      "note": "skills 分发链路；brain 无对应页"
+    }
+  ]
+}
