@@ -64,6 +64,30 @@ def test_distill_chunks_long_message_no_truncation():
     distiller.distill_span(rows, cfg, _chat=chat)
     assert seen["n"] >= 3   # 长消息被切多块逐块蒸馏（非一次截断丢中段）
 
+def test_timeline_date_is_conversation_date_not_run_date(tmp_path):
+    # backlog 蒸馏：timeline 日期必须取会话消息真实日期，不能盖跑批当天（e2e 抓到的 P0）
+    from datetime import datetime, timezone
+    old_ms = int(datetime(2026, 3, 18, 9, 0, tzinfo=timezone.utc).timestamp() * 1000)  # 老会话 2026-03-18
+    rows = [{"idx": 5, "role": "user", "content": "我们决定用 X 方案",
+             "source_path": "/p/s.jsonl", "created_at": old_ms}]
+    fake = {"candidates": [{"entity_name": "X方案", "entity_kind": "decision", "entry_type": "decision",
+                            "fact_text": "决定用 X 方案", "source_idx": 5}]}
+    out = distiller.distill_span(rows, _cfg(), _chat=lambda body, cfg: fake)
+    c = state.connect(str(tmp_path / "s.db"))
+    c.execute("INSERT INTO raw_work_item(id,source_id,conversation_id,span_start,span_end,session_ref,status,created_at)"
+              " VALUES(7,'ubuntu-cc',1,1,9,'/p/s.jsonl#1-9','new','2026-06-24')"); c.commit()
+    distiller.commit_distilled(c, 7, out["candidates"], "/p/s.jsonl")
+    got = c.execute("SELECT entry_date FROM journal").fetchone()[0]
+    assert got == "2026-03-18", f"timeline 日期应为会话真实日期 2026-03-18；got {got}（盖成跑批当天=bug）"
+
+
+def test_msg_date_uses_gmt8_not_utc_at_day_boundary():
+    # 2026-05-09 17:00 UTC = 2026-05-10 01:00 GMT+8 → 本地日期应为 05-10（消除傍晚偏移）
+    from datetime import datetime, timezone
+    ms = int(datetime(2026, 5, 9, 17, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert distiller._msg_date(ms) == "2026-05-10"
+
+
 def _cfg():
     return {"distill": {"base_url": "x", "api_key": "x", "model": "gpt-5.4-mini"},
             "budget": {"chunk_char_size": 24000, "chunk_overlap": 400},

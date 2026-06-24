@@ -80,7 +80,7 @@ def source_id_for(agent):
 
 _SPAN_SQL = """
 SELECT m.id AS mid, m.idx AS idx, m.role AS role, m.content AS content,
-       c.source_path AS source_path
+       m.created_at AS created_at, c.source_path AS source_path
 FROM messages m JOIN conversations c ON c.id = m.conversation_id
 WHERE m.conversation_id = :cid AND m.id BETWEEN :lo AND :hi ORDER BY m.idx ASC
 """
