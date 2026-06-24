@@ -1,9 +1,12 @@
 # distill/distiller.py
 import json, os, sys, urllib.request, urllib.error
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_TZ = ZoneInfo("Asia/Shanghai")   # 蒸馏日期统一 GMT+8（Ivan 本地"哪天聊的"语义）
+try:
+    _TZ = ZoneInfo("Asia/Shanghai")          # 蒸馏日期统一 GMT+8（Ivan 本地"哪天聊的"语义）
+except ZoneInfoNotFoundError:                # 极简环境缺系统 tzdata → 固定 +8（China 无 DST，对日期等价）
+    _TZ = timezone(timedelta(hours=8))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "infra", "distill"))
 from audit import audit_append  # R5：原文出机审计
 from distill import idempotency
@@ -139,12 +142,13 @@ def build_journal_rows(candidates, raw_id, source_path):
 def commit_distilled(conn, raw_id, candidates, source_path):
     """spec §2.6.1 distill phase 事务边界（codex R0 P1-1）：单事务内 算 key→INSERT OR IGNORE journal→raw 标 distilled。"""
     now = datetime.now(timezone.utc).isoformat()
+    today_local = datetime.now(_TZ).date().isoformat()   # 缺会话日期时的统一退回(GMT+8，循环外算一次防跨午夜混两天)
     conn.execute("BEGIN")
     try:
         rows = build_journal_rows(candidates, raw_id, source_path)   # 纯计算，置于事务内满足"单事务"
         n = 0
         for r in rows:
-            entry_date = r.get("entry_date") or datetime.now(_TZ).date().isoformat()   # 会话真实日期；缺失退回跑批日(GMT+8)
+            entry_date = r.get("entry_date") or today_local   # 会话真实日期；缺失退回跑批日(GMT+8)
             cur = conn.execute(
                 "INSERT OR IGNORE INTO journal(key,raw_work_item_id,entity_slug,entry_type,fact_text,source_ref,entry_date,status,created_at)"
                 " VALUES(?,?,?,?,?,?,?, 'pending', ?)",
