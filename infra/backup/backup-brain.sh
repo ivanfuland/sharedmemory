@@ -52,4 +52,21 @@ else
     echo "[backup] WARN: pg dump 失败（pg-memory 未运行？）"
 fi
 
-echo "[backup] 完成 → $DEST（brain-repo / gbrain-home / canonical / pg dump）"
+# §11.3：蒸馏桥状态库（cursor/raw_work_item/journal）——hub 唯一副本，必备份
+BRIDGE_STATE="${BRIDGE_STATE_DB:-$ROOT/infra/distill/bridge-state.db}"
+BACKUP_DIR="$DEST"
+if [ -f "$BRIDGE_STATE" ]; then
+    sqlite3 "$BRIDGE_STATE" ".backup '$BACKUP_DIR/bridge-state.db'"
+    echo "[backup] bridge state → $BACKUP_DIR/bridge-state.db"
+    # restore smoke 验证 + 记录最近成功时间（§11.3 要求留档）
+    if bash "$ROOT/infra/backup/restore-bridge-smoke.sh" "$BRIDGE_STATE" "$BACKUP_DIR/bridge-state.verify.db" 2>&1; then
+        date -u +%FT%TZ > "$BACKUP_DIR/bridge-state.last-restore-ok"
+        echo "[backup] bridge state restore smoke OK → last-restore-ok 已更新"
+    else
+        echo "[backup] WARN: bridge state restore smoke 失败（非致命，继续备份其余内容）"
+    fi
+else
+    echo "[backup] INFO: bridge state db 不存在（路径=$BRIDGE_STATE），桥尚未首次运行，跳过"
+fi
+
+echo "[backup] 完成 → $DEST（brain-repo / gbrain-home / canonical / pg dump / bridge-state）"

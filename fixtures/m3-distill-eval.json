@@ -1,0 +1,186 @@
+[
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "老兰拍板：LFT 前 6 个月只跑模拟盘，资金 5-10 万封顶", "source_path": "/synthetic/1"}
+    ],
+    "gold": [
+      {"entity": "LFT", "fact": "前 6 个月只跑模拟盘"},
+      {"entity": "LFT", "fact": "资金 5-10 万封顶"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "assistant", "content": "HEARTBEAT_OK", "source_path": "/synthetic/2"}
+    ],
+    "gold": []
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "老兰决定 LFT 用 Qlib 做底座，不用 backtrader", "source_path": "/synthetic/3"}
+    ],
+    "gold": [
+      {"entity": "LFT", "fact": "底座选 Qlib，不用 backtrader"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "共享记忆层项目 M3 蒸馏桥的 distill concurrency 固定为 1，防并发写冲突", "source_path": "/synthetic/4"}
+    ],
+    "gold": [
+      {"entity": "共享记忆层", "fact": "M3 蒸馏桥 distill_concurrency=1，防并发写冲突"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "老兰偏好不装任何 Claude Code 相关插件，只用官方 CLI，封号风险太高", "source_path": "/synthetic/5"}
+    ],
+    "gold": [
+      {"entity": "老兰", "fact": "偏好不装任何 CC 相关插件，只用官方 CLI，原因是封号风险"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "嗯好的", "source_path": "/synthetic/6"},
+      {"idx": 1, "role": "assistant", "content": "明白，已记录。", "source_path": "/synthetic/6"}
+    ],
+    "gold": []
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "Ivan 的台式工作站是 Ubuntu 22.04，GPU 是 RTX 4090 48G 魔改版", "source_path": "/synthetic/7"}
+    ],
+    "gold": [
+      {"entity": "老兰", "fact": "台式工作站 Ubuntu 22.04 + RTX 4090 48G 魔改版"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "Trinity 项目决定用 docker compose 部署，frontend 绑 127.0.0.1:6299，redis host 映射 6380", "source_path": "/synthetic/8"}
+    ],
+    "gold": [
+      {"entity": "Trinity", "fact": "用 docker compose 部署"},
+      {"entity": "Trinity", "fact": "frontend 绑 127.0.0.1:6299"},
+      {"entity": "Trinity", "fact": "redis host 映射 6380"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "Portola 的 native 层只允许承载平台事实，禁止承载产品决策，这是架构红线", "source_path": "/synthetic/9"}
+    ],
+    "gold": [
+      {"entity": "Portola", "fact": "native 层只承载平台事实，禁止承载产品决策（架构红线）"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "assistant", "content": "好的，文件已保存到 /tmp/cc-report.md", "source_path": "/synthetic/10"},
+      {"idx": 1, "role": "user", "content": "收到", "source_path": "/synthetic/10"}
+    ],
+    "gold": []
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "LFT 项目踩坑教训：回测单窗口 headline 是噪声，必须并列 sensitivity probe + walk-forward 分布才有意义", "source_path": "/synthetic/11"}
+    ],
+    "gold": [
+      {"entity": "LFT", "fact": "回测单窗口 headline 是噪声，必须附 sensitivity probe + walk-forward 分布（mean/std/P10/P90）"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "xagent 项目老兰决定技术栈：TypeScript + Next.js 15 + Prisma + PostgreSQL", "source_path": "/synthetic/12"}
+    ],
+    "gold": [
+      {"entity": "xagent", "fact": "技术栈 TypeScript + Next.js 15 + Prisma + PostgreSQL"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "cc-workspace 里的 MEMORY.md 是跨会话记忆主体，每次 CC 启动通过 @import 自动加载", "source_path": "/synthetic/13"}
+    ],
+    "gold": [
+      {"entity": "共享记忆层", "fact": "MEMORY.md 是跨会话记忆主体，CC 启动时通过 @import 链自动加载"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "好的，知道了，谢谢", "source_path": "/synthetic/14"},
+      {"idx": 1, "role": "assistant", "content": "不客气。", "source_path": "/synthetic/14"}
+    ],
+    "gold": []
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "老兰确认：蒸馏走 LiteLLM API key（sk-FAKEKEY），严禁用订阅 OAuth token 驱动自动化任务", "source_path": "/synthetic/15"}
+    ],
+    "gold": [
+      {"entity": "共享记忆层", "fact": "蒸馏走 API key 路径，严禁用订阅 OAuth token 驱动自动化（封号风险）"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "Portola 的 3D mesh 草模生成主入口是 Tripo，ComfyUI 只做控制面，Seedance 只做人眼动态 gate", "source_path": "/synthetic/16"}
+    ],
+    "gold": [
+      {"entity": "Portola", "fact": "3D mesh 草模生成主入口是 Tripo"},
+      {"entity": "ComfyUI", "fact": "在 Portola 中只做控制面"},
+      {"entity": "Seedance", "fact": "在 Portola 中只做人眼动态 gate"},
+      {"entity": "Tripo", "fact": "是 Portola 的 3D mesh 草模生成主入口"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "LFT 量化项目决定前 6 个月纯模拟盘，盈利稳定后才上实盘，路线：规则策略 → ML → RL", "source_path": "/synthetic/17"},
+      {"idx": 1, "role": "assistant", "content": "已记录 LFT 执行路线：规则 → ML → RL，模拟盘先行。", "source_path": "/synthetic/17"}
+    ],
+    "gold": [
+      {"entity": "LFT", "fact": "执行路线：规则策略跑通 → ML 替换决策层 → RL 实验"},
+      {"entity": "LFT", "fact": "前期纯模拟盘，盈利稳定后上实盘"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user",
+       "content": "共享记忆层 M1 benchmark 结果：embed_batch_size=64，distill_concurrency=1，distill_timeout_s=90。这些参数来自 config/m1-benchmarks.json 的 derived_config，不在 bridge 重复写以防漂移。M2 阶段验证了 gbrain MCP 写经 /mcp 端点，token 打 http://127.0.0.1:7777/token，不走 /ingest。M3 蒸馏桥继承这些约束，Task 11 是质量门决策点。",
+       "source_path": "/synthetic/18"}
+    ],
+    "gold": [
+      {"entity": "共享记忆层", "fact": "M1 derived_config: embed_batch_size=64，distill_concurrency=1，distill_timeout_s=90，来自 config/m1-benchmarks.json，不在 bridge 重复写以防漂移"},
+      {"entity": "共享记忆层", "fact": "gbrain MCP 写端走 /mcp 端点，token 打 http://127.0.0.1:7777/token，不走 /ingest"},
+      {"entity": "共享记忆层", "fact": "M3 蒸馏桥继承 M1/M2 约束，Task 11 是质量门决策点"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "OpenClaw 升级遇错先跑 openclaw doctor，不是直接回滚", "source_path": "/synthetic/19"}
+    ],
+    "gold": [
+      {"entity": "OpenClaw", "fact": "升级遇错先跑 openclaw doctor --fix，不是直接回滚"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "老兰决定 Inngest cron 定时任务统一用 TZ=Asia/Shanghai，错开 03:00 OpenClaw dreaming，定在 03:30", "source_path": "/synthetic/20"}
+    ],
+    "gold": [
+      {"entity": "Inngest", "fact": "cron 定时任务统一使用 TZ=Asia/Shanghai"},
+      {"entity": "Inngest", "fact": "蒸馏任务定在 03:30，错开 OpenClaw dreaming 03:00"},
+      {"entity": "老兰", "fact": "决定 Inngest cron 任务使用 Asia/Shanghai 时区，时间定 03:30 错开 OpenClaw dreaming"}
+    ]
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "哦对，还有个问题", "source_path": "/synthetic/21"},
+      {"idx": 1, "role": "assistant", "content": "请说。", "source_path": "/synthetic/21"}
+    ],
+    "gold": []
+  },
+  {
+    "span": [
+      {"idx": 0, "role": "user", "content": "jarvis-workflow-ts 是 Ubuntu-only 能力，Mac 上没有这个 repo，不能在 Mac 上假设有 Inngest 环境", "source_path": "/synthetic/22"}
+    ],
+    "gold": [
+      {"entity": "jarvis-workflow-ts", "fact": "Ubuntu-only 部署，Mac 上不存在，不能在 Mac 上假设 Inngest 环境"}
+    ]
+  }
+]
