@@ -34,6 +34,13 @@ def test_read_advances_cursor_and_writes_raw_same_txn(tmp_path):
     row = c.execute("SELECT span_start,span_end,session_ref,status FROM raw_work_item").fetchone()
     assert (row["span_start"], row["span_end"], row["status"]) == (1, 2, "new")
 
+def test_read_span_messages_carries_created_at(tmp_path):
+    # 蒸馏的会话日期来源于此：_SPAN_SQL 必须带 created_at（注入式单测抓不到生产 SQL 缺列，故在此钉死）
+    canon = _canon(tmp_path)
+    rows = cass_reader.read_span_messages(canon, conv_id=1, lo=1, hi=2)
+    assert [r["created_at"] for r in rows] == [1700000000000, 1700000001000]
+
+
 def test_reread_is_idempotent_noop(tmp_path):
     canon = _canon(tmp_path)
     c = state.connect(str(tmp_path / "s.db"))

@@ -1,6 +1,12 @@
 # distill/distiller.py
 import json, os, sys, urllib.request, urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    _TZ = ZoneInfo("Asia/Shanghai")          # 蒸馏日期统一 GMT+8（Ivan 本地"哪天聊的"语义）
+except ZoneInfoNotFoundError:                # 极简环境缺系统 tzdata → 固定 +8（China 无 DST，对日期等价）
+    _TZ = timezone(timedelta(hours=8))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "infra", "distill"))
 from audit import audit_append  # R5：原文出机审计
 from distill import idempotency
@@ -96,18 +102,28 @@ def _validate(d):
         assert set(c) == {"entity_name", "entity_kind", "entry_type", "fact_text", "source_idx"}, f"candidate 非 strict: {c}"
     return d
 
+def _msg_date(ts):
+    """CASS created_at（epoch 毫秒）→ 'YYYY-MM-DD'；缺失/异常 → None（commit 退回跑批日）。"""
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts) / 1000, _TZ).date().isoformat()
+    except (ValueError, OSError, TypeError, OverflowError):
+        return None
+
 def distill_span(rows, cfg, _chat=None):
     """长消息分块逐块蒸馏并候选（P0-1）；任一块 retry×2 仍败 → 抛 → 调用方标 raw_quarantined。每次出机由 _distill_one 审计（P0-4）。"""
     chat = _chat or _chat_http
     b = cfg["budget"]
     session_ref = rows[0].get("source_path", "?") if rows else "?"
     valid_idx = {r["idx"] for r in rows}
+    idx_date = {r["idx"]: _msg_date(r.get("created_at")) for r in rows}   # idx→会话真实日期(YYYY-MM-DD)
     kept, rejected = [], 0
     for chunk in _chunk_rows(rows, b["chunk_char_size"], b.get("chunk_overlap", 0)):
         parsed = _distill_one(chunk, cfg, chat, session_ref)
         for c in parsed["candidates"]:
             if c["source_idx"] in valid_idx:
-                kept.append(c)
+                kept.append({**c, "entry_date": idx_date.get(c["source_idx"])})   # 盖会话日期非跑批日
             else:
                 rejected += 1  # 无法回指原文（spec §2.6 line 159-161）
     return {"candidates": kept, "rejected_no_provenance": rejected}
@@ -119,22 +135,25 @@ def build_journal_rows(candidates, raw_id, source_path):
         src = f"{source_path}:{c['source_idx']}"
         key = idempotency.fact_key(src, slug, c["entry_type"], c["fact_text"])
         rows.append({"key": key, "raw_work_item_id": raw_id, "entity_slug": slug,
-                     "entry_type": c["entry_type"], "fact_text": c["fact_text"], "source_ref": src})
+                     "entry_type": c["entry_type"], "fact_text": c["fact_text"], "source_ref": src,
+                     "entry_date": c.get("entry_date")})
     return rows
 
 def commit_distilled(conn, raw_id, candidates, source_path):
     """spec §2.6.1 distill phase 事务边界（codex R0 P1-1）：单事务内 算 key→INSERT OR IGNORE journal→raw 标 distilled。"""
     now = datetime.now(timezone.utc).isoformat()
+    today_local = datetime.now(_TZ).date().isoformat()   # 缺会话日期时的统一退回(GMT+8，循环外算一次防跨午夜混两天)
     conn.execute("BEGIN")
     try:
         rows = build_journal_rows(candidates, raw_id, source_path)   # 纯计算，置于事务内满足"单事务"
         n = 0
         for r in rows:
+            entry_date = r.get("entry_date") or today_local   # 会话真实日期；缺失退回跑批日(GMT+8)
             cur = conn.execute(
                 "INSERT OR IGNORE INTO journal(key,raw_work_item_id,entity_slug,entry_type,fact_text,source_ref,entry_date,status,created_at)"
                 " VALUES(?,?,?,?,?,?,?, 'pending', ?)",
                 (r["key"], r["raw_work_item_id"], r["entity_slug"], r["entry_type"],
-                 r["fact_text"], r["source_ref"], now[:10], now))
+                 r["fact_text"], r["source_ref"], entry_date, now))
             n += cur.rowcount
         upd = conn.execute("UPDATE raw_work_item SET status='distilled' WHERE id=? AND status='new'", (raw_id,))
         if upd.rowcount != 1:
