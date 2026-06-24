@@ -1,0 +1,159 @@
+{
+  "contradiction_check": true,
+  "budget": {
+    "batch_token_cap": 200000,
+    "max_entities": 400,
+    "deferred_hard_cap": 2000,
+    "chunk_char_size": 24000,
+    "chunk_overlap": 400
+  },
+  "model_lock": {
+    "status": "locked",
+    "model": "gpt-5.4-mini",
+    "locked_at": "2026-06-24T06:09:52.239552+00:00",
+    "metrics": {
+      "precision": 0.923,
+      "recall": 0.857,
+      "f1": 0.889,
+      "n_samples": 22,
+      "tot_gold": 28,
+      "tot_extracted": 26,
+      "tot_matched": 24,
+      "per_sample": [
+        {
+          "gold": 2,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/1"
+        },
+        {
+          "gold": 0,
+          "extracted": 0,
+          "matched": 0,
+          "source": "/synthetic/2"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/3"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/4"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/5"
+        },
+        {
+          "gold": 0,
+          "extracted": 0,
+          "matched": 0,
+          "source": "/synthetic/6"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 0,
+          "source": "/synthetic/7"
+        },
+        {
+          "gold": 3,
+          "extracted": 3,
+          "matched": 3,
+          "source": "/synthetic/8"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/9"
+        },
+        {
+          "gold": 0,
+          "extracted": 0,
+          "matched": 0,
+          "source": "/synthetic/10"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/11"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/12"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/13"
+        },
+        {
+          "gold": 0,
+          "extracted": 0,
+          "matched": 0,
+          "source": "/synthetic/14"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/15"
+        },
+        {
+          "gold": 4,
+          "extracted": 4,
+          "matched": 4,
+          "source": "/synthetic/16"
+        },
+        {
+          "gold": 2,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/17"
+        },
+        {
+          "gold": 3,
+          "extracted": 4,
+          "matched": 3,
+          "source": "/synthetic/18"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/19"
+        },
+        {
+          "gold": 3,
+          "extracted": 2,
+          "matched": 2,
+          "source": "/synthetic/20"
+        },
+        {
+          "gold": 0,
+          "extracted": 0,
+          "matched": 0,
+          "source": "/synthetic/21"
+        },
+        {
+          "gold": 1,
+          "extracted": 1,
+          "matched": 1,
+          "source": "/synthetic/22"
+        }
+      ]
+    }
+  },
+  "_note": "derived_config(embed_batch_size/distill_concurrency/distill_timeout_s) 从 config/m1-benchmarks.json 读，不在此重复(codex R0 P2-1 防漂移)。budget: batch_token_cap=单批蒸馏 token 预算；max_entities=单批落库实体上限；deferred_hard_cap=deferred 总量硬上限超即停桥(§2.6.1 codex R0 P0-5)；chunk_char_size/chunk_overlap=长消息分块参数(M1-EXIT 8191-token 上限，codex R0 P0-1 改截断为分块；msg_char_cap 已删，R1 P2-1)。batch_token_cap=蒸馏 token 预算/max_entities=单批写实体预算（R1 P0-3 真执行）。model_lock 由 Task 11 写回。"
+}
