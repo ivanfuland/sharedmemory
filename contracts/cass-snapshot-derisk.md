@@ -39,12 +39,19 @@ canonical DB（魔数 `SQLite format 3`，VACUUM INTO + quick_check 全 ok）。
 
 cass **无** backup/snapshot 顶层命令（子命令列确认；`doctor backups` 只校验旧备份非创建）→ cass-backup 候选已删。
 
-## 3. 隔离铁证（Phase A 后回填）
+## 3. 隔离铁证（Phase B 首次全量建索引后回填，2026-06-26）
 
-> 待 Phase A Infinity 就绪 + Phase B 首次建索引后补：记活 DB 逻辑指纹（conv/msg 计数）→ 快照上跑
-> do_snapshot+backfill → 复核活 DB 计数 + integrity 不变 = 隔离确认。
+Phase B 在快照上跑了完整 do_snapshot + 词法 force-rebuild + bge-m3 全量 backfill（2670 会话/75939 docs，
+~52min）。建索引**前后**复核 baseline 活 DB：
 
-**状态：PENDING（Phase B Step 2 verify 回填）**
+| 项 | 建索引后 |
+|---|---|
+| `cass status` opened | **True**（err None） |
+| conv/msg 计数 | **2670 / 76076**（== 快照 fingerprint `content-v1:2670:2670:76076`，未变） |
+| `PRAGMA quick_check` | **ok**（未被 migrate/损坏） |
+| WAL 写入 | 无（全量建索引期间活 DB 零写） |
+
+→ **隔离确认**：fork 全程只写快照副本 `$STAGE`，baseline 活 DB 逻辑计数 + integrity 完全不变。**状态：✅ CONFIRMED**
 
 ## 4. 一致性 verdict
 
