@@ -1,4 +1,8 @@
-# CASS 一致性快照机制 de-risk verdict（Phase 0）
+> ⚠️ **SUPERSEDED（2026-06-27）by v2 单版本架构**：快照隔离整套已作废（plan v2 = fork 单版本独占，无快照）。
+> 本文保留仅作**实测证据存档**：VACUUM INTO 事务一致快照 + `quick_check` + fork 写打开/迁移一份活 DB 副本可行
+> ——其中「fork 0.6.17 写打开 + 迁移 0.6.13 库副本 → 全量索引跑通」这条证明了 v2 路2全新重摄入/迁移的安全性。
+
+# CASS 一致性快照机制 de-risk verdict（Phase 0，v1 — SUPERSEDED）
 
 > Plan: `cc-workspace/docs/projects/shared-memory/plans/2026-06-26-cass-semantic-production.md`
 > 实测于 2026-06-26（生产 DB `/home/ivan/.local/share/coding-agent-search/agent_search.db`，1.26GB）。
