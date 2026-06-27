@@ -22,6 +22,15 @@ else
   echo "• $ENVF 已存在，保留现有 bearer"
 fi
 
+# 1b. bearer 校验（新建/已存在两分支都做：placeholder/空/弱 → 报错退出，保护唯一鉴权闸）
+BEARER=$(grep '^CASS_MCP_BEARER=' "$ENVF" | cut -d= -f2-)
+if ! [[ "$BEARER" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "✗ $ENVF 的 CASS_MCP_BEARER 非法（应为 openssl rand -hex 32 的 64 位 hex；当前疑似 placeholder/空/弱）。"
+  echo "  修复：在 $ENVF 填 CASS_MCP_BEARER=\$(openssl rand -hex 32) 后重跑。"
+  exit 1
+fi
+chmod 600 "$ENVF"   # 已存在时也确保权限收紧（防权限松）
+
 # 2. 装 + 起 user service
 mkdir -p "$(dirname "$UNIT_DST")"
 cp "$UNIT_SRC" "$UNIT_DST"
@@ -33,9 +42,8 @@ loginctl enable-linger "$USER" >/dev/null 2>&1 || true   # 重启/无登录也�
 for i in $(seq 1 30); do ss -tlnp 2>/dev/null | grep -q ':7788' && break; sleep 0.5; done
 CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7788/mcp -X POST -H 'Content-Type: application/json' -d '{}' || echo 000)
 echo "no-token HTTP $CODE（期望 401）"
+[[ "$CODE" == "401" ]] || { echo "✗ smoke 失败：期望 401 得到 $CODE。查 journalctl --user -u cass-mcp.service"; exit 1; }
 systemctl --user --no-pager status cass-mcp.service | sed -n '1,4p'
-
-BEARER=$(grep '^CASS_MCP_BEARER=' "$ENVF" | cut -d= -f2-)
 echo ""
 echo "✓ cass-mcp 部署完成（127.0.0.1:7788）"
 echo "  注册三端 MCP 用的 bearer： $BEARER"

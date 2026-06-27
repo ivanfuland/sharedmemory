@@ -54,6 +54,14 @@ def _readiness():
         checks["infinity"] = False
     return checks
 
+def _data_ready():
+    """轻量 DB 就绪检查：仅校验 canonical DB 文件存在（pack/sessions/timeline 前置门）。
+    不检查 Infinity/语义索引——那些由 _readiness() 负责（search 专属）。
+    lexical index 缺失等边角让 cass_exit 兜，不过度。
+    """
+    dd = os.environ.get("CASS_DATA_DIR", "")
+    return {"db": os.path.isfile(os.path.join(dd, "agent_search.db"))}
+
 def _call(tool, args):
     spec = contract.TOOLS[tool]                          # subcmd + want_json 单一来源
     t0 = time.monotonic()
@@ -115,9 +123,14 @@ def cass_triage(stale_threshold: int = 300):
     return _call("cass_triage", ["--stale-threshold", str(stale_threshold)])
 
 @mcp.tool(description="把某主题的历史会话打包成确定性 answer pack（agent handoff/取证）。"
-                      "注意：pack 走关键词/lexical 检索，不是语义——概念/中文模糊召回请用 cass_search；"
-                      "pack 适合已知关键词时拿结构化证据包。返回 cass.pack.v1。")
+                      "注意：pack 的 semantic 模式实测不可用（cass 返回 semantic-unavailable code 15）；"
+                      "pack 走默认 hybrid-preferred，实际 fail-open 到 lexical 证据——不是语义检索。"
+                      "概念/中文模糊召回请用 cass_search（真语义）；pack 适合已知关键词时拿确定性证据包。返回 cass.pack.v1。")
 def cass_pack(query: str, agent: str = "", workspace: str = "", limit: int = 10, max_tokens: int = 0):
+    checks = _data_ready()
+    if not all(checks.values()):
+        _audit("cass_pack", [query], "not_ready", 0)
+        return {"error": "not_ready", "checks": checks}
     args = [query, "--limit", str(limit)]            # ❗不加 SEMANTIC_FLAGS（pack 不支持）
     if max_tokens: args += ["--max-tokens", str(max_tokens)]
     if agent: args += ["--agent", agent]
@@ -127,6 +140,10 @@ def cass_pack(query: str, agent: str = "", workspace: str = "", limit: int = 10,
 @mcp.tool(description="列出最近会话（按时间倒序）。问『我最近在搞啥/某项目有哪些会话』时用。"
                       "返回 dict，sessions 字段是 list，每项 path/agent/title/message_count 等；要看内容用 cass_search/cass_expand。")
 def cass_sessions(limit: int = 10, workspace: str = "", current: bool = False):
+    checks = _data_ready()
+    if not all(checks.values()):
+        _audit("cass_sessions", ["--limit"], "not_ready", 0)
+        return {"error": "not_ready", "checks": checks}
     args = ["--limit", str(limit)]
     if workspace: args += ["--workspace", workspace]
     if current: args.append("--current")
@@ -135,6 +152,10 @@ def cass_sessions(limit: int = 10, workspace: str = "", current: bool = False):
 @mcp.tool(description="某时间段的活动时间轴。问『上周二/最近三天干了啥』这类时间维度查询时用。"
                       "since 接受 today/yesterday/Nd(如 7d)/ISO 日期。")
 def cass_timeline(since: str = "7d", until: str = "", agent: str = ""):
+    checks = _data_ready()
+    if not all(checks.values()):
+        _audit("cass_timeline", [since], "not_ready", 0)
+        return {"error": "not_ready", "checks": checks}
     args = ["--since", since]
     if until: args += ["--until", until]
     if agent: args += ["--agent", agent]

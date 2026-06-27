@@ -40,5 +40,5 @@ bearer = deploy.sh 输出值。本机 URL `http://127.0.0.1:7788/mcp`。
 ## 设计约束（勿违背）
 - 绑 127.0.0.1；外网只经 tailscale serve（bearer 是唯一闸，缺/错 token → 401）。
 - `cass_search` 走语义（`--mode semantic --daemon --model bge-m3 --rerank`）+ 查询前三就绪校验。
-- `cass_pack` 仅 lexical/hybrid（CASS 上游未支持 pack 语义）——概念召回用 `cass_search`。
+- `cass_pack` 的 semantic 模式不可用（cass 返回 `semantic-unavailable` code 15）；pack 走默认 hybrid-preferred，实际 fail-open 到 lexical 证据。**概念/中文模糊召回用 `cass_search`（真语义）**，pack 用于已知关键词时拿确定性证据包。
 - 升级 cass fork 后无需动 cass-mcp（契约 `contracts/cass-semantic-prod.md` 稳定）。

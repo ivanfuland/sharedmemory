@@ -194,6 +194,7 @@ def test_cass_pack_tool_calls_runner_no_semantic_flags(monkeypatch, tmp_path):
         calls["call"] = (subcmd, args, kw)
         return {"schema_version": "cass.pack.v1", "pack": []}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
     out = S.cass_pack(query="记忆", limit=5)
     assert out.get("schema_version") == "cass.pack.v1"
@@ -218,6 +219,7 @@ def test_cass_pack_optional_args(monkeypatch, tmp_path):
         calls["call"] = (subcmd, args, kw)
         return {"schema_version": "cass.pack.v1", "pack": []}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
     S.cass_pack(query="q", max_tokens=4000, agent="codex", workspace="/tmp")
     _, args, _ = calls["call"]
@@ -227,12 +229,13 @@ def test_cass_pack_optional_args(monkeypatch, tmp_path):
 
 
 def test_cass_sessions_tool_calls_runner(monkeypatch, tmp_path):
-    """cass_sessions：subcmd=sessions，args 含 --limit；无 readiness gate。"""
+    """cass_sessions：subcmd=sessions，args 含 --limit；DB readiness gate 须通过。"""
     calls = {}
     def fake_run(subcmd, args, **kw):
         calls["call"] = (subcmd, args, kw)
         return {"sessions": [{"path": "/x", "agent": "cc", "title": "T", "message_count": 1}]}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
     out = S.cass_sessions(limit=5)
     assert "sessions" in out
@@ -249,6 +252,7 @@ def test_cass_sessions_optional_workspace_current(monkeypatch, tmp_path):
     def fake_run(subcmd, args, **kw):
         calls["call"] = (subcmd, args, kw); return {"sessions": []}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
     # workspace 传了 → 含 --workspace
     S.cass_sessions(workspace="/proj/x")
@@ -262,12 +266,13 @@ def test_cass_sessions_optional_workspace_current(monkeypatch, tmp_path):
 
 
 def test_cass_timeline_tool_calls_runner(monkeypatch, tmp_path):
-    """cass_timeline：subcmd=timeline，args 含 --since；无 readiness gate，无 --week。"""
+    """cass_timeline：subcmd=timeline，args 含 --since；DB readiness gate 须通过，无 --week。"""
     calls = {}
     def fake_run(subcmd, args, **kw):
         calls["call"] = (subcmd, args, kw)
         return {"range": {}, "total_sessions": 0, "groups": []}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
     out = S.cass_timeline(since="7d")
     assert "groups" in out
@@ -286,8 +291,50 @@ def test_cass_timeline_optional_until_agent(monkeypatch, tmp_path):
     def fake_run(subcmd, args, **kw):
         calls["call"] = (subcmd, args, kw); return {"range": {}, "total_sessions": 0, "groups": []}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
     S.cass_timeline(since="today", until="yesterday", agent="codex")
     _, args, _ = calls["call"]
     assert "--until" in args and "yesterday" in args
     assert "--agent" in args and "codex" in args
+
+
+# ---- DB readiness gate：pack/sessions/timeline 当 DB 缺失时返回 not_ready ----
+
+def test_cass_pack_not_ready_when_db_missing(monkeypatch, tmp_path):
+    """P2: DB 缺失时 cass_pack 返回 not_ready，不调 run_cass。"""
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": False})
+    called = {"n": 0}
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    out = S.cass_pack(query="记忆")
+    assert out["error"] == "not_ready", "DB 缺失时应返回 not_ready"
+    assert "checks" in out
+    assert out["checks"]["db"] is False
+    assert called["n"] == 0, "not_ready 时不应调用 run_cass"
+
+
+def test_cass_sessions_not_ready_when_db_missing(monkeypatch, tmp_path):
+    """P2: DB 缺失时 cass_sessions 返回 not_ready，不调 run_cass。"""
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": False})
+    called = {"n": 0}
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    out = S.cass_sessions()
+    assert out["error"] == "not_ready", "DB 缺失时应返回 not_ready"
+    assert "checks" in out
+    assert out["checks"]["db"] is False
+    assert called["n"] == 0, "not_ready 时不应调用 run_cass"
+
+
+def test_cass_timeline_not_ready_when_db_missing(monkeypatch, tmp_path):
+    """P2: DB 缺失时 cass_timeline 返回 not_ready，不调 run_cass。"""
+    monkeypatch.setattr(S, "_data_ready", lambda: {"db": False})
+    called = {"n": 0}
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    out = S.cass_timeline(since="7d")
+    assert out["error"] == "not_ready", "DB 缺失时应返回 not_ready"
+    assert "checks" in out
+    assert out["checks"]["db"] is False
+    assert called["n"] == 0, "not_ready 时不应调用 run_cass"

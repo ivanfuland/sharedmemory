@@ -31,6 +31,7 @@ TOOLS = {
     "cass_pack":     {"subcmd": "pack",     "want_json": True, "arg": "query_positional"},
     # <QUERY> --limit N [--max-tokens N] [--agent A] [--workspace W]
     # ⚠ 仅 lexical/hybrid，不接受 --mode semantic/--rerank/--model（传了报错）
+    # ⚠ pack semantic 实测 unavailable(code 15, kind=semantic-unavailable)，故走默认 hybrid-preferred→fail-open 到 lexical
     # JSON shape: dict → schema_version=cass.pack.v1 / query / pack / evidence / ...
     "cass_sessions": {"subcmd": "sessions", "want_json": True, "arg": "none"},
     # --limit N [--workspace W] [--current]
