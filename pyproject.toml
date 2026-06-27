@@ -3,14 +3,16 @@ name = "sharedmemory"
 version = "0.0.1"
 description = "M0 contract artifacts for the shared-memory layer"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastmcp>=3.4.2,<4",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["distill"]
+packages = ["distill", "cass_mcp"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

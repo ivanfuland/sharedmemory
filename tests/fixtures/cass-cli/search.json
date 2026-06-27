@@ -1,0 +1,41 @@
+{
+  "query": "记忆",
+  "limit": 2,
+  "offset": 0,
+  "count": 2,
+  "total_matches": 3,
+  "hits": [
+    {
+      "title": "# AGENTS.md instructions for /home/ivan/projects/cc-workspace",
+      "snippet": "记录下当前的memory中",
+      "content": "记录下当前的memory中",
+      "score": 0.5660185217857361,
+      "source_path": "/home/ivan/.codex/sessions/2026/05/11/rollout-2026-05-11T10-24-09-019e14d9-5cfe-7943-aa72-975c2203fff4.jsonl",
+      "agent": "codex",
+      "workspace": "/home/ivan/projects/cc-workspace",
+      "created_at": 1778481778933,
+      "line_number": 22,
+      "match_type": "exact",
+      "source_id": "local",
+      "origin_kind": "local"
+    },
+    {
+      "title": "# AGENTS.md instructions for /home/ivan/myobsidian/ivan-ai-driven",
+      "snippet": "保存了",
+      "content": "保存了",
+      "score": 0.19930799305438995,
+      "source_path": "/home/ivan/.codex/sessions/2026/05/11/rollout-2026-05-11T16-18-30-019e161d-c6a0-7853-a1fb-5bb80cc2fd52.jsonl",
+      "agent": "codex",
+      "workspace": "/home/ivan/myobsidian/ivan-ai-driven",
+      "created_at": 1778496055807,
+      "line_number": 109,
+      "match_type": "exact",
+      "source_id": "local",
+      "origin_kind": "local"
+    }
+  ],
+  "max_tokens": null,
+  "request_id": null,
+  "cursor": null,
+  "hits_clamped": false
+}

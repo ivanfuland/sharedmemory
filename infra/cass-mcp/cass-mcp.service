@@ -1,0 +1,15 @@
+[Unit]
+Description=cass-mcp — CASS 语义检索暴露为 MCP 工具（只读 connector，M4 Phase B）
+After=network-online.target cc-infinity.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/sharedmemory
+EnvironmentFile=%h/projects/sharedmemory/infra/cass-mcp/cass-mcp.env
+ExecStart=%h/.local/bin/uv run python -m cass_mcp.server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

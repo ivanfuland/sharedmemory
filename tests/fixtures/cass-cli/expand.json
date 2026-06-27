@@ -1,0 +1,26 @@
+[
+  {
+    "line": 1,
+    "role": "last-prompt",
+    "is_target": true,
+    "content": ""
+  },
+  {
+    "line": 2,
+    "role": "mode",
+    "is_target": false,
+    "content": ""
+  },
+  {
+    "line": 3,
+    "role": "permission-mode",
+    "is_target": false,
+    "content": ""
+  },
+  {
+    "line": 4,
+    "role": "attachment",
+    "is_target": false,
+    "content": ""
+  }
+]

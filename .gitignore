@@ -18,3 +18,6 @@ sandbox/gbrain-pg/
 .superpowers/
 # M2 Task2 generated env（bash-sourced clean re-emit，含 secret，绝不进 git）
 infra/gbrain/serve/env.generated
+# M4 cass-mcp secrets（bearer token / 访问日志含 secret，绝不进 git）
+infra/cass-mcp/*.env
+infra/cass-mcp/*.log

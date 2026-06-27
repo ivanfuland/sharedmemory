@@ -1,0 +1,633 @@
+{
+  "surface": "triage",
+  "schema_version": 1,
+  "status": "unhealthy",
+  "healthy": false,
+  "initialized": true,
+  "explanation": null,
+  "recommended_action": "Run 'cass index' to refresh the index",
+  "recommended_commands": [
+    {
+      "id": "refresh-lexical-index",
+      "command": "cass index --json --no-progress-events --data-dir /home/ivan/.local/share/coding-agent-search",
+      "purpose": "Index newly discovered sessions without a full rebuild.",
+      "safety": "writes-cass-archive-and-derived-index",
+      "run_when": "Run when the index is stale or pending.sessions is nonzero.",
+      "success_signal": "success=true, then pending.sessions=0 and index.fresh=true",
+      "parse_fields": [
+        "success",
+        "conversations",
+        "messages",
+        "error"
+      ],
+      "retry_after_ms": null
+    },
+    {
+      "id": "verify-refresh",
+      "command": "cass health --json --data-dir /home/ivan/.local/share/coding-agent-search",
+      "purpose": "Confirm the refresh cleared the readiness blocker.",
+      "safety": "read-only",
+      "run_when": "Run after refresh-lexical-index finishes.",
+      "success_signal": "healthy=true or recommended_commands changes to the next blocker",
+      "parse_fields": [
+        "status",
+        "healthy",
+        "state.index",
+        "recommended_commands"
+      ],
+      "retry_after_ms": null
+    }
+  ],
+  "next_command": "cass index --json --no-progress-events --data-dir /home/ivan/.local/share/coding-agent-search",
+  "search_completeness": {
+    "quarantine_status": "ok",
+    "quarantined_conversations": 0,
+    "complete": true,
+    "can_search": true,
+    "coverage_suspect": false,
+    "impact": "search covers all known conversations; nothing is quarantined",
+    "next_command": "cass status --json"
+  },
+  "root_cause": {
+    "schema_version": 1,
+    "family": "unknown",
+    "locus": "unknown",
+    "confidence": "unknown",
+    "evidence_refs": [],
+    "summary": "no evidence signals pointed at any root-cause family",
+    "recommended_next_probe": "cass diag --json && cass doctor check --json"
+  },
+  "readiness": {
+    "index": {
+      "exists": true,
+      "status": "stale",
+      "reason": "lexical index is older than the stale threshold",
+      "fresh": false,
+      "partial": false,
+      "partial_reason": null,
+      "last_indexed_at": "2026-06-27T06:00:06.159+00:00",
+      "age_seconds": 2904,
+      "stale": true,
+      "stale_threshold_seconds": 300,
+      "rebuilding": false,
+      "stalled": false,
+      "activity_at": null,
+      "documents": null,
+      "empty_with_messages": false,
+      "quarantined_conversations": 0,
+      "fingerprint": {
+        "current_db_fingerprint": null,
+        "checkpoint_fingerprint": "content-v1:1718:1718:67815",
+        "matches_current_db_fingerprint": null
+      },
+      "checkpoint": {
+        "present": true,
+        "completed": true,
+        "db_matches": true,
+        "schema_matches": true,
+        "page_size_matches": true,
+        "page_size_compatible": true
+      }
+    },
+    "database": {
+      "exists": true,
+      "opened": true,
+      "conversations": null,
+      "messages": null,
+      "open_error": null,
+      "open_retryable": false,
+      "counts_skipped": true,
+      "open_skipped": false
+    },
+    "pending": {
+      "sessions": 0,
+      "watch_active": false,
+      "orphaned": false
+    },
+    "rebuild": {
+      "active": false,
+      "stalled": false,
+      "last_progress_at": null,
+      "last_progress_age_ms": null,
+      "orphaned": false,
+      "pid": null,
+      "mode": null,
+      "job_id": null,
+      "job_kind": null,
+      "phase": null,
+      "started_at": null,
+      "updated_at": null,
+      "processed_conversations": null,
+      "total_conversations": null,
+      "indexed_docs": null,
+      "pipeline": {
+        "workers": 18,
+        "available_parallelism": 20,
+        "reserved_cores": 2,
+        "tantivy_writer_threads": 4,
+        "staged_shard_builders": 1,
+        "staged_merge_workers": 4,
+        "controller_mode": "auto",
+        "controller_restore_clear_samples": 3,
+        "controller_restore_hold_ms": 5000,
+        "pipeline_max_message_bytes_in_flight": 671088640,
+        "page_prep_workers": 8,
+        "page_size": 1024,
+        "steady_batch_fetch_conversations": 512,
+        "startup_batch_fetch_conversations": 32,
+        "steady_commit_every_conversations": 10000,
+        "startup_commit_every_conversations": 2048,
+        "steady_commit_every_messages": 800000,
+        "startup_commit_every_messages": 800000,
+        "steady_commit_every_message_bytes": 536870912,
+        "startup_commit_every_message_bytes": 134217728,
+        "pipeline_channel_size": 4,
+        "controller_loadavg_high_watermark_1m": 19.0,
+        "controller_loadavg_low_watermark_1m": 18.0,
+        "runtime": null
+      }
+    },
+    "rebuild_progress": {
+      "active": false,
+      "stalled": false,
+      "last_progress_at": null,
+      "last_progress_age_ms": null,
+      "mode": null,
+      "phase": null,
+      "processed_conversations": null,
+      "total_conversations": null,
+      "remaining_conversations": null,
+      "completion_ratio": null,
+      "indexed_docs": null,
+      "runtime_available": false,
+      "queue_depth": null,
+      "queue_capacity": null,
+      "queue_headroom": null,
+      "pending_batch_conversations": null,
+      "pending_batch_message_bytes": null,
+      "inflight_message_bytes": null,
+      "max_message_bytes_in_flight": null,
+      "inflight_message_bytes_headroom": null,
+      "controller_mode": null,
+      "controller_reason": null,
+      "updated_at": null
+    },
+    "semantic": {
+      "status": "building",
+      "availability": "index_building",
+      "summary": "semantic backfill is in progress for the current database",
+      "available": false,
+      "can_search": false,
+      "fallback_mode": "lexical",
+      "preferred_backend": "fastembed",
+      "embedder_id": "minilm-384",
+      "vector_index_path": "/home/ivan/.local/share/coding-agent-search/vector_index/index-minilm-384.fsvi",
+      "model_dir": "/home/ivan/.local/share/coding-agent-search/models/all-MiniLM-L6-v2",
+      "hnsw_path": "/home/ivan/.local/share/coding-agent-search/vector_index/hnsw-minilm-384.chsw",
+      "hnsw_ready": false,
+      "progressive_ready": false,
+      "feature_compiled_in": false,
+      "quality_tier_published": false,
+      "semantic_only_search_available": false,
+      "hint": "Run 'cass index --semantic' to finish backfilling current semantic assets; search will use lexical fallback until then.",
+      "fast_tier": {
+        "present": false,
+        "ready": false,
+        "current_db_matches": null,
+        "conversation_count": null,
+        "doc_count": null,
+        "embedder_id": null,
+        "model_revision": null,
+        "completed_at": null,
+        "size_bytes": null
+      },
+      "quality_tier": {
+        "present": true,
+        "ready": true,
+        "current_db_matches": null,
+        "conversation_count": 1718,
+        "doc_count": 25723,
+        "embedder_id": "bge-m3",
+        "model_revision": "infinity-bge-m3",
+        "completed_at": "2026-06-27T06:02:50.564+00:00",
+        "size_bytes": 55791808
+      },
+      "backlog": {
+        "total_conversations": 1718,
+        "fast_tier_processed": 0,
+        "fast_tier_remaining": 1718,
+        "quality_tier_processed": 1718,
+        "quality_tier_remaining": 0,
+        "pending_work": true,
+        "current_db_matches": null,
+        "computed_at": "2026-06-27T06:02:50.564+00:00"
+      },
+      "checkpoint": {
+        "active": false,
+        "tier": null,
+        "current_db_matches": null,
+        "completed": null,
+        "conversations_processed": null,
+        "total_conversations": null,
+        "progress_pct": null,
+        "docs_embedded": null,
+        "last_offset": null,
+        "saved_at": null
+      }
+    },
+    "ingest_quarantine": {
+      "schema_version": 1,
+      "status": "ok",
+      "quarantined_conversations": 0,
+      "recent_quarantined_conversations": 0,
+      "recent_window_seconds": 3600,
+      "circuit_breaker_limit": 25,
+      "circuit_breaker_active": false,
+      "quarantine_files": [],
+      "newest_last_attempt_at_ms": null,
+      "recommended_action": null
+    }
+  },
+  "discovery": {
+    "capabilities_command": "cass capabilities --json",
+    "schemas_command": "cass introspect --json",
+    "docs_command": "cass robot-docs guide",
+    "api_version_command": "cass api-version --json"
+  },
+  "starter_workflows": [
+    {
+      "name": "cold-start",
+      "intent": "Discover readiness, exact next command, docs, schemas, workflows, and recoveries from zero context.",
+      "first_command": "cass triage --json",
+      "follow_up_commands": [
+        "cass capabilities --json",
+        "cass --robot-help --color=never",
+        "cass robot-docs guide --color=never",
+        "cass introspect --json"
+      ],
+      "parse_contract": "Parse status, healthy, initialized, next_command, recommended_commands[], discovery, starter_workflows[], and mistake_recoveries[].",
+      "note": "Use triage first when you do not know whether the archive is initialized; use capabilities/introspect for static API binding."
+    },
+    {
+      "name": "api-discovery",
+      "intent": "Discover the static CLI contract for typed clients and prompt construction.",
+      "first_command": "cass capabilities --json",
+      "follow_up_commands": [
+        "cass introspect --json",
+        "cass robot-docs commands --color=never",
+        "cass robot-docs schemas --color=never"
+      ],
+      "parse_contract": "Parse workflows, commands, global_flags, exit_codes, env_vars, limits, and response_schemas.",
+      "note": "Capabilities is static self-description; triage is the read-only runtime preflight."
+    },
+    {
+      "name": "health-preflight",
+      "intent": "Check whether search is ready before issuing queries.",
+      "first_command": "cass health --json",
+      "follow_up_commands": [
+        "cass status --json",
+        "cass index --full --json",
+        "cass doctor --json"
+      ],
+      "parse_contract": "Branch on healthy, status, fallback_mode, and recommended_action.",
+      "note": "Do not hand-delete index assets; index/doctor are the recovery surfaces."
+    },
+    {
+      "name": "bounded-search",
+      "intent": "Search sessions without flooding the caller's token budget.",
+      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+      "follow_up_commands": [
+        "cass view <source_path> -n <line_number> --json",
+        "cass expand <source_path> --line <line_number> -C 3 --json",
+        "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10"
+      ],
+      "parse_contract": "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
+      "note": "Prefer an explicit --limit in automation; limit 0 intentionally means unbounded."
+    },
+    {
+      "name": "answer-pack",
+      "intent": "Build a deterministic cited handoff bundle for another agent.",
+      "first_command": "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
+      "follow_up_commands": [
+        "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
+        "cass view <source_path> -n <line_number> --json"
+      ],
+      "parse_contract": "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
+      "note": "Use pack when the downstream consumer needs citations rather than raw search hits."
+    },
+    {
+      "name": "session-drilldown",
+      "intent": "Move from a hit to surrounding conversation context.",
+      "first_command": "cass view <source_path> -n <line_number> --json",
+      "follow_up_commands": [
+        "cass expand <source_path> --line <line_number> -C 5 --json",
+        "cass context <source_path> --json",
+        "cass resume <source_path> --shell"
+      ],
+      "parse_contract": "Parse path, line_number, message, surrounding messages, and resume command output.",
+      "note": "Use source_path and line_number from search hits; do not infer file formats by hand."
+    },
+    {
+      "name": "semantic-models",
+      "intent": "Understand or repair semantic-search readiness.",
+      "first_command": "cass models status --json",
+      "follow_up_commands": [
+        "cass models verify --json",
+        "cass models install --model minilm",
+        "cass models install --from-file <dir> --model minilm",
+        "cass models backfill"
+      ],
+      "parse_contract": "Parse installed, available, cache_dir, verification status, and err.kind.",
+      "note": "Models are opt-in; lexical fallback is valid while the model is absent."
+    }
+  ],
+  "mistake_recoveries": [
+    {
+      "wrong": "cass searh \"query\" --robot --limit 10",
+      "canonical": "cass search \"query\" --robot --limit 10",
+      "accepted": true,
+      "behavior": "Levenshtein command recovery corrects the top-level subcommand typo."
+    },
+    {
+      "wrong": "cass -robot-help",
+      "canonical": "cass --robot-help",
+      "accepted": true,
+      "behavior": "Single-dash long global flags are normalized to double-dash form."
+    },
+    {
+      "wrong": "cass --Robot-help",
+      "canonical": "cass --robot-help",
+      "accepted": true,
+      "behavior": "Long flags are lowercased when the lowercase spelling is known."
+    },
+    {
+      "wrong": "cass --robot-docs=commands",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "The legacy flag-shaped spelling is normalized into the robot-docs subcommand."
+    },
+    {
+      "wrong": "cass commands --json",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search."
+    },
+    {
+      "wrong": "cass search \"query\" limit=5",
+      "canonical": "cass search \"query\" --limit 5",
+      "accepted": true,
+      "behavior": "Bare key=value arguments are promoted to known long flags."
+    },
+    {
+      "wrong": "cass robot-docs --robot",
+      "canonical": "cass robot-docs guide",
+      "accepted": true,
+      "behavior": "robot-docs is already machine-readable; redundant robot/json flags are removed and the guide topic is used by default."
+    },
+    {
+      "wrong": "cass help --json",
+      "canonical": "cass robot-docs guide",
+      "accepted": true,
+      "behavior": "Structured help requests route to the agent guide instead of clap's human help path."
+    },
+    {
+      "wrong": "cass help commands --json",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "Structured help for robot-docs topics routes directly to the matching robot-docs topic."
+    },
+    {
+      "wrong": "cass search --help --json",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "Structured command help routes to the machine-readable command reference while plain --help remains native clap help."
+    },
+    {
+      "wrong": "cass ready --json",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "ready is accepted as the one-shot agent triage alias."
+    },
+    {
+      "wrong": "cass preflight --json",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "preflight is accepted as the one-shot agent triage alias."
+    },
+    {
+      "wrong": "cass --json",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "A top-level structured-output request defaults to read-only agent triage instead of launching the TUI or failing usage."
+    },
+    {
+      "wrong": "cass --robot",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "A top-level robot-mode request defaults to read-only agent triage."
+    },
+    {
+      "wrong": "cass --json search auth",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "A leading structured-output flag is moved after the robot-capable subcommand."
+    },
+    {
+      "wrong": "cass --robot status",
+      "canonical": "cass status --json",
+      "accepted": true,
+      "behavior": "A leading robot-mode flag is canonicalized to the subcommand's JSON output flag."
+    },
+    {
+      "wrong": "cass --data-dir /tmp/cass health --json",
+      "canonical": "cass health --data-dir /tmp/cass --json",
+      "accepted": true,
+      "behavior": "A leading data-dir override is moved onto the data-dir-aware subcommand."
+    },
+    {
+      "wrong": "cass search --query auth --json",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "A named query option is converted to the required positional query for agent-facing commands."
+    },
+    {
+      "wrong": "cass search --q auth --json",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "Short and familiar query aliases such as --q, --text, and --pattern are converted to the required positional query."
+    },
+    {
+      "wrong": "cass search auth error --json",
+      "canonical": "cass search \"auth error\" --json",
+      "accepted": true,
+      "behavior": "Adjacent bare words after search/pack are folded into the query positional before filters are parsed."
+    },
+    {
+      "wrong": "cass answer auth --json",
+      "canonical": "cass pack auth --json",
+      "accepted": true,
+      "behavior": "Answer/handoff/bundle/evidence aliases route cited-handoff intent to the answer-pack command instead of implicit search."
+    },
+    {
+      "wrong": "cass why auth failed --json --max-evidence 3",
+      "canonical": "cass pack \"auth failed\" --json --max-evidence 3",
+      "accepted": true,
+      "behavior": "Question/RC prompt aliases route answer intent to pack, so pack-only evidence flags do not get misparsed as search flags."
+    },
+    {
+      "wrong": "cass html-export session.jsonl --json",
+      "canonical": "cass export-html session.jsonl --json",
+      "accepted": true,
+      "behavior": "Reversed HTML export spellings such as html-export, html_export, and exporthtml route to the self-contained HTML export command."
+    },
+    {
+      "wrong": "cass current --json",
+      "canonical": "cass sessions --current --json",
+      "accepted": true,
+      "behavior": "Current-session shorthands route to session discovery instead of being treated as a search query."
+    },
+    {
+      "wrong": "cass sessions current --json",
+      "canonical": "cass sessions --current --json",
+      "accepted": true,
+      "behavior": "The sessions command accepts current as a positional shorthand for the --current flag."
+    },
+    {
+      "wrong": "cass auth failed --json --max-evidence 3",
+      "canonical": "cass pack \"auth failed\" --json --max-evidence 3",
+      "accepted": true,
+      "behavior": "A bare robot query with pack-only flags is treated as answer-pack intent instead of implicit search."
+    },
+    {
+      "wrong": "cass search auth failed --json --max-evidence 3",
+      "canonical": "cass pack \"auth failed\" --json --max-evidence 3",
+      "accepted": true,
+      "behavior": "An explicit structured-output search with pack-only flags is treated as answer-pack intent instead of failing on search-only parsing."
+    },
+    {
+      "wrong": "cass auth error --json",
+      "canonical": "cass search \"auth error\" --json",
+      "accepted": true,
+      "behavior": "Unquoted top-level words in robot mode are folded into an implicit search query unless they look like a subcommand typo."
+    },
+    {
+      "wrong": "cass search query=auth --json",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "A bare query=<value> assignment is converted to the required positional query."
+    },
+    {
+      "wrong": "cass view --path session.jsonl --line 42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "A named path option is converted to the required positional path for drill-down commands."
+    },
+    {
+      "wrong": "cass view session.jsonl:42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "A grep-style path:line argument is split into the positional path plus --line."
+    },
+    {
+      "wrong": "cass view session.jsonl line=42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "A bare line=<value> assignment is converted to the drill-down --line option."
+    },
+    {
+      "wrong": "cass view session.jsonl --line-number 42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "Search-result field names such as line_number/line-number are accepted as drill-down line aliases."
+    },
+    {
+      "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 --json",
+      "canonical": "cass view session.jsonl --source local --line 42 --json",
+      "accepted": true,
+      "behavior": "Search-result field bundles can be pasted directly into follow-up drill-down commands."
+    },
+    {
+      "wrong": "cass search auth --format json",
+      "canonical": "cass search auth --robot-format json",
+      "accepted": true,
+      "behavior": "Familiar structured-output spellings are converted to cass's robot-format flag on robot-capable commands."
+    },
+    {
+      "wrong": "cass search auth --output json",
+      "canonical": "cass search auth --robot-format json",
+      "accepted": true,
+      "behavior": "Output-format aliases such as --output json and --output-format json are converted to cass's robot-format flag on robot-capable commands."
+    },
+    {
+      "wrong": "cass --format json status",
+      "canonical": "cass status --robot-format json",
+      "accepted": true,
+      "behavior": "A leading structured-output format request is moved onto the robot-capable subcommand."
+    },
+    {
+      "wrong": "cass search auth --max-results 5 --json",
+      "canonical": "cass search auth --limit 5 --json",
+      "accepted": true,
+      "behavior": "A common result-count alias is converted to the canonical limit flag."
+    },
+    {
+      "wrong": "cass search auth --max_results 5 --json",
+      "canonical": "cass search auth --limit 5 --json",
+      "accepted": true,
+      "behavior": "Snake_case long flags are normalized to kebab-case before alias recovery runs."
+    },
+    {
+      "wrong": "cass search auth max_results=5 --json",
+      "canonical": "cass search auth --limit 5 --json",
+      "accepted": true,
+      "behavior": "A bare result-count assignment is converted to the canonical limit flag."
+    },
+    {
+      "wrong": "cass search auth agent=codex days=7 fields=minimal --json",
+      "canonical": "cass search auth --agent codex --days 7 --fields minimal --json",
+      "accepted": true,
+      "behavior": "Known bare filter assignments are converted to canonical long flags."
+    },
+    {
+      "wrong": "cass search auth last=7d before=now --json",
+      "canonical": "cass search auth --since -7d --until now --json",
+      "accepted": true,
+      "behavior": "Familiar time-window assignments are converted to canonical since/until filters."
+    },
+    {
+      "wrong": "cass search auth --last 7 --before now --json",
+      "canonical": "cass search auth --since -7d --until now --json",
+      "accepted": true,
+      "behavior": "Familiar time-window alias flags are converted to canonical since/until filters."
+    },
+    {
+      "wrong": "cass search auth --provider codex --json",
+      "canonical": "cass search auth --agent codex --json",
+      "accepted": true,
+      "behavior": "Provider/tool/connector filter aliases are converted to the canonical agent filter."
+    },
+    {
+      "wrong": "cass search auth provider codex limit 5 last 7d --json",
+      "canonical": "cass search auth --agent codex --limit 5 --since -7d --json",
+      "accepted": true,
+      "behavior": "Bare filter key/value pairs after a query are converted before remaining words are folded into the query."
+    },
+    {
+      "wrong": "cass search --agent codex --limit 5 auth error --json",
+      "canonical": "cass search \"auth error\" --agent codex --limit 5 --json",
+      "accepted": true,
+      "behavior": "A query placed after leading search/pack filters is moved back to the required query positional."
+    },
+    {
+      "wrong": "cass search auth -n 5 --json",
+      "canonical": "cass search auth --limit 5 --json",
+      "accepted": true,
+      "behavior": "A familiar short result-count spelling is converted to the canonical limit flag."
+    }
+  ],
+  "_meta": {
+    "timestamp": "2026-06-27T06:48:30+00:00",
+    "data_dir": "/home/ivan/.local/share/coding-agent-search",
+    "db_path": "/home/ivan/.local/share/coding-agent-search/agent_search.db"
+  }
+}
