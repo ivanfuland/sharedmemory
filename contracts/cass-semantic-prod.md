@@ -19,8 +19,10 @@
 
 ## 就绪契约（cass-mcp 查询前应校验）
 
-- **语义就绪**：`current/vector_index/semantic_manifest.json` 的 `quality_tier.ready == true` 且 `embedder_id == "bge-m3"`。
-- **词法就绪**：`index/` 目录存在可打开。
+> ⚠ 路径无 `current/` 层级（那是已废弃的 v1 快照 serving-dir 结构）；单版本 canonical 直接是 `$CASS_DATA_DIR/...`。
+
+- **语义就绪**：`${CASS_DATA_DIR}/vector_index/semantic_manifest.json` 的 `quality_tier.ready == true` 且 `embedder_id == "bge-m3"`（`CASS_DATA_DIR` = `~/.local/share/coding-agent-search`）。
+- **词法就绪**：`${CASS_DATA_DIR}/index/` 目录存在可打开。
 - **Infinity 就绪**：`GET http://127.0.0.1:7997/health` 200。
 
 ## 新鲜度

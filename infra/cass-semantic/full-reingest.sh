@@ -12,9 +12,9 @@ NEW="${NEW_DATA_DIR:-$CANON.new}"
 URL="${CASS_INFINITY_URL:-http://127.0.0.1:7997}"
 BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
 RECALL="${RECALL_RUN:-$HOME/projects/cc-workspace/docs/projects/shared-memory/recall-regression/run.py}"
-LOCK="$HOME/.local/share/.cass-reingest.lock"
+LOCK="$HOME/.local/share/.cass-write.lock"   # 全局写锁，与 index-pull.sh 共用（codex P1#1：防 pull 在 swap 窗口写 canonical）
 
-exec 9>"$LOCK"; flock -n 9 || { echo "another reingest running"; exit 0; }
+exec 9>"$LOCK"; flock -n 9 || { echo "another cass write holds lock (reingest/pull)"; exit 0; }
 curl -sf -m5 "$URL/health" >/dev/null || { echo "FAIL: Infinity down"; exit 2; }
 
 # 1) 备份老库（回滚后路；幂等：当日已备份则跳过）
@@ -52,7 +52,10 @@ python3 -c "import json,sys;m=json.load(open('$NEW/vector_index/semantic_manifes
 CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" python3 "$RECALL" "$BIN" || { echo "FAIL: 召回门未过，不 swap"; exit 1; }
 echo "GATE PASSED."
 
-# 5) 原子 swap（仅 SWAP=1）。老库已在步骤1另备份，此处再留一份 .swapped 双保险。
+# 5) swap（仅 SWAP=1）。老库已在步骤1另备份，此处再留一份 .swapped 双保险。
+#    并发安全：全脚本持全局写锁 → index-pull/另一次 reingest 不能并发写 canonical（codex P1#1 writer 竞争已堵）。
+#    残留：两次 mv 间 canonical 短暂不存在（亚毫秒），仅影响并发 READER（search）——失败重试即可，不损坏。
+#    单用户 + swap 仅全量重建(罕见/手动)，不值得为此上 renameat2(RENAME_EXCHANGE)。
 if [ "${SWAP:-0}" = "1" ]; then
   [ -d "$CANON" ] && mv "$CANON" "$CANON.0.6.13.bak.swapped.$(date +%Y%m%d-%H%M%S)"
   mv "$NEW" "$CANON"
