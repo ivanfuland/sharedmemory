@@ -113,6 +113,15 @@ def test_cass_export_rejects_oversized(tmp_path):
     assert out["error"] == "session_too_large"
 
 
+def test_call_audits_and_wraps_runner_exception(monkeypatch, tmp_path):
+    def boom(*a, **k): raise FileNotFoundError("no cass")
+    monkeypatch.setattr(S.runner, "run_cass", boom)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    out = S.cass_search(query="q")
+    assert out["error"] == "cass_exception"            # 异常转 error dict，不穿透
+    assert (tmp_path / "a.log").read_text().strip()    # 审计写了
+
+
 def test_server_module_refuses_import_without_bearer():
     env = {k: v for k, v in os.environ.items() if k != "CASS_MCP_BEARER"}
     r = subprocess.run([sys.executable, "-c", "import cass_mcp.server"],

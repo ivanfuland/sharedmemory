@@ -31,9 +31,16 @@ def _audit(tool, params, status, dur_ms):
 def _call(tool, args):
     spec = contract.TOOLS[tool]                          # subcmd + want_json 单一来源
     t0 = time.monotonic()
-    r = runner.run_cass(spec["subcmd"], args, want_json=spec["want_json"], cass_bin=config.CASS_BIN, breaker=_BREAKER)
-    _audit(tool, args, "error" if "error" in r else "ok", round((time.monotonic() - t0) * 1000))
-    return r
+    r = None
+    try:
+        r = runner.run_cass(spec["subcmd"], args, want_json=spec["want_json"], cass_bin=config.CASS_BIN, breaker=_BREAKER)
+        return r
+    except Exception as e:                               # cass_bin 缺失等：MCP 工具返回 error，不穿透
+        r = {"error": "cass_exception", "detail": str(e)[:300]}
+        return r
+    finally:
+        status = "error" if (r is None or "error" in r) else "ok"
+        _audit(tool, args, status, round((time.monotonic() - t0) * 1000))
 
 @mcp.tool(description="语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
                       "说『之前/上次/我们讨论过』、或问某事来龙去脉时用。返回 hits[]，每条含 source_path/agent/snippet/score；"
@@ -62,9 +69,13 @@ def cass_export(source_path: str, fmt: str = "markdown"):
     try:
         sz = os.path.getsize(source_path)
     except OSError as e:
-        return {"error": "stat_failed", "detail": str(e)}
+        r = {"error": "stat_failed", "detail": str(e)}
+        _audit("cass_export", [source_path], "error", 0)
+        return r
     if sz > _EXPORT_MAX_BYTES:
-        return {"error": "session_too_large", "size_bytes": sz}
+        r = {"error": "session_too_large", "size_bytes": sz}
+        _audit("cass_export", [source_path], "error", 0)
+        return r
     return _call("cass_export", [source_path, "--format", fmt])
 
 @mcp.tool(description="CASS 自检：索引新鲜度、库统计。注意：返回里的 semantic.available 反映的是 cass 原生 ONNX 路径"
