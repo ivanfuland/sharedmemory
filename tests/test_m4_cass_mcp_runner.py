@@ -22,10 +22,15 @@ def test_run_timeout(tmp_path):
     r = runner.run_cass("search", ["q"], cass_bin=cass, timeout_s=0.3)
     assert r["error"] == "timeout"
 
-def test_run_truncates_oversized(tmp_path):
+def test_run_truncates_json_returns_error(tmp_path):
     cass = _fake_cass(tmp_path, 'python3 -c "print(\'x\'*100000)"')
-    r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000)
-    assert r.get("truncated") is True
+    r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000)   # want_json=True
+    assert r["error"] == "result_too_large" and r["bytes"] > 1000
+
+def test_run_truncates_text_returns_partial(tmp_path):
+    cass = _fake_cass(tmp_path, 'python3 -c "print(\'y\'*100000)"')
+    r = runner.run_cass("export", ["/p"], cass_bin=cass, want_json=False, max_bytes=1000)
+    assert r.get("truncated") is True and "text" in r
 
 def test_run_export_returns_text_not_json(tmp_path):
     cass = _fake_cass(tmp_path, 'printf "# Session\\nhello markdown\\n"')   # 非 JSON 输出

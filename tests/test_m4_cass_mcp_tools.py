@@ -9,7 +9,7 @@ def test_cass_search_fixture_shape():
     """search fixture 语义模式输出：dict，hits 为非空 list，每条含 source_path 或 agent。"""
     d = json.loads((FIXTURES / "search.json").read_text())
     # search --json 返回 dict，hits key（非 results/rows）
-    rows = d if isinstance(d, list) else d.get("results", d.get("hits", []))
+    rows = d if isinstance(d, list) else d.get("hits", d.get("results", []))
     assert isinstance(rows, list)
     assert rows, "search fixture 应有结果（语义模式在真实语料上必有命中）"
     assert "source_path" in rows[0] or "agent" in rows[0]
@@ -38,7 +38,7 @@ def test_cass_export_fixture_shape():
     text = (FIXTURES / "export.md").read_text()
     assert text.strip(), "export fixture 应非空"
     # markdown export 首行含 # 标题
-    assert "#" in text
+    assert text.lstrip().startswith("#")
 
 
 def test_cass_triage_fixture_shape():
@@ -125,5 +125,5 @@ def test_call_audits_and_wraps_runner_exception(monkeypatch, tmp_path):
 def test_server_module_refuses_import_without_bearer():
     env = {k: v for k, v in os.environ.items() if k != "CASS_MCP_BEARER"}
     r = subprocess.run([sys.executable, "-c", "import cass_mcp.server"],
-                       env=env, capture_output=True, cwd="/home/ivan/projects/sharedmemory.worktrees/m4-cass-mcp")
+                       env=env, capture_output=True, cwd=str(pathlib.Path(__file__).resolve().parent.parent))
     assert r.returncode != 0 and b"CASS_MCP_BEARER" in r.stderr

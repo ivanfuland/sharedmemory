@@ -9,7 +9,7 @@ from cass_mcp import runner, contract, config                       # config imp
 _BEARER = os.environ.get("CASS_MCP_BEARER")
 if not _BEARER:
     raise RuntimeError("CASS_MCP_BEARER 未设置：cass-mcp 拒绝无鉴权（fail-fast）")
-_TOKENS = {_BEARER: {"client_id": os.environ.get("CASS_MCP_TOKEN_ID", "hub")}}
+_TOKENS = {_BEARER: {"client_id": os.environ.get("CASS_MCP_TOKEN_ID", "hub"), "scopes": []}}
 mcp = FastMCP("cass-mcp", auth=StaticTokenVerifier(_TOKENS))
 _BREAKER = runner.CircuitBreaker()
 
@@ -21,12 +21,15 @@ def _token_id():
         return "?"
 
 def _audit(tool, params, status, dur_ms):
-    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "params": str(params)[:200],
-           "token_id": _token_id(), "status": status, "duration_ms": dur_ms}
-    audit_path = os.environ.get("CASS_MCP_AUDIT", config.CASS_AUDIT)
-    os.makedirs(os.path.dirname(os.path.abspath(audit_path)), exist_ok=True)
-    with open(audit_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "params": str(params)[:200],
+               "token_id": _token_id(), "status": status, "duration_ms": dur_ms}
+        audit_path = os.environ.get("CASS_MCP_AUDIT", config.CASS_AUDIT)
+        os.makedirs(os.path.dirname(os.path.abspath(audit_path)), exist_ok=True)
+        with open(audit_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 审计尽力而为，绝不掩盖工具返回
 
 def _call(tool, args):
     spec = contract.TOOLS[tool]                          # subcmd + want_json 单一来源

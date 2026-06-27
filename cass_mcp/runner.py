@@ -1,4 +1,6 @@
 # cass_mcp/runner.py
+# NOTE: 语义检索依赖 CASS_DATA_DIR / CASS_INFINITY_URL 在进程 env 中（由 cass_mcp.config import 时
+# setdefault 设好；server.py 已 import config，故 run_cass 调用时 env 已就绪）。
 import json, os, subprocess, time
 
 class CircuitBreaker:
@@ -29,7 +31,10 @@ def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_b
     if breaker: breaker.record(True, now)
     out = p.stdout
     if len(out) > max_bytes:
-        return {"truncated": True, "raw": out[:max_bytes].decode("utf-8", "ignore")}
+        if want_json:
+            return {"error": "result_too_large", "bytes": len(out),
+                    "hint": "narrow query: lower limit or max_content_length"}
+        return {"truncated": True, "text": out[:max_bytes].decode("utf-8", "ignore")}
     text = out.decode("utf-8", "replace")
     if not want_json:
         return {"text": text}                            # export markdown 文本，不 json.loads
