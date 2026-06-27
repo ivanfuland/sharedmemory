@@ -69,3 +69,52 @@ def test_contract_search_hits_extractor():
     assert isinstance(hits, list)
     assert hits, "hits 应非空"
     assert "source_path" in hits[0]
+
+
+# ---- B3 追加 ----
+# NOTE: fastmcp 3.4.2 的 @mcp.tool(description=...) 装饰器返回原始函数本身（非 FunctionTool），
+# 因此无 .fn 属性。工具函数是普通 def，直接调用即可（无需 await）。
+# FunctionTool 对象只能通过 `await mcp.get_tool(name)` 获取（用于元数据场景）。
+import os, sys, subprocess
+os.environ.setdefault("CASS_MCP_BEARER", "test-bearer")   # server 模块加载即要求 bearer（fail-fast），import 前置
+from cass_mcp import server as S
+
+
+def test_cass_search_tool_calls_runner(monkeypatch, tmp_path):
+    calls = {}
+    def fake_run(subcmd, args, **kw): calls["call"] = (subcmd, args, kw); return {"hits": [{"agent": "codex"}]}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
+    out = S.cass_search(query="x方案", limit=5)   # @mcp.tool 返回原函数，直接调用（非 .fn）
+    assert out["hits"][0]["agent"] == "codex"
+    args = calls["call"][1]
+    assert calls["call"][0] == "search"
+    # 语义 flags 必须在（读侧改走语义的硬纪律，契约 cass-semantic-prod.md）
+    assert "--mode" in args and "semantic" in args and "--model" in args and "bge-m3" in args
+    assert "--rerank" in args                                  # 默认开 rerank（spike rerank@5≈0.97）
+    assert "--max-content-length" in args                      # 控量（非 --fields minimal，保 snippet）
+    assert calls["call"][2].get("want_json") is True           # contract 驱动
+    assert (tmp_path / "audit.log").exists()                   # 访问日志写了
+
+
+def test_cass_export_uses_text_mode(monkeypatch, tmp_path):
+    small = tmp_path / "s.jsonl"; small.write_text("{}")
+    calls = {}
+    def fake_run(subcmd, args, **kw): calls["kw"] = kw; return {"text": "# md"}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    out = S.cass_export(source_path=str(small))    # 直接调用，无需 await
+    assert out["text"] == "# md" and calls["kw"].get("want_json") is False
+
+
+def test_cass_export_rejects_oversized(tmp_path):
+    big = tmp_path / "big.jsonl"; big.write_bytes(b"x" * (S._EXPORT_MAX_BYTES + 1))
+    out = S.cass_export(source_path=str(big))      # 直接调用，无需 await
+    assert out["error"] == "session_too_large"
+
+
+def test_server_module_refuses_import_without_bearer():
+    env = {k: v for k, v in os.environ.items() if k != "CASS_MCP_BEARER"}
+    r = subprocess.run([sys.executable, "-c", "import cass_mcp.server"],
+                       env=env, capture_output=True, cwd="/home/ivan/projects/sharedmemory.worktrees/m4-cass-mcp")
+    assert r.returncode != 0 and b"CASS_MCP_BEARER" in r.stderr
