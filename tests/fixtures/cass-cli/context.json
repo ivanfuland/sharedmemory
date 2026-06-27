@@ -1,0 +1,83 @@
+{
+  "source": {
+    "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/6b37a3e2-36f2-433f-8d18-9dea6a50145f.jsonl",
+    "source_id": "local",
+    "title": "用inngest mcp归档链接：https://lucumr.pocoo.org/2026/6/23/the-coming-loop/",
+    "agent": "claude_code",
+    "workspace": "/home/ivan/projects/cc-workspace",
+    "started_at": "2026-06-27T02:14:46.512+00:00"
+  },
+  "related": {
+    "same_workspace": [
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/ab97e765-498b-469c-b23f-7544cc411534.jsonl",
+        "source_id": "local",
+        "title": "看 Readwise 推荐一本书，现在的Workflow变成两个Skill的调用。",
+        "agent": "claude_code",
+        "started_at": "2026-06-27T02:19:44.201+00:00"
+      },
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/cdf5b2f9-88d9-4192-a73b-d1b2041e1870/subagents/agent-a76d19922f24c611f.jsonl",
+        "source_id": "local",
+        "title": "用户在用 Claude Code CLI（交互式会话），想知道：如何从当前的上下文「分支/fork」出一个新的会话，然后基于当前已有的上下文开始另一个不同的任务。也就是说，保留当前对话的全部上下文，但",
+        "agent": "claude_code",
+        "started_at": "2026-06-27T01:12:19.313+00:00"
+      },
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/cdf5b2f9-88d9-4192-a73b-d1b2041e1870.jsonl",
+        "source_id": "local",
+        "title": "在 Claude Code 中，我如何从当前的上下文分支成一个新的会话，然后开始另一个任务？",
+        "agent": "claude_code",
+        "started_at": "2026-06-27T01:11:48.607+00:00"
+      }
+    ],
+    "same_day": [
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-myobsidian-ivan-ai-driven/ad601c87-0d4b-47a7-96ac-17618028c9eb.jsonl",
+        "source_id": "local",
+        "title": "pull",
+        "agent": "claude_code",
+        "started_at": "2026-06-27T03:23:06.123+00:00"
+      },
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-jarvis-workflow-ts/36e5f39d-19ad-4b41-9c2d-355d7e7ee3db.jsonl",
+        "source_id": "local",
+        "title": "@/home/ivan/incoming/shot_20260627_104003.png ",
+        "agent": "claude_code",
+        "started_at": "2026-06-27T02:40:07.319+00:00"
+      },
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/ab97e765-498b-469c-b23f-7544cc411534.jsonl",
+        "source_id": "local",
+        "title": "看 Readwise 推荐一本书，现在的Workflow变成两个Skill的调用。",
+        "agent": "claude_code",
+        "started_at": "2026-06-27T02:19:44.201+00:00"
+      }
+    ],
+    "same_agent": [
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-myobsidian-ivan-ai-driven/ad601c87-0d4b-47a7-96ac-17618028c9eb.jsonl",
+        "source_id": "local",
+        "title": "pull",
+        "started_at": "2026-06-27T03:23:06.123+00:00"
+      },
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-jarvis-workflow-ts/36e5f39d-19ad-4b41-9c2d-355d7e7ee3db.jsonl",
+        "source_id": "local",
+        "title": "@/home/ivan/incoming/shot_20260627_104003.png ",
+        "started_at": "2026-06-27T02:40:07.319+00:00"
+      },
+      {
+        "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/ab97e765-498b-469c-b23f-7544cc411534.jsonl",
+        "source_id": "local",
+        "title": "看 Readwise 推荐一本书，现在的Workflow变成两个Skill的调用。",
+        "started_at": "2026-06-27T02:19:44.201+00:00"
+      }
+    ]
+  },
+  "counts": {
+    "same_workspace": 3,
+    "same_day": 3,
+    "same_agent": 3
+  }
+}
