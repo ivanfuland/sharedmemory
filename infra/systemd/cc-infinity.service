@@ -1,0 +1,20 @@
+[Unit]
+Description=Infinity inference (bge-m3 + bge-reranker-v2-m3) for CASS semantic
+
+[Service]
+# 不写 Requires/After=docker.service —— user manager 看不到 system unit（codex R1 P0#1）。
+# 改 ExecStartPre 探 daemon 可达。
+ExecStartPre=/usr/bin/docker info
+ExecStartPre=-/usr/bin/docker rm -f cc-infinity
+# 镜像 pin digest（非裸 latest，codex R1 P1）。绑 127.0.0.1 仅本机（内部服务，比 0.0.0.0 安全）。
+ExecStart=/usr/bin/docker run --rm --name cc-infinity --gpus all -p 127.0.0.1:7997:7997 \
+  -e HF_HOME=/app/.cache/huggingface -v cc-infinity-hf:/app/.cache/huggingface \
+  michaelf34/infinity@sha256:11e8b3921b9f1a58965afaad4a844c435c9807cbc82c51e47cb147b7d977fc88 \
+  v2 --model-id BAAI/bge-m3 --model-id BAAI/bge-reranker-v2-m3 --port 7997
+ExecStop=/usr/bin/docker stop cc-infinity
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target
