@@ -21,7 +21,10 @@ import { runCassIndex } from "./runner";
 export const cassIndexFunction = inngest.createFunction(
   { id: "cass-index-daily", name: "CASS incremental index pull (nightly)",
     retries: 1, concurrency: { limit: 1 } },          // concurrency=1 + 脚本内 flock 双保护
-  { cron: "TZ=Asia/Shanghai 0 4 * * *" },             // 04:00；与 distill-bridge(03:30) 两独立 cron，不串
+  [                                                   // 双 trigger：cron 定时 + event 手动触发(验证/补跑)
+    { cron: "TZ=Asia/Shanghai 0 4 * * *" },           // 04:00；与 distill-bridge(03:30) 两独立 cron，不串
+    { event: "cass/index.requested" },                // 手动 invoke 入口（部署后验证用）
+  ],
   async ({ step }) => {
     return await step.run("index-pull", () => runCassIndex());
   },
@@ -38,13 +41,25 @@ import { sendTelegram } from "@/inngest/shared/notify";
 const PULL = path.join(process.env.HOME ?? "/home/ivan",
   "projects/sharedmemory/infra/cass-semantic/index-pull.sh");
 
+function lastJsonLine(s: string): any | null {
+  const lines = (s || "").trim().split("\n").filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try { return JSON.parse(lines[i]); } catch { /* keep scanning up */ }
+  }
+  return null;
+}
+
 export async function runCassIndex(): Promise<any> {
   const r = spawnSync("bash", [PULL], { encoding: "utf-8", timeout: 2 * 60 * 60 * 1000 }); // ≤2h
   if (r.status !== 0) {
-    await sendTelegram(`🛑 *cass-index* fatal exit=${r.status}\n${(r.stderr || "").slice(0, 500)}`, { markdown: true });
-    throw new Error(`cass-index failed: ${r.stderr || r.error}`);
+    // index-pull.sh 失败路径在 stdout 末行也吐 {"ok":false,"error":...}；优先取它（含 "Infinity down" 等关键信息，codex P2）
+    const errJson = lastJsonLine(r.stdout || "");
+    const detail = errJson?.error || (r.stderr || "").slice(0, 500) || String(r.error);
+    await sendTelegram(`🛑 *cass-index* fatal exit=${r.status}\n${detail}`, { markdown: true });
+    throw new Error(`cass-index failed (exit=${r.status}): ${detail}`);
   }
-  const lines = (r.stdout || "").trim().split("\n");
-  return JSON.parse(lines[lines.length - 1]);   // index-pull.sh 末行 JSON 报告
+  const ok = lastJsonLine(r.stdout || "");
+  if (!ok) throw new Error(`cass-index: no JSON report in stdout`);
+  return ok;   // index-pull.sh 末行 JSON 报告
 }
 ```
