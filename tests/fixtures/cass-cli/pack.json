@@ -1,0 +1,334 @@
+{
+  "schema_version": "cass.pack.v1",
+  "query": {
+    "text": "记忆",
+    "normalized": "记忆",
+    "filters": {}
+  },
+  "_meta": {
+    "request_id": null,
+    "generated_at_ms": 1782549486692,
+    "elapsed_ms": 32,
+    "partial": false,
+    "format": "json",
+    "warnings": [
+      "semantic_fallback_lexical",
+      "privacy_redactions_applied"
+    ]
+  },
+  "limits": {
+    "max_tokens": 12000,
+    "estimated_tokens": 69,
+    "max_sessions": 8,
+    "max_evidence": 24,
+    "context_lines": 3,
+    "max_excerpt_chars": 1600,
+    "field_mask": "standard"
+  },
+  "realized": {
+    "search_mode": "lexical",
+    "fallback_mode": "lexical",
+    "semantic_joined": false,
+    "candidate_count": 3,
+    "selected_evidence_count": 3,
+    "selected_session_count": 1
+  },
+  "health": {
+    "healthy": true,
+    "recommended_action": "continue with lexical evidence or install semantic model explicitly",
+    "index_state": "ready",
+    "index_generation": null,
+    "lexical_readiness": "ready",
+    "semantic_state": "fallback_lexical",
+    "active_rebuild": false,
+    "lock_state": null,
+    "missing_database": false,
+    "source_sync_gaps": [],
+    "source_readiness": [
+      {
+        "source_id": "local",
+        "origin_kind": "local",
+        "readiness": "healthy",
+        "healthy": true,
+        "evidence_count": 3
+      }
+    ]
+  },
+  "freshness": {
+    "policy": "prefer-recent",
+    "window_seconds": 2592000,
+    "newest_evidence_at_ms": 1782204908123,
+    "oldest_evidence_at_ms": 1782178788514,
+    "stale_evidence_count": 0
+  },
+  "pack": {
+    "title": "记忆",
+    "answer_outline": [
+      {
+        "rank": 1,
+        "heading": "claude_code evidence from local",
+        "evidence_ids": [
+          "ev_4b9e1da696613184"
+        ]
+      },
+      {
+        "rank": 2,
+        "heading": "claude_code evidence from local",
+        "evidence_ids": [
+          "ev_f31fcd3bb29ca9be"
+        ]
+      },
+      {
+        "rank": 3,
+        "heading": "claude_code evidence from local",
+        "evidence_ids": [
+          "ev_1e1e712075443e82"
+        ]
+      }
+    ],
+    "source_summary": [
+      {
+        "source_id": "local",
+        "origin_kind": "local",
+        "session_count": 1,
+        "evidence_count": 3,
+        "newest_evidence_at_ms": 1782204908123,
+        "healthy": true
+      }
+    ],
+    "handoff": [
+      {
+        "rank": 1,
+        "kind": "fact",
+        "text": "[Tool: Edit - [REDACTED_PATH]/006-路线图：共享记忆层实施.md]",
+        "evidence_ids": [
+          "ev_4b9e1da696613184"
+        ]
+      },
+      {
+        "rank": 2,
+        "kind": "fact",
+        "text": "[Tool: Read - [REDACTED_PATH]/006-路线图：共享记忆层实施.md]",
+        "evidence_ids": [
+          "ev_f31fcd3bb29ca9be"
+        ]
+      },
+      {
+        "rank": 3,
+        "kind": "fact",
+        "text": "[Tool: Read - [REDACTED_PATH]/006-路线图：共享记忆层实施.md]",
+        "evidence_ids": [
+          "ev_1e1e712075443e82"
+        ]
+      }
+    ]
+  },
+  "evidence": [
+    {
+      "id": "ev_4b9e1da696613184",
+      "rank": 1,
+      "excerpt": "[Tool: Edit - [REDACTED_PATH]/006-路线图：共享记忆层实施.md]",
+      "excerpt_truncated": false,
+      "estimated_tokens": 23,
+      "citation": {
+        "source_path": "[REDACTED_PATH]/4b533c61-7e5d-4394-a494-d8407357344f.jsonl",
+        "source_id": "local",
+        "origin_kind": "local",
+        "origin_host": null,
+        "workspace": "[REDACTED_PATH]/cc-workspace",
+        "workspace_original": null,
+        "agent": "claude_code",
+        "line_start": 449,
+        "line_end": 449,
+        "message_index": null,
+        "conversation_id": 744,
+        "content_hash": "eb63a90df598925c",
+        "span_hash": "eb63a90df598925c",
+        "excerpt_sha256": "eae25d06d659294f96f4fc5c2a00fba38041b5328a60428d9e47d4881c5a191e",
+        "created_at_ms": 1782204908123,
+        "indexed_at_ms": null,
+        "freshness_age_seconds": 344578,
+        "match_type": "exact",
+        "verified": true
+      },
+      "trust": {
+        "schema_version": 1,
+        "trust_tier": "unverified",
+        "confidence": "medium",
+        "provenance_refs": [],
+        "stale_reason": "workspace_mismatch",
+        "recommended_followup": "Unverified — corroborate before reuse (no linked commit or closed bead)."
+      },
+      "selection": {
+        "score": 0.7500000000000001,
+        "token_cost": 23,
+        "selected_reason": "strong_citation"
+      },
+      "roles": [],
+      "matched_terms": [],
+      "redactions": [
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 92,
+          "replacement": "[REDACTED_PATH]/<name>"
+        },
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 103,
+          "replacement": "[REDACTED_PATH]/<name>"
+        },
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 32,
+          "replacement": "[REDACTED_PATH]/<name>"
+        }
+      ]
+    },
+    {
+      "id": "ev_f31fcd3bb29ca9be",
+      "rank": 2,
+      "excerpt": "[Tool: Read - [REDACTED_PATH]/006-路线图：共享记忆层实施.md]",
+      "excerpt_truncated": false,
+      "estimated_tokens": 23,
+      "citation": {
+        "source_path": "[REDACTED_PATH]/4b533c61-7e5d-4394-a494-d8407357344f.jsonl",
+        "source_id": "local",
+        "origin_kind": "local",
+        "origin_host": null,
+        "workspace": "[REDACTED_PATH]/cc-workspace",
+        "workspace_original": null,
+        "agent": "claude_code",
+        "line_start": 447,
+        "line_end": 447,
+        "message_index": null,
+        "conversation_id": 744,
+        "content_hash": "7a38e1733c83faf6",
+        "span_hash": "7a38e1733c83faf6",
+        "excerpt_sha256": "ff75692a181fd9d4cfb6ef9a806cb30a529056067d7796110bd4ea6d6c98edca",
+        "created_at_ms": 1782204853772,
+        "indexed_at_ms": null,
+        "freshness_age_seconds": 344632,
+        "match_type": "exact",
+        "verified": true
+      },
+      "trust": {
+        "schema_version": 1,
+        "trust_tier": "unverified",
+        "confidence": "medium",
+        "provenance_refs": [],
+        "stale_reason": "workspace_mismatch",
+        "recommended_followup": "Unverified — corroborate before reuse (no linked commit or closed bead)."
+      },
+      "selection": {
+        "score": 0.6500000000000001,
+        "token_cost": 23,
+        "selected_reason": "strong_citation"
+      },
+      "roles": [],
+      "matched_terms": [],
+      "redactions": [
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 92,
+          "replacement": "[REDACTED_PATH]/<name>"
+        },
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 103,
+          "replacement": "[REDACTED_PATH]/<name>"
+        },
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 32,
+          "replacement": "[REDACTED_PATH]/<name>"
+        }
+      ]
+    },
+    {
+      "id": "ev_1e1e712075443e82",
+      "rank": 3,
+      "excerpt": "[Tool: Read - [REDACTED_PATH]/006-路线图：共享记忆层实施.md]",
+      "excerpt_truncated": false,
+      "estimated_tokens": 23,
+      "citation": {
+        "source_path": "[REDACTED_PATH]/4b533c61-7e5d-4394-a494-d8407357344f.jsonl",
+        "source_id": "local",
+        "origin_kind": "local",
+        "origin_host": null,
+        "workspace": "[REDACTED_PATH]/cc-workspace",
+        "workspace_original": null,
+        "agent": "claude_code",
+        "line_start": 6,
+        "line_end": 6,
+        "message_index": null,
+        "conversation_id": 744,
+        "content_hash": "b084ab40c8dd3597",
+        "span_hash": "b084ab40c8dd3597",
+        "excerpt_sha256": "ff75692a181fd9d4cfb6ef9a806cb30a529056067d7796110bd4ea6d6c98edca",
+        "created_at_ms": 1782178788514,
+        "indexed_at_ms": null,
+        "freshness_age_seconds": 370698,
+        "match_type": "exact",
+        "verified": true
+      },
+      "trust": {
+        "schema_version": 1,
+        "trust_tier": "unverified",
+        "confidence": "medium",
+        "provenance_refs": [],
+        "stale_reason": "workspace_mismatch",
+        "recommended_followup": "Unverified — corroborate before reuse (no linked commit or closed bead)."
+      },
+      "selection": {
+        "score": 0.6500000000000001,
+        "token_cost": 23,
+        "selected_reason": "strong_citation"
+      },
+      "roles": [],
+      "matched_terms": [],
+      "redactions": [
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 92,
+          "replacement": "[REDACTED_PATH]/<name>"
+        },
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 103,
+          "replacement": "[REDACTED_PATH]/<name>"
+        },
+        {
+          "kind": "private_path",
+          "start_char": 0,
+          "end_char": 32,
+          "replacement": "[REDACTED_PATH]/<name>"
+        }
+      ]
+    }
+  ],
+  "omitted": {
+    "count": 0,
+    "items": []
+  },
+  "privacy": {
+    "redaction_policy": "strict",
+    "redaction_applied": true,
+    "sensitive_output": false,
+    "skill_content_included": false,
+    "redaction_counts": {
+      "private_path": 9
+    }
+  },
+  "warnings": [
+    "semantic_fallback_lexical",
+    "privacy_redactions_applied"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "sessions": [
+    {
+      "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/c576ca4b-4116-4ea2-b6e3-9cf46a0f50e8.jsonl",
+      "workspace": "/home/ivan/projects/cc-workspace",
+      "agent": "claude_code",
+      "title": "查看sharedmemory项目的spec/plan，看看目前的进度",
+      "source_id": "local",
+      "origin_host": null,
+      "modified": "2026-06-27T08:37:39.376+00:00",
+      "size_bytes": 1700327,
+      "message_count": 88,
+      "human_turns": 13
+    },
+    {
+      "path": "/home/ivan/.claude/projects/-home-ivan-projects-cc-workspace/6c692e94-27a6-4a94-be57-e4501cbe590b.jsonl",
+      "workspace": "/home/ivan/projects/cc-workspace",
+      "agent": "claude_code",
+      "title": "接：  /tmp/handoff-dyxK53.md",
+      "source_id": "local",
+      "origin_host": null,
+      "modified": "2026-06-27T08:37:34.845+00:00",
+      "size_bytes": 1846203,
+      "message_count": 176,
+      "human_turns": 20
+    },
+    {
+      "path": "/home/ivan/.claude/projects/-home-ivan-myobsidian-ivan-ai-driven/72583b92-4273-4abe-b846-1c177c2fd8ed.jsonl",
+      "workspace": "/home/ivan/myobsidian/ivan-ai-driven",
+      "agent": "claude_code",
+      "title": "查看笔记：865-Remote 工作流",
+      "source_id": "local",
+      "origin_host": null,
+      "modified": "2026-06-27T08:36:39.368+00:00",
+      "size_bytes": 996714,
+      "message_count": 47,
+      "human_turns": 13
+    }
+  ]
+}

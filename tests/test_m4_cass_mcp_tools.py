@@ -51,10 +51,14 @@ def test_cass_triage_fixture_shape():
 
 
 def test_contract_tools_keys():
-    """contract.TOOLS 包含五个预期工具，且字段齐全。"""
+    """contract.TOOLS 包含八个预期工具（原 5 + 新 3），且字段齐全。"""
     from cass_mcp.contract import TOOLS
-    expected = {"cass_search", "cass_expand", "cass_context", "cass_export", "cass_triage"}
-    assert set(TOOLS.keys()) == expected
+    expected = {
+        "cass_search", "cass_expand", "cass_context", "cass_export", "cass_triage",
+        "cass_pack", "cass_sessions", "cass_timeline",
+    }
+    assert set(TOOLS.keys()) == expected, f"期望 8 工具，实际 {set(TOOLS.keys())}"
+    assert len(TOOLS) == 8, f"contract.TOOLS 应有 8 条，实际 {len(TOOLS)}"
     for name, cfg in TOOLS.items():
         assert "subcmd" in cfg, f"{name} 缺 subcmd"
         assert "want_json" in cfg, f"{name} 缺 want_json"
@@ -148,3 +152,142 @@ def test_server_module_refuses_import_without_bearer():
     r = subprocess.run([sys.executable, "-c", "import cass_mcp.server"],
                        env=env, capture_output=True, cwd=str(pathlib.Path(__file__).resolve().parent.parent))
     assert r.returncode != 0 and b"CASS_MCP_BEARER" in r.stderr
+
+
+# ---- M4 Phase B 新增：cass_pack / cass_sessions / cass_timeline ----
+
+def test_cass_sessions_fixture_shape():
+    """sessions fixture：dict，含 sessions 列表，每条含 path/agent/title/message_count。"""
+    d = json.loads((FIXTURES / "sessions.json").read_text())
+    assert isinstance(d, dict), "sessions fixture 应为 dict"
+    assert "sessions" in d, "顶层应有 sessions 键"
+    rows = d["sessions"]
+    assert isinstance(rows, list) and rows, "sessions 列表应非空"
+    first = rows[0]
+    for key in ("path", "agent", "title", "message_count"):
+        assert key in first, f"sessions 每条应含 {key}"
+
+
+def test_cass_timeline_fixture_shape():
+    """timeline fixture：dict，含 range/total_sessions/groups。"""
+    d = json.loads((FIXTURES / "timeline.json").read_text())
+    assert isinstance(d, dict), "timeline fixture 应为 dict"
+    assert "range" in d
+    assert "total_sessions" in d
+    assert "groups" in d
+
+
+def test_cass_pack_fixture_shape():
+    """pack fixture：dict，schema_version=cass.pack.v1，不含语义 flag 痕迹。"""
+    d = json.loads((FIXTURES / "pack.json").read_text())
+    assert isinstance(d, dict), "pack fixture 应为 dict"
+    assert d.get("schema_version") == "cass.pack.v1", "pack 应返回 cass.pack.v1"
+    # 验证 fixture 是用纯 lexical 模式抓的（无语义字段污染）
+    assert "query" in d
+
+
+def test_cass_pack_tool_calls_runner_no_semantic_flags(monkeypatch, tmp_path):
+    """cass_pack 走 run_cass subcmd=pack，args 含 query+--limit，
+    且绝不含 --mode / semantic / --rerank（pack 不支持语义 flag）。"""
+    calls = {}
+    def fake_run(subcmd, args, **kw):
+        calls["call"] = (subcmd, args, kw)
+        return {"schema_version": "cass.pack.v1", "pack": []}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
+    out = S.cass_pack(query="记忆", limit=5)
+    assert out.get("schema_version") == "cass.pack.v1"
+    subcmd, args, kw = calls["call"]
+    assert subcmd == "pack"
+    assert "记忆" in args, "query 应作为位置参数传入"
+    assert "--limit" in args and "5" in args
+    assert kw.get("want_json") is True, "pack want_json 应为 True"
+    # 硬断言：pack 绝不含语义 flag（防回归）
+    args_str = " ".join(str(a) for a in args)
+    assert "--mode" not in args_str, "pack args 不应含 --mode"
+    assert "semantic" not in args_str, "pack args 不应含 semantic"
+    assert "--rerank" not in args_str, "pack args 不应含 --rerank"
+    assert "--model" not in args_str, "pack args 不应含 --model"
+    assert (tmp_path / "audit.log").exists(), "审计日志应写入"
+
+
+def test_cass_pack_optional_args(monkeypatch, tmp_path):
+    """cass_pack：max_tokens/agent/workspace 传了才加对应 flag。"""
+    calls = {}
+    def fake_run(subcmd, args, **kw):
+        calls["call"] = (subcmd, args, kw)
+        return {"schema_version": "cass.pack.v1", "pack": []}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    S.cass_pack(query="q", max_tokens=4000, agent="codex", workspace="/tmp")
+    _, args, _ = calls["call"]
+    assert "--max-tokens" in args and "4000" in args
+    assert "--agent" in args and "codex" in args
+    assert "--workspace" in args and "/tmp" in args
+
+
+def test_cass_sessions_tool_calls_runner(monkeypatch, tmp_path):
+    """cass_sessions：subcmd=sessions，args 含 --limit；无 readiness gate。"""
+    calls = {}
+    def fake_run(subcmd, args, **kw):
+        calls["call"] = (subcmd, args, kw)
+        return {"sessions": [{"path": "/x", "agent": "cc", "title": "T", "message_count": 1}]}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
+    out = S.cass_sessions(limit=5)
+    assert "sessions" in out
+    subcmd, args, kw = calls["call"]
+    assert subcmd == "sessions"
+    assert "--limit" in args and "5" in args
+    assert kw.get("want_json") is True
+    assert (tmp_path / "audit.log").exists()
+
+
+def test_cass_sessions_optional_workspace_current(monkeypatch, tmp_path):
+    """workspace/current 传了才加对应 flag。"""
+    calls = {}
+    def fake_run(subcmd, args, **kw):
+        calls["call"] = (subcmd, args, kw); return {"sessions": []}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    # workspace 传了 → 含 --workspace
+    S.cass_sessions(workspace="/proj/x")
+    _, args, _ = calls["call"]
+    assert "--workspace" in args and "/proj/x" in args
+    assert "--current" not in args
+    # current=True → 含 --current
+    S.cass_sessions(current=True)
+    _, args, _ = calls["call"]
+    assert "--current" in args
+
+
+def test_cass_timeline_tool_calls_runner(monkeypatch, tmp_path):
+    """cass_timeline：subcmd=timeline，args 含 --since；无 readiness gate，无 --week。"""
+    calls = {}
+    def fake_run(subcmd, args, **kw):
+        calls["call"] = (subcmd, args, kw)
+        return {"range": {}, "total_sessions": 0, "groups": []}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
+    out = S.cass_timeline(since="7d")
+    assert "groups" in out
+    subcmd, args, kw = calls["call"]
+    assert subcmd == "timeline"
+    assert "--since" in args and "7d" in args
+    assert kw.get("want_json") is True
+    # 硬断言：绝不含 --week（该 flag 不存在会报错）
+    assert "--week" not in args, "timeline 不应含 --week flag（该 flag 不存在）"
+    assert (tmp_path / "audit.log").exists()
+
+
+def test_cass_timeline_optional_until_agent(monkeypatch, tmp_path):
+    """until/agent 传了才加对应 flag。"""
+    calls = {}
+    def fake_run(subcmd, args, **kw):
+        calls["call"] = (subcmd, args, kw); return {"range": {}, "total_sessions": 0, "groups": []}
+    monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    S.cass_timeline(since="today", until="yesterday", agent="codex")
+    _, args, _ = calls["call"]
+    assert "--until" in args and "yesterday" in args
+    assert "--agent" in args and "codex" in args

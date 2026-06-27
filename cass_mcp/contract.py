@@ -27,6 +27,18 @@ TOOLS = {
     "cass_triage":  {"subcmd": "triage",  "want_json": True,  "arg": "none"},
     # --stale-threshold N
     # JSON shape: dict → healthy / status / recommended_commands / search_completeness / ...
+    # ---- M4 Phase B 新增（2026-06-27 probe 钉死） ----
+    "cass_pack":     {"subcmd": "pack",     "want_json": True, "arg": "query_positional"},
+    # <QUERY> --limit N [--max-tokens N] [--agent A] [--workspace W]
+    # ⚠ 仅 lexical/hybrid，不接受 --mode semantic/--rerank/--model（传了报错）
+    # JSON shape: dict → schema_version=cass.pack.v1 / query / pack / evidence / ...
+    "cass_sessions": {"subcmd": "sessions", "want_json": True, "arg": "none"},
+    # --limit N [--workspace W] [--current]
+    # JSON shape: dict → sessions (list)；每条含 path/workspace/agent/title/source_id/modified/size_bytes/message_count/human_turns
+    "cass_timeline": {"subcmd": "timeline", "want_json": True, "arg": "none"},
+    # --since <today|yesterday|Nd|ISO> [--until <spec>] [--agent A]
+    # ⚠ 无 --week flag（传了报错）
+    # JSON shape: dict → range / total_sessions / groups
 }
 
 # 从 fixture 提取 search hits 的标准辅助（与 B3 runner 共享，避免重复硬编码 key 路径）

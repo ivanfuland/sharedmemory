@@ -114,5 +114,31 @@ def cass_export(source_path: str, fmt: str = "markdown"):
 def cass_triage(stale_threshold: int = 300):
     return _call("cass_triage", ["--stale-threshold", str(stale_threshold)])
 
+@mcp.tool(description="把某主题的历史会话打包成确定性 answer pack（agent handoff/取证）。"
+                      "注意：pack 走关键词/lexical 检索，不是语义——概念/中文模糊召回请用 cass_search；"
+                      "pack 适合已知关键词时拿结构化证据包。返回 cass.pack.v1。")
+def cass_pack(query: str, agent: str = "", workspace: str = "", limit: int = 10, max_tokens: int = 0):
+    args = [query, "--limit", str(limit)]            # ❗不加 SEMANTIC_FLAGS（pack 不支持）
+    if max_tokens: args += ["--max-tokens", str(max_tokens)]
+    if agent: args += ["--agent", agent]
+    if workspace: args += ["--workspace", workspace]
+    return _call("cass_pack", args)
+
+@mcp.tool(description="列出最近会话（按时间倒序）。问『我最近在搞啥/某项目有哪些会话』时用。"
+                      "返回 dict，sessions 字段是 list，每项 path/agent/title/message_count 等；要看内容用 cass_search/cass_expand。")
+def cass_sessions(limit: int = 10, workspace: str = "", current: bool = False):
+    args = ["--limit", str(limit)]
+    if workspace: args += ["--workspace", workspace]
+    if current: args.append("--current")
+    return _call("cass_sessions", args)
+
+@mcp.tool(description="某时间段的活动时间轴。问『上周二/最近三天干了啥』这类时间维度查询时用。"
+                      "since 接受 today/yesterday/Nd(如 7d)/ISO 日期。")
+def cass_timeline(since: str = "7d", until: str = "", agent: str = ""):
+    args = ["--since", since]
+    if until: args += ["--until", until]
+    if agent: args += ["--agent", agent]
+    return _call("cass_timeline", args)
+
 if __name__ == "__main__":        # bearer 已在模块加载强制
     mcp.run(transport="http", host="127.0.0.1", port=config.CASS_PORT)
