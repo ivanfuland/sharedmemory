@@ -3,7 +3,9 @@ name = "sharedmemory"
 version = "0.0.1"
 description = "M0 contract artifacts for the shared-memory layer"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastmcp>=3.4.2",
+]
 
 [build-system]
 requires = ["hatchling"]
