@@ -33,3 +33,32 @@ def test_gate_paired_and_power():
     assert qe.gate_paired(d, {"p_lo": 0.80, "r_lo": 0.82}) is False     # 不过绝对地板
     assert qe.power_ok({"p_lo": 0.9, "p_hi": 0.95, "r_lo": 0.85, "r_hi": 0.9, "n_clusters": 5}) is True
     assert qe.power_ok({"p_lo": 0.6, "p_hi": 0.99, "r_lo": 0.6, "r_hi": 0.99, "n_clusters": 2}) is False  # 簇少+宽
+
+
+def test_paired_delta_unique_vs_collide():
+    """固化"source 键唯一才能正确配对"契约：
+    - 全唯一 source：n_paired == N（无塌缩）
+    - 故意碰撞 source：n_paired < N（演示静默缩水，是 Fix I-1 要防止的 bug 场景）
+    """
+    N = 6
+    # 每条样本有唯一 source（conv_id:win_start 格式，模拟 Fix I-1 修复后的行为）
+    unique_per = [
+        {"source": f"conv{i}:{i*10}", "gold": 2, "extracted": 2, "matched": 1}
+        for i in range(N)
+    ]
+    delta_unique = qe.paired_delta_ci(unique_per, unique_per, n_boot=200, seed=42)
+    assert delta_unique["n_paired"] == N, (
+        f"唯一 source 时 n_paired 应等于样本数 {N}，实际 {delta_unique['n_paired']}"
+    )
+
+    # 故意让两条 source 相同（碰撞场景，模拟 Fix I-1 修复前的 bug）
+    collide_per = [
+        {"source": f"conv{i}:{i*10}", "gold": 2, "extracted": 2, "matched": 1}
+        for i in range(N)
+    ]
+    # 把最后一条的 source 改成第 0 条相同 → dict 键碰撞，后者覆盖前者
+    collide_per[-1]["source"] = collide_per[0]["source"]
+    delta_collide = qe.paired_delta_ci(collide_per, collide_per, n_boot=200, seed=42)
+    assert delta_collide["n_paired"] < N, (
+        f"source 键碰撞时 n_paired 应小于 {N}（发生塌缩），实际 {delta_collide['n_paired']}"
+    )

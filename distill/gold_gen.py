@@ -57,18 +57,18 @@ def extract_atoms(span_rows,model,base,key,temp,chat=None,ledger=None,span_id=""
 def align_count(a,b,j,chat=None,ledger=None,span_id=""):
     if not a or not b: return 0
     u=f"A={json.dumps(a,ensure_ascii=False)}\nB={json.dumps(b,ensure_ascii=False)}"
-    return int(_chat_retry(_body(j["model"],_ALIGN_SYS,u,0,500),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="align",span_id=span_id).get("matched",0))
+    return int(_chat_retry(_body(j["model"],_ALIGN_SYS,u,0,4000),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="align",span_id=span_id).get("matched",0))
 def dedup_atoms(atoms,j,chat=None,ledger=None,span_id=""):
     if len(atoms)<=1: return [{"entity":a["entity"],"fact":a["fact"]} for a in atoms]
     u=f"atoms={json.dumps([{'entity':a['entity'],'fact':a['fact']} for a in atoms],ensure_ascii=False)}"
     return _atoms_from(_chat_retry(_body(j["model"],_DEDUP_SYS,u),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="dedup",span_id=span_id))
 def is_faithful(atom,span_rows,j,chat=None,ledger=None,span_id=""):
     u=f"原文：\n{distiller._render(span_rows)}\n\n待判 atom：{json.dumps(atom,ensure_ascii=False)}"
-    return bool(_chat_retry(_body(j["model"],_FAITHFUL_SYS,u,0,500),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="faithful",span_id=span_id).get("faithful"))
+    return bool(_chat_retry(_body(j["model"],_FAITHFUL_SYS,u,0,4000),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="faithful",span_id=span_id).get("faithful"))
 def duplicate_audit(atoms,j,chat=None,ledger=None,span_id=""):
     if len(atoms)<=1: return []
     u=f"atoms={json.dumps([{'i':i,'entity':a['entity'],'fact':a['fact']} for i,a in enumerate(atoms)],ensure_ascii=False)}"
-    out=_chat_retry(_body(j["model"],_DUP_SYS,u,0,1000),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="dupaudit",span_id=span_id)
+    out=_chat_retry(_body(j["model"],_DUP_SYS,u,0,4000),_cfg(j["base_url"],j["api_key"],j["model"]),chat,ledger=ledger,stage="dupaudit",span_id=span_id)
     return [tuple(p) for p in out.get("dups",[]) if isinstance(p,(list,tuple)) and len(p)==2]
 def _all_dups(atoms,j,chat,ledger,span_id):
     """LLM 审计 ∪ 确定性词法：任一发现重复即算（不把可信只押在同族 LLM 上）。"""

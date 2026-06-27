@@ -16,7 +16,7 @@ def match_count(gold, extracted, cfg, chat):
     body = {
         "model": os.environ.get("JUDGE_MODEL") or cfg["distill"]["model"],
         "temperature": 0,
-        "max_tokens": 2000,
+        "max_tokens": 4000,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system",
@@ -38,6 +38,7 @@ def match_count(gold, extracted, cfg, chat):
         result = distiller._chat_http(body, jcfg)
     else:
         result = chat(body, cfg)
+    assert isinstance(result, dict) and "matched" in result, f"judge 返回缺 matched: {result}"
     return int(result["matched"])
 
 
@@ -164,7 +165,10 @@ def evaluate(cfg, eval_set, _chat=None, _judge=None):
         tot_gold += len(s["gold"])
         tot_ext += len(ext)
         tot_match += m
-        source = s["span"][0].get("source_path", "?") if s["span"] else "?"
+        if s.get("_meta"):
+            source = f"{s['_meta']['conv_id']}:{s['_meta']['win_start']}"
+        else:
+            source = s["span"][0].get("source_path", "?") if s["span"] else "?"
         # split: real（有 agent）or synthetic（source_path 唯一）
         split = s.get("split") or ("real" if s.get("agent") else "synthetic")
         # cluster: real 用 agent id，synthetic 用 source_path
@@ -254,6 +258,7 @@ def main():
         # flash 跑：配对 bootstrap (flash−mini)，对称非劣
         mini_per = json.load(open(a.baseline_per, encoding="utf-8"))
         delta = paired_delta_ci(real_per, mini_per)
+        assert delta["n_paired"] == len(real_per), f"配对样本塌缩: n_paired={delta['n_paired']} != real={len(real_per)}（source 键非唯一）"
         pw = power_ok(real["clustered"])
         passed = gate_paired(delta, real["flat"]) and pw
         print(f"\n[paired flash−mini] {json.dumps(delta, ensure_ascii=False)}")
