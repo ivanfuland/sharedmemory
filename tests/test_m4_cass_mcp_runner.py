@@ -43,3 +43,21 @@ def test_circuit_breaker_opens_after_5_failures(tmp_path):
     for _ in range(5): runner.run_cass("search", ["q"], cass_bin=cass, breaker=cb)
     r = runner.run_cass("search", ["q"], cass_bin=cass, breaker=cb)
     assert r["error"] == "unavailable"
+
+
+def test_breaker_counts_bad_json(tmp_path):
+    """P1-2: bad_json（exit 0 但输出非 JSON）也计入熔断失败计数。"""
+    cass = _fake_cass(tmp_path, 'echo "not json"')      # exit 0 但非 JSON
+    cb = runner.CircuitBreaker(threshold=5, cooldown_s=300)
+    for _ in range(5): runner.run_cass("search", ["q"], cass_bin=cass, breaker=cb)
+    r = runner.run_cass("search", ["q"], cass_bin=cass, breaker=cb)
+    assert r["error"] == "unavailable"
+
+
+def test_breaker_counts_result_too_large(tmp_path):
+    """P1-2: result_too_large（exit 0 但超 max_bytes）也计入熔断失败计数。"""
+    cass = _fake_cass(tmp_path, 'python3 -c "print(\'x\'*100000)"')
+    cb = runner.CircuitBreaker(threshold=5, cooldown_s=300)
+    for _ in range(5): runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb)
+    r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb)
+    assert r["error"] == "unavailable"

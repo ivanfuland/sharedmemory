@@ -1,5 +1,5 @@
 # cass_mcp/server.py
-import json, os, time
+import hashlib, json, os, time, urllib.request
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier   # B0 auth_api.md 确认 fastmcp 3.4.2 可用
 from fastmcp.server.dependencies import get_access_token
@@ -21,8 +21,12 @@ def _token_id():
         return "?"
 
 def _audit(tool, params, status, dur_ms):
+    # P2-2: 脱敏——不记原始 query 文本，只记长度 + sha256[:12]
+    p = params if isinstance(params, list) else [params]
+    q = p[0] if p else ""
+    safe = {"argc": len(p), "q_len": len(str(q)), "q_sha12": hashlib.sha256(str(q).encode()).hexdigest()[:12]}
     try:
-        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "params": str(params)[:200],
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "params": safe,
                "token_id": _token_id(), "status": status, "duration_ms": dur_ms}
         audit_path = os.environ.get("CASS_MCP_AUDIT", config.CASS_AUDIT)
         os.makedirs(os.path.dirname(os.path.abspath(audit_path)), exist_ok=True)
@@ -30,6 +34,25 @@ def _audit(tool, params, status, dur_ms):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass  # 审计尽力而为，绝不掩盖工具返回
+
+
+def _readiness():
+    """P1-3: 查询前就绪校验（契约 cass-semantic-prod.md §20/§50）。"""
+    dd = os.environ.get("CASS_DATA_DIR", "")
+    checks = {}
+    try:
+        m = json.load(open(os.path.join(dd, "vector_index", "semantic_manifest.json")))["quality_tier"]
+        checks["semantic"] = bool(m.get("ready")) and m.get("embedder_id") == "bge-m3"
+    except Exception:
+        checks["semantic"] = False
+    checks["lexical"] = os.path.isdir(os.path.join(dd, "index"))
+    try:
+        url = os.environ.get("CASS_INFINITY_URL", "").rstrip("/") + "/health"
+        with urllib.request.urlopen(url, timeout=2) as r:
+            checks["infinity"] = (getattr(r, "status", r.getcode()) == 200)
+    except Exception:
+        checks["infinity"] = False
+    return checks
 
 def _call(tool, args):
     spec = contract.TOOLS[tool]                          # subcmd + want_json 单一来源
@@ -49,9 +72,14 @@ def _call(tool, args):
                       "说『之前/上次/我们讨论过』、或问某事来龙去脉时用。返回 hits[]，每条含 source_path/agent/snippet/score；"
                       "要更全上下文用 cass_expand。新鲜度=每日 pull，最新对话可能尚未入索引。")
 def cass_search(query: str, agent: str = "", workspace: str = "", limit: int = 10,
-                max_content_length: int = 2000, rerank: bool = True):
-    args = [query, *config.SEMANTIC_FLAGS]                          # --mode semantic --daemon --model bge-m3（契约定）
-    if rerank: args.append("--rerank")                             # 默认开（spike rerank@5≈0.97）
+                max_content_length: int = 2000):
+    # P1-3: 查询前就绪校验（语义 manifest + 词法 index + Infinity health）
+    checks = _readiness()
+    if not all(checks.values()):
+        _audit("cass_search", [query], "not_ready", 0)
+        return {"error": "not_ready", "checks": checks}
+    # P1-1: --rerank 恒开（已并入 SEMANTIC_FLAGS，无可关参数）
+    args = [query, *config.SEMANTIC_FLAGS]                          # --mode semantic --daemon --model bge-m3 --rerank（契约定）
     args += ["--max-content-length", str(max_content_length), "--limit", str(limit)]  # 保 snippet，不 --fields minimal
     if agent: args += ["--agent", agent]
     if workspace: args += ["--workspace", workspace]

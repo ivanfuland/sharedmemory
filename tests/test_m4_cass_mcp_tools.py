@@ -84,6 +84,7 @@ def test_cass_search_tool_calls_runner(monkeypatch, tmp_path):
     calls = {}
     def fake_run(subcmd, args, **kw): calls["call"] = (subcmd, args, kw); return {"hits": [{"agent": "codex"}]}
     monkeypatch.setattr(S.runner, "run_cass", fake_run)
+    monkeypatch.setattr(S, "_readiness", lambda: {"semantic": True, "lexical": True, "infinity": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "audit.log"))
     out = S.cass_search(query="x方案", limit=5)   # @mcp.tool 返回原函数，直接调用（非 .fn）
     assert out["hits"][0]["agent"] == "codex"
@@ -91,10 +92,17 @@ def test_cass_search_tool_calls_runner(monkeypatch, tmp_path):
     assert calls["call"][0] == "search"
     # 语义 flags 必须在（读侧改走语义的硬纪律，契约 cass-semantic-prod.md）
     assert "--mode" in args and "semantic" in args and "--model" in args and "bge-m3" in args
-    assert "--rerank" in args                                  # 默认开 rerank（spike rerank@5≈0.97）
+    assert "--rerank" in args                                  # 恒开 rerank（P1-1: 并入 SEMANTIC_FLAGS，不可关）
     assert "--max-content-length" in args                      # 控量（非 --fields minimal，保 snippet）
     assert calls["call"][2].get("want_json") is True           # contract 驱动
     assert (tmp_path / "audit.log").exists()                   # 访问日志写了
+
+
+def test_cass_search_no_rerank_param():
+    """P1-1: cass_search 签名不再接受 rerank 参数（--rerank 恒开，无可关 footgun）。"""
+    import inspect
+    sig = inspect.signature(S.cass_search)
+    assert "rerank" not in sig.parameters, "cass_search 不应暴露 rerank 参数（已并入 SEMANTIC_FLAGS 恒开）"
 
 
 def test_cass_export_uses_text_mode(monkeypatch, tmp_path):
@@ -116,10 +124,23 @@ def test_cass_export_rejects_oversized(tmp_path):
 def test_call_audits_and_wraps_runner_exception(monkeypatch, tmp_path):
     def boom(*a, **k): raise FileNotFoundError("no cass")
     monkeypatch.setattr(S.runner, "run_cass", boom)
+    monkeypatch.setattr(S, "_readiness", lambda: {"semantic": True, "lexical": True, "infinity": True})
     monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
     out = S.cass_search(query="q")
     assert out["error"] == "cass_exception"            # 异常转 error dict，不穿透
     assert (tmp_path / "a.log").read_text().strip()    # 审计写了
+
+
+def test_cass_search_blocks_when_not_ready(monkeypatch, tmp_path):
+    """P1-3: readiness 校验失败时 cass_search 返回 not_ready 且不调 run_cass。"""
+    monkeypatch.setattr(S, "_readiness", lambda: {"semantic": False, "lexical": True, "infinity": True})
+    called = {"n": 0}
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(tmp_path / "a.log"))
+    out = S.cass_search(query="q")
+    assert out["error"] == "not_ready"
+    assert "checks" in out
+    assert called["n"] == 0, "readiness 失败时不应调用 run_cass"
 
 
 def test_server_module_refuses_import_without_bearer():

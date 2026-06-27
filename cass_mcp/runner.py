@@ -28,17 +28,24 @@ def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_b
     if p.returncode != 0:
         if breaker: breaker.record(False, now)
         return {"error": "cass_exit", "code": p.returncode, "stderr": p.stderr.decode("utf-8", "replace")[:500]}
-    if breaker: breaker.record(True, now)
+    # NOTE: 成功只在「干净解析/返回」后记 True；bad_json / result_too_large 也记 False（P1-2 fix）
     out = p.stdout
     if len(out) > max_bytes:
         if want_json:
+            if breaker: breaker.record(False, now)
             return {"error": "result_too_large", "bytes": len(out),
                     "hint": "narrow query: lower limit or max_content_length"}
+        # 文本(export)截断不算失败（有意 cap，仍返回可用文本）
+        if breaker: breaker.record(True, now)
         return {"truncated": True, "text": out[:max_bytes].decode("utf-8", "ignore")}
     text = out.decode("utf-8", "replace")
     if not want_json:
+        if breaker: breaker.record(True, now)
         return {"text": text}                            # export markdown 文本，不 json.loads
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
+        if breaker: breaker.record(False, now)
         return {"error": "bad_json", "raw": text[:500]}
+    if breaker: breaker.record(True, now)
+    return parsed
