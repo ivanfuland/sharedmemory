@@ -61,3 +61,17 @@ def test_breaker_counts_result_too_large(tmp_path):
     for _ in range(5): runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb)
     r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb)
     assert r["error"] == "unavailable"
+
+
+def test_default_cap_passes_200kb_json(tmp_path):
+    """默认 256KB cap 放行 ~200KB JSON（timeline 7d 实测 204KB），不误判 result_too_large。"""
+    cass = _fake_cass(tmp_path, "python3 -c 'import json,sys; sys.stdout.write(json.dumps({\"d\":\"x\"*200000}))'")
+    r = runner.run_cass("timeline", ["--since", "7d"], cass_bin=cass)
+    assert "error" not in r and len(r.get("d", "")) == 200000
+
+
+def test_default_cap_rejects_over_256kb_json(tmp_path):
+    """超 256KB 仍回清晰 result_too_large（病态宽窗口的 backstop）。"""
+    cass = _fake_cass(tmp_path, "python3 -c 'import json,sys; sys.stdout.write(json.dumps({\"d\":\"x\"*300000}))'")
+    r = runner.run_cass("timeline", ["--since", "30d"], cass_bin=cass)
+    assert r["error"] == "result_too_large" and r["bytes"] > 262144

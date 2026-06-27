@@ -14,7 +14,9 @@ class CircuitBreaker:
             self.fails += 1
             if self.fails >= self.threshold: self.open_until = now + self.cooldown_s
 
-def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_bytes=65536, breaker=None, _now=None):
+def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_bytes=262144, breaker=None, _now=None):
+    # max_bytes 256KB(~64k token)：单次工具返回上限。够 timeline 7d(实测204KB)/pack/sessions；
+    # 更宽窗口超此回 result_too_large+narrow 提示（见下）。search 实测仅 7-10KB，远不触。
     now = _now if _now is not None else time.monotonic()
     if breaker and not breaker.allow(now):
         return {"error": "unavailable"}
