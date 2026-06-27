@@ -1,0 +1,227 @@
+[
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "LFT 量化交易底座选用 Qlib（微软开源），不选 backtrader",
+        "source_path": "/synthetic-ctrl/choose-a-not-b"
+      }
+    ],
+    "gold": [
+      {"entity": "LFT", "fact": "底座选用 Qlib（微软开源）"},
+      {"entity": "LFT", "fact": "不选 backtrader"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "Trinity 部署配置：frontend 绑 127.0.0.1:6299，redis 映射宿主机 6380，整套走 docker compose 部署",
+        "source_path": "/synthetic-ctrl/param-bundle"
+      }
+    ],
+    "gold": [
+      {"entity": "Trinity", "fact": "frontend 绑 127.0.0.1:6299"},
+      {"entity": "Trinity", "fact": "redis 映射宿主机 6380"},
+      {"entity": "Trinity", "fact": "整套走 docker compose 部署"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "Portola AI 美术管线：Tripo 是 3D mesh 草模生成主入口，ComfyUI 是节点流编排控制面，Seedance 只做人眼动态 gate",
+        "source_path": "/synthetic-ctrl/multi-entity"
+      }
+    ],
+    "gold": [
+      {"entity": "Tripo", "fact": "是 Portola AI 美术管线中 3D mesh 草模生成主入口"},
+      {"entity": "ComfyUI", "fact": "是 Portola AI 美术管线节点流编排控制面"},
+      {"entity": "Seedance", "fact": "在 Portola AI 美术管线中只做人眼动态 gate"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "老兰决定，Inngest cron 统一使用 TZ=Asia/Shanghai 时区，定在 03:30 错开 dreaming 窗口",
+        "source_path": "/synthetic-ctrl/decider"
+      }
+    ],
+    "gold": [
+      {"entity": "Inngest", "fact": "cron 统一使用 TZ=Asia/Shanghai 时区"},
+      {"entity": "Inngest", "fact": "cron 定在 03:30 错开 dreaming 窗口"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "Ivan 在网易雷火主导重构渲染管线，实现 120/240 FPS 超高帧率、功耗 <3W、覆盖 22000+ 设备型号，是雷火首个超高帧率方案",
+        "source_path": "/synthetic-ctrl/achievement-metrics"
+      }
+    ],
+    "gold": [
+      {"entity": "Ivan", "fact": "主导重构渲染管线，是雷火首个超高帧率方案"},
+      {"entity": "渲染管线", "fact": "实现 120/240 FPS 超高帧率"},
+      {"entity": "渲染管线", "fact": "功耗 <3W"},
+      {"entity": "渲染管线", "fact": "覆盖 22000+ 设备型号"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "assistant",
+        "content": "HEARTBEAT_OK",
+        "source_path": "/synthetic-ctrl/noise-heartbeat"
+      }
+    ],
+    "gold": [],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "嗯好的",
+        "source_path": "/synthetic-ctrl/noise-ack"
+      },
+      {
+        "idx": 1,
+        "role": "assistant",
+        "content": "收到",
+        "source_path": "/synthetic-ctrl/noise-ack"
+      }
+    ],
+    "gold": [],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "cass-mcp 服务绑定 127.0.0.1:7788，通过 tailscale serve 向 tailnet 暴露",
+        "source_path": "/synthetic-ctrl/fact-cass-port"
+      }
+    ],
+    "gold": [
+      {"entity": "cass-mcp", "fact": "服务绑定 127.0.0.1:7788"},
+      {"entity": "cass-mcp", "fact": "通过 tailscale serve 向 tailnet 暴露"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "Ivan 下载视频首选格式 BluRay 2160p x265 10bit HDR",
+        "source_path": "/synthetic-ctrl/pref-download-fmt"
+      }
+    ],
+    "gold": [
+      {"entity": "Ivan", "fact": "下载视频首选格式 BluRay 2160p x265 10bit HDR"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "Ivan 偏好知名压制组出品的合集打包，代表组有 FRDS、mUHD、ADE、CHD、CMCT",
+        "source_path": "/synthetic-ctrl/pref-encode-group"
+      }
+    ],
+    "gold": [
+      {"entity": "Ivan", "fact": "偏好知名压制组（FRDS/mUHD/ADE/CHD/CMCT 等）出品的合集打包"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "assistant",
+        "content": "教训：AI 在脏状态上修补容易越修越乱，人的止损直觉不可替代",
+        "source_path": "/synthetic-ctrl/lesson-dirty-state"
+      }
+    ],
+    "gold": [
+      {"entity": "教训", "fact": "AI 在脏状态上修补容易越修越乱，人的止损直觉不可替代"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "assistant",
+        "content": "教训：验证必须端到端——看到日志行不等于功能正常；必须真实触发一次目标场景并观察末端输出",
+        "source_path": "/synthetic-ctrl/lesson-e2e-verify"
+      }
+    ],
+    "gold": [
+      {"entity": "教训", "fact": "验证必须端到端，看到日志行不等于功能正常，须真实触发目标场景观察末端输出"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "升级 cass-infinity 后，必须跑召回回归门（semantic relevance@5 ≥0.55），PASS 才切换；回归门 FAIL 则回滚 cass-infinity.prev",
+        "source_path": "/synthetic-ctrl/action-cass-upgrade"
+      }
+    ],
+    "gold": [
+      {"entity": "cass-infinity", "fact": "升级后须跑召回回归门（semantic relevance@5 ≥0.55），PASS 才切换"},
+      {"entity": "cass-infinity", "fact": "回归门 FAIL 时回滚 cass-infinity.prev"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "改 openclaw.json 必须走 openclaw config set/unset CLI，禁止直接编辑；否则 zod schema 校验失败会静默 auto-restore，改动丢失",
+        "source_path": "/synthetic-ctrl/action-openclaw-config"
+      }
+    ],
+    "gold": [
+      {"entity": "openclaw.json", "fact": "必须走 openclaw config set/unset CLI 修改，禁止直接编辑"},
+      {"entity": "openclaw.json", "fact": "直接编辑后 zod 校验失败会静默 auto-restore，改动丢失"}
+    ],
+    "split": "synthetic"
+  },
+  {
+    "span": [
+      {
+        "idx": 0,
+        "role": "user",
+        "content": "任何 headless / 自动化 / 定时 agent 驱动一律走 API key 或国产 LiteLLM，不用订阅 OAuth——否则触发 Anthropic 风控封号",
+        "source_path": "/synthetic-ctrl/decision-api-key"
+      }
+    ],
+    "gold": [
+      {"entity": "自动化 agent", "fact": "驱动一律走 API key 或国产 LiteLLM"},
+      {"entity": "自动化 agent", "fact": "不用订阅 OAuth 驱动（否则触发 Anthropic 风控封号）"}
+    ],
+    "split": "synthetic"
+  }
+]
