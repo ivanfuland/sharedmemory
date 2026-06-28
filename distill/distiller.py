@@ -36,6 +36,7 @@ _SYSTEM = (
     "2) 跳过噪声：工具调用/文件读取输出、寒暄、无信息量来回 → candidates 为 []。\n"
     "3) entity_kind 选 person/project/decision/preference；entry_type 选 fact/decision/lesson/action_item。\n"
     "4) 粒度：R1 不同维度/槽位各一条；R2 每个独立可查的参数/取值各一条（配置/指标 bundle 按值拆）；R3 多实体各自角色各一条（按各自实体归属）；R4「用A不用B」拆2：{用A}+{不用B}；成就+多指标拆开（成就1条+每指标各1条）；关系只记一条（按被查端，不两端各记）；约束+理由同条（除非理由独立有用）。\n"
+    "5) 例外不炸开(v1.1)：①同质枚举——同一类事物的列表(一串工具名/组名/型号/示例)整体算1条，不逐项拆；②单条连贯的教训/原则即使含多个解释分句也算1条，不逐句拆；③选项枚举『A或B』(同一槽位多个可选)算1条。\n"
     "输出严格 JSON 对象（不要代码块、不要解释）：\n"
     '{"candidates":[{"entity_name":"<串>","entity_kind":"person|project|decision|preference","entry_type":"fact|decision|lesson|action_item","fact_text":"<串>","source_idx":<整数>}]}\n'
     "示例（学这个粒度）：\n"

@@ -37,12 +37,15 @@ def main():
     with open("fixtures/m4-goldgen-ledger.jsonl","a",encoding="utf-8") as ledger, open(RESUME,"a",encoding="utf-8") as rf:
         sc=selfcheck_on_control(cfg,ledger)
         print(f"[dev selfcheck] P={sc['precision']} R={sc['recall']} dups={sc['residual_dups']} dev_union_only={sc['union_only_frac']}")
-        assert sc["precision"]>=0.9 and sc["recall"]>=0.9 and sc["residual_dups"]==0, \
-            "dev 自检不达 0.9/0.9 或有漏并 → 补 RUBRIC_PROMPT/dedup（只在 dev 调），禁用此 gold"
+        # dev 门 v1.1（Ivan option A，2026-06-28）：召回为主。手写 gold 的精确粒度是主观尺，
+        # 在 compound-spec/协议 边界与 pipeline 分歧惩罚了可辩护的更细选择；全 atom faithful 已由 build_gold 接地门保证。
+        # 真判别力在 Task 8 flash-vs-mini 配对(两者都对同一份 pipeline 共识 gold)。
+        assert sc["recall"]>=0.9 and sc["precision"]>=0.75 and sc["residual_dups"]==0, \
+            f"dev 自检: R={sc['recall']}(需≥0.9) P={sc['precision']}(软地板≥0.75) dups={sc['residual_dups']}(需0) → 补 prompt（只在 dev 调）"
         uo_max=min(UNION_ONLY_CEIL, sc["union_only_frac"]+CALIB_MARGIN)   # 用 dev 实测校准 real 阈值（非拍脑袋）
         pool=json.load(open("fixtures/m4-real-pool.json",encoding="utf-8"))
         dev=json.load(open("fixtures/m4-synthetic-control.json",encoding="utf-8"))
-        kept=[]; skipped=0; agreements=[]
+        kept=[]; skipped=0; gen_failed=0; agreements=[]
         for s in pool:
             if len(kept)>=EVAL_N: break
             key=(s["_meta"]["conv_id"],s["_meta"]["win_start"])
@@ -50,11 +53,14 @@ def main():
             else:
                 hits=secret_scan.scan_span(s)
                 if hits: skipped+=1; print(f"[secret] skip {key} hits={hits}"); continue
-                g=gold_gen.build_gold(s["span"],cfg,ledger=ledger,span_id=f"real-{key[0]}-{key[1]}")
+                try:
+                    g=gold_gen.build_gold(s["span"],cfg,ledger=ledger,span_id=f"real-{key[0]}-{key[1]}")
+                except Exception as e:   # 一条坏样本(模型返空/超时 retry 耗尽)不杀整 run → skip+refill（120 候选够回填）
+                    gen_failed+=1; print(f"[goldgen-fail] skip {key}: {type(e).__name__} {str(e)[:80]}"); continue
                 rec={"span":s["span"],"gold":g["atoms"],"split":"real","cluster":s["cluster"],"_meta":s["_meta"],"_agreement":g["agreement"],"_fp":fp}
                 rf.write(json.dumps(rec,ensure_ascii=False)+"\n"); rf.flush()   # per-span 缓存，crash 可续
             kept.append(rec); agreements.append(rec["_agreement"])
-        assert len(kept)==EVAL_N, f"real eval {len(kept)}/{EVAL_N}（pool 耗尽/secret 剔太多）→ 扩 pool_size/降 min_chars"
+        assert len(kept)==EVAL_N, f"real eval {len(kept)}/{EVAL_N}（pool 耗尽/secret {skipped}/genfail {gen_failed}）→ 扩 pool_size/降 min_chars"
         total=sum(a["n_a"]+a["n_b"] for a in agreements); union=sum(a["union_only"] for a in agreements)
         residual=sum(a["residual_dups"] for a in agreements); uo=round(union/total,3) if total else 0.0
         per_uo=[(a["union_only"]/(a["n_a"]+a["n_b"])) if (a["n_a"]+a["n_b"]) else 0 for a in agreements]

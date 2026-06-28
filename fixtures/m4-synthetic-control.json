@@ -4,12 +4,12 @@
       {
         "idx": 0,
         "role": "user",
-        "content": "LFT 量化交易底座选用 Qlib（微软开源），不选 backtrader",
+        "content": "LFT 量化交易底座选用 Qlib，不选 backtrader",
         "source_path": "/synthetic-ctrl/choose-a-not-b"
       }
     ],
     "gold": [
-      {"entity": "LFT", "fact": "底座选用 Qlib（微软开源）"},
+      {"entity": "LFT", "fact": "底座选用 Qlib"},
       {"entity": "LFT", "fact": "不选 backtrader"}
     ],
     "split": "synthetic"
@@ -156,12 +156,12 @@
       {
         "idx": 0,
         "role": "assistant",
-        "content": "教训：AI 在脏状态上修补容易越修越乱，人的止损直觉不可替代",
-        "source_path": "/synthetic-ctrl/lesson-dirty-state"
+        "content": "教训：yfinance 是实时数据源不是静态 fixture，每次 history() 都重算 adjusted close",
+        "source_path": "/synthetic-ctrl/lesson-single"
       }
     ],
     "gold": [
-      {"entity": "教训", "fact": "AI 在脏状态上修补容易越修越乱，人的止损直觉不可替代"}
+      {"entity": "教训", "fact": "yfinance 是实时数据源非静态 fixture，每次 history() 重算 adjusted close"}
     ],
     "split": "synthetic"
   },

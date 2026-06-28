@@ -21,3 +21,12 @@ infra/gbrain/serve/env.generated
 # M4 cass-mcp secrets（bearer token / 访问日志含 secret，绝不进 git）
 infra/cass-mcp/*.env
 infra/cass-mcp/*.log
+
+# M6 gold-gen 真实数据产物(含真实会话内容,PUBLIC 仓绝不提交)
+fixtures/m4-real-pool.json
+fixtures/m4-real-spans.json
+fixtures/m4-real-manifest.json
+fixtures/m4-goldgen-ledger.jsonl
+fixtures/m4-goldgen-resume.jsonl
+fixtures/m4-distill-eval.json
+fixtures/m4-distill-eval.partial.json
