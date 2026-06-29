@@ -19,7 +19,7 @@ def run_batch(cfg, sources=None, today=None, allow_unreleased=False, _chat=None,
         tools = set(REQUIRED_TOOLS) if _call is not None else writer.probe_tools(cfg, token)
         missing = [t for t in REQUIRED_TOOLS if t not in tools]
         assert not missing, f"gbrain MCP 缺工具 {missing}（probe={tools}）"
-        counters = {"raw_processed": 0, "rejected_no_provenance": 0}
+        counters = {"raw_processed": 0, "rejected_no_provenance": 0, "raw_quarantined_new": 0}
         rd = state.reset_deferred(conn, today)                       # 0) deferred 复位（优先处理）
         disc = cass_reader.discover_sources(cfg["paths"]["canon_db"], conn)   # 1) 发现 + 未知 quarantine（P0-2/R1 P0-1）
         if sources is None:
@@ -54,7 +54,9 @@ def run_batch(cfg, sources=None, today=None, allow_unreleased=False, _chat=None,
                 out = distiller.distill_span(kept, cfg, _chat=_chat)
             except Exception:
                 conn.execute("UPDATE raw_work_item SET status='raw_quarantined' WHERE id=? AND status='new'", (raw["id"],))
-                conn.commit(); continue                             # retry×2 仍败 → raw_quarantined
+                conn.commit(); counters["raw_quarantined_new"] += 1; continue   # retry×2 仍败 → raw_quarantined（本批新增计入告警分级）
+                # P2-A 已知 gap：此计数纯内存。若 commit 后、report/notify 前崩溃，重跑该 batch 时 span 已非 'new' 被跳过 → 计数归零 → 漏发本条告警。
+                # 累计 raw_quarantined_count 仍在 report JSON(日志)可见，人工巡检可兜底；不引入 DB 状态对账(窄崩溃窗口，过度工程)。
             counters["rejected_no_provenance"] += out["rejected_no_provenance"]
             sp = kept[0].get("source_path", raw["session_ref"])
             distiller.commit_distilled(conn, raw["id"], out["candidates"], sp)   # 单事务 build+insert+mark
