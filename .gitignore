@@ -12,8 +12,13 @@ fixtures/real-snapshots/
 infra/pg-memory/.env
 infra/gbrain/config.env
 infra/gbrain/clients.env
-infra/distill/config.env
+infra/distill/config.env*
 infra/distill/audit.log
+# distill 运行时产物（含真实会话 fact_text/源路径/MEMORY 分析，PUBLIC 仓绝不进 git）
+infra/distill/bridge-state.db
+infra/distill/bridge-state.db-*
+infra/distill/memory-hygiene.md
+infra/distill/review-queue/
 sandbox/gbrain-pg/
 .superpowers/
 # M2 Task2 generated env（bash-sourced clean re-emit，含 secret，绝不进 git）

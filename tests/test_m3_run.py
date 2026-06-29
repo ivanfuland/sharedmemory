@@ -38,6 +38,19 @@ def test_fingerprint_mismatch_is_fatal(tmp_path):
         run.run_batch(cfg, [("ubuntu-cc","claude_code")], "2026-06-24",
                       _chat=lambda b,c:{"candidates":[]}, _call=FakeGbrain())
 
+def test_distill_failure_surfaces_raw_quarantined_new(tmp_path, monkeypatch):
+    # 本批 distill 失败(retry×3 仍败) → raw_quarantined，report 透出本批新增计数(供告警分级用 M4)
+    canon=_canon(tmp_path); cfg=_cfg(tmp_path, canon)
+    from distill import cass_reader
+    open(cfg["paths"]["fingerprint"],"w").write(cass_reader._schema_fingerprint(canon))
+    monkeypatch.setattr("distill.writer.load_token", lambda c:"t")
+    monkeypatch.setattr("distill.writer.probe_tools", lambda c,t:{"put_page","add_timeline_entry","search","get_timeline","get_page"})
+    def boom(body, c): raise RuntimeError("model down")
+    rep=run.run_batch(cfg, sources=[("ubuntu-cc","claude_code")], today="2026-06-24",
+                      _chat=boom, _call=FakeGbrain())
+    assert rep["raw_quarantined_new"]>=1
+    assert rep["processed_count"]==0          # 失败的 span 不计入 processed
+
 def test_deferred_hard_cap_stops_bridge(tmp_path, monkeypatch):
     canon=_canon(tmp_path); cfg=_cfg(tmp_path, canon)
     from distill import cass_reader, state
