@@ -34,11 +34,12 @@ def assess_contradiction(cfg, token, slug, fact_text, call, chat=None, page_md=N
     if not _has_compiled_truth(md):
         return False
     chat = chat or distiller._chat_http
-    body = {"model": cfg["distill"]["model"], "temperature": 0,
-            "response_format": {"type": "json_schema", "json_schema": _JUDGE_SCHEMA},
+    body = {"model": cfg["distill"]["model"],
+            "temperature": float(__import__("os").environ.get("DISTILL_TEMP","0")), "max_tokens": 1000,
+            "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": "判断新事实是否与既有结论矛盾，只输出 {\"contradicts\": bool}。"},
-                {"role": "user", "content": f"既有结论：\n{_body_after_frontmatter(md)}\n\n新事实：\n{fact_text}"}]}
+                {"role":"system","content":"判断新事实是否与既有结论矛盾。只输出 JSON 对象：{\"contradicts\": true|false}。不要代码块/解释。"},
+                {"role":"user","content": f"既有结论：\n{_body_after_frontmatter(md)}\n\n新事实：\n{fact_text}"}]}
     nbytes = len(_body_after_frontmatter(md).encode()) + len(fact_text.encode())
     try:
         out = chat(body, cfg)
