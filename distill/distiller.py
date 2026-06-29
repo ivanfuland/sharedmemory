@@ -30,14 +30,22 @@ DISTILL_SCHEMA = {
 }
 
 _SYSTEM = (
-    "你是个人记忆蒸馏器。从会话片段中抽取值得长期记住的世界知识：实体（人/项目）、"
-    "事实、决策、踩坑教训(lesson)、待办(action_item)。严格按 schema 输出 candidates。\n"
-    "规则：\n"
-    "1) 每条 candidate 必须能回指原文——source_idx 填该结论所依据消息的 idx（必须是输入里出现过的 idx）。"
-    "无法回指原文的不要编造，直接不输出。\n"
-    "2) 跳过噪声：常规工具调用/文件读取输出、寒暄、无信息量的来回。\n"
+    "你是个人记忆蒸馏器。从会话片段抽取值得长期记住的世界知识，按粒度规范输出 JSON。\n"
+    "总原则=拆细：每条 candidate=一个独立可检索的事实/决策/偏好/教训/待办；宁拆细勿揉合；同一事实换措辞只记一条。\n"
+    "1) 每条 candidate 必须回指原文：source_idx 填依据消息的 idx（必须是输入出现过的 idx）；无法回指的不编造、不输出。\n"
+    "2) 跳过噪声：工具调用/文件读取输出、寒暄、无信息量来回 → candidates 为 []。\n"
     "3) entity_kind 选 person/project/decision/preference；entry_type 选 fact/decision/lesson/action_item。\n"
-    "4) 没有任何值得记的 → candidates 输出空数组 []（不要编造）。"
+    "4) 粒度：R1 不同维度/槽位各一条；R2 每个独立可查的参数/取值各一条（配置/指标 bundle 按值拆）；R3 多实体各自角色各一条（按各自实体归属）；R4「用A不用B」拆2：{用A}+{不用B}；成就+多指标拆开（成就1条+每指标各1条）；关系只记一条（按被查端，不两端各记）；约束+理由同条（除非理由独立有用）。\n"
+    "5) 例外不炸开(v1.1)：①同质枚举——同一类事物的列表(一串工具名/组名/型号/示例)整体算1条，不逐项拆；②单条连贯的教训/原则即使含多个解释分句也算1条，不逐句拆；③选项枚举『A或B』(同一槽位多个可选)算1条。\n"
+    "输出严格 JSON 对象（不要代码块、不要解释）：\n"
+    '{"candidates":[{"entity_name":"<串>","entity_kind":"person|project|decision|preference","entry_type":"fact|decision|lesson|action_item","fact_text":"<串>","source_idx":<整数>}]}\n'
+    "示例（学这个粒度）：\n"
+    "输入：[idx=0 user] 团队定：订单服务用 Go 重写，不用 Java；先灰度 10% 再全量\n"
+    "输出："
+    '{"candidates":[{"entity_name":"订单服务","entity_kind":"project","entry_type":"decision","fact_text":"用 Go 重写","source_idx":0},'
+    '{"entity_name":"订单服务","entity_kind":"project","entry_type":"decision","fact_text":"不用 Java","source_idx":0},'
+    '{"entity_name":"订单服务","entity_kind":"project","entry_type":"decision","fact_text":"先灰度 10% 再全量","source_idx":0}]}\n'
+    "（含「用A不用B」拆2 + 独立维度各一条；纯噪声/寒暄→candidates 为 []。）"
 )
 
 def _render(rows):
@@ -65,8 +73,8 @@ def _chunk_rows(rows, chunk_size, overlap):
 
 def _distill_one(chunk_rows, cfg, chat, session_ref):
     rendered = _render(chunk_rows)
-    body = {"model": cfg["distill"]["model"], "temperature": 0,
-            "response_format": {"type": "json_schema", "json_schema": DISTILL_SCHEMA},
+    body = {"model": cfg["distill"]["model"], "temperature": float(os.environ.get("DISTILL_TEMP", "0")), "max_tokens": 4000,
+            "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": _SYSTEM},
                          {"role": "user", "content": rendered}]}
     last = None
@@ -96,10 +104,32 @@ def _chat_http(body, cfg):
         raise AssertionError(f"distill HTTP {e.code}: {e.read().decode()[:300]}")
     return json.loads(out["choices"][0]["message"]["content"])
 
+_ENTITY_KINDS = {"person", "project", "decision", "preference"}
+_ENTRY_TYPES = {"fact", "decision", "lesson", "action_item"}
+_CAND_KEYS = {"entity_name", "entity_kind", "entry_type", "fact_text", "source_idx"}
+
+def _validate_candidate(c):
+    assert isinstance(c, dict) and set(c) == _CAND_KEYS, f"candidate 字段非 strict: {c}"
+    assert isinstance(c["entity_name"], str) and c["entity_name"].strip(), "entity_name 空/非串"
+    assert c["entity_kind"] in _ENTITY_KINDS, f"entity_kind 非法: {c.get('entity_kind')}"
+    assert c["entry_type"] in _ENTRY_TYPES, f"entry_type 非法: {c.get('entry_type')}"
+    assert isinstance(c["fact_text"], str) and c["fact_text"].strip(), "fact_text 空/非串"
+    assert isinstance(c["source_idx"], int) and not isinstance(c["source_idx"], bool), "source_idx 非整数"
+
 def _validate(d):
-    assert isinstance(d, dict) and set(d) == {"candidates"}, f"顶层非 strict: {set(d)}"
-    for c in d["candidates"]:
-        assert set(c) == {"entity_name", "entity_kind", "entry_type", "fact_text", "source_idx"}, f"candidate 非 strict: {c}"
+    # 顶层结构坏 → 抛（整 span quarantine，无法恢复）。
+    assert isinstance(d, dict) and set(d) == {"candidates"}, f"顶层非 strict: {set(d) if isinstance(d, dict) else type(d)}"
+    assert isinstance(d["candidates"], list), "candidates 非数组"
+    # 候选粒度过滤（codex 审 R: 别因一个坏 candidate 废掉同 span 其余合法的，flash 格式抖动常见）。
+    raw, good = d["candidates"], []
+    for c in raw:
+        try:
+            _validate_candidate(c)
+        except AssertionError:
+            continue   # 丢这一条坏的，保住其余
+        good.append(c)
+    assert not (raw and not good), f"全部 {len(raw)} 个 candidate 非法 → span quarantine"
+    d["candidates"] = good
     return d
 
 def _msg_date(ts):
