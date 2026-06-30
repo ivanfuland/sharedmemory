@@ -8,7 +8,7 @@ echo "[install-service] 生成 systemd-safe env…"
 #    直接 EnvironmentFile 原始 config.env 会把 `URL  # comment` 的行内注释吃进值（codex R1 #5）。
 set -a; source "$ROOT/infra/gbrain/config.env"; source "$ROOT/infra/pg-memory/.env"; set +a
 GEN="$HERE/env.generated"; : > "$GEN"; chmod 600 "$GEN"
-for k in OPENROUTER_BASE_URL OPENROUTER_API_KEY LLAMA_SERVER_RERANKER_BASE_URL DEEPSEEK_API_KEY POSTGRES_PASSWORD; do
+for k in OPENROUTER_BASE_URL OPENROUTER_API_KEY LLAMA_SERVER_RERANKER_BASE_URL DEEPSEEK_API_KEY LITELLM_BASE_URL LITELLM_API_KEY POSTGRES_PASSWORD; do
   v="${!k:-}"; [ -n "$v" ] || { echo "FATAL: env $k 空，先填 config.env / pg-memory/.env"; exit 1; }
   printf '%s=%s\n' "$k" "$v" >> "$GEN"
 done
@@ -20,8 +20,9 @@ mkdir -p "$(dirname "$DEST")"
 cp "$HERE/gbrain-mcp.service" "$DEST"
 echo "[install-service] unit 复制到 $DEST"
 systemctl --user daemon-reload
-systemctl --user enable --now gbrain-mcp.service
-echo "[install-service] 服务已 enable + start"
+systemctl --user enable gbrain-mcp.service
+systemctl --user restart gbrain-mcp.service
+echo "[install-service] 服务已 enable + restart（重启以应用 env/code 变更）"
 
 # 3) 等 /health
 echo "[install-service] 等待 /health 就绪（最多 10s）…"
