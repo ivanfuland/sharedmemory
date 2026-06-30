@@ -8,7 +8,7 @@ echo "[install-service] 生成 systemd-safe env…"
 #    直接 EnvironmentFile 原始 config.env 会把 `URL  # comment` 的行内注释吃进值（codex R1 #5）。
 set -a; source "$ROOT/infra/gbrain/config.env"; source "$ROOT/infra/pg-memory/.env"; set +a
 GEN="$HERE/env.generated"; : > "$GEN"; chmod 600 "$GEN"
-for k in OPENROUTER_BASE_URL OPENROUTER_API_KEY POSTGRES_PASSWORD; do
+for k in OPENROUTER_BASE_URL OPENROUTER_API_KEY LLAMA_SERVER_RERANKER_BASE_URL DEEPSEEK_API_KEY POSTGRES_PASSWORD; do
   v="${!k:-}"; [ -n "$v" ] || { echo "FATAL: env $k 空，先填 config.env / pg-memory/.env"; exit 1; }
   printf '%s=%s\n' "$k" "$v" >> "$GEN"
 done
