@@ -25,13 +25,13 @@ def _atomic_write(path, text):
 
 
 def export(db_path, out_dir, limit=20, agents=None,
-           min_turns=4, max_turns=None, min_chars=2000, pruner=None, since_ts=None):
+           min_turns=4, max_turns=None, min_chars=2000, pruner=None, since_cursor=None):
     pruner = pruner or DeterministicPruner()
     os.makedirs(out_dir, exist_ok=True)
-    convs = reader.select_conversations(db_path, limit, agents, min_turns, max_turns, since_ts=since_ts)
+    convs = reader.select_conversations(db_path, limit, agents, min_turns, max_turns, since_cursor=since_cursor)
     written, skipped, errors = [], [], []
-    max_ts, broke = None, False          # D2: max_ts = 无错 ASC 前缀的最大 last_ts(= 新水位线候选)
-    for meta in convs:                   # since_ts 给值时 reader 已 ASC 排序
+    max_cursor, broke = None, False      # D2: max_cursor = 无错 (ts,id) ASC 前缀的末端(= 新游标候选)
+    for meta in convs:                   # since_cursor 给值时 reader 已按 (ts,id) ASC 排序
         had_error = False
         try:                                            # per-conversation 隔离:单会话失败不中断整批
             msgs = reader.read_messages(db_path, meta["id"])
@@ -46,27 +46,28 @@ def export(db_path, out_dir, limit=20, agents=None,
             errors.append((meta.get("id"), repr(e)[:200]))
             had_error = True
         if had_error:
-            broke = True                 # 一旦出错,停止推进 max_ts(留给下轮重试,零静默丢失)
+            broke = True                 # 一旦出错,停止推进游标(留给下轮重试,零静默丢失)
         elif not broke and meta.get("last_ts") is not None:
-            max_ts = meta["last_ts"]     # ASC,无错前缀持续推进
+            max_cursor = (meta["last_ts"], meta["id"])  # (ts,id) ASC,无错前缀持续推进
     return {"written": written, "skipped": skipped, "errors": errors,
-            "total": len(convs), "max_ts": max_ts}
+            "total": len(convs), "max_cursor": max_cursor}
 
 
 def run_feed(db_path, out_dir, cap, state_path, backfill=False):
-    """水位线编排:读水位线 → export 增量 → 按 max_ts 推进水位线 → 存。
-    首跑(无水位线且非 backfill):播种水位线=全库 max ts + courtesy 导最新 cap 条(不 backfill 存量)。"""
-    wm = 0 if backfill else _state.load_watermark(state_path)
-    if wm is None:
-        seed = reader.max_conversation_ts(db_path)                 # D1 首跑播种
-        rep = export(db_path, out_dir, limit=cap, since_ts=None)   # 旧 DESC newest-N
+    """水位线编排:读复合游标 → export 严格 keyset 增量 → 按 max_cursor 推进 → 存。
+    首跑(无游标且非 backfill,codex P1-A fix a):**只播种游标=当前最新, import 0**
+    (不 courtesy 导——corpus 已由旧 feed 灌过;要灌存量走 --backfill)。
+    坏游标文件在 load_cursor 里已 raise(fail loud,codex P1-B),不会落到首跑分支静默重播种。"""
+    cursor = (0, 0) if backfill else _state.load_cursor(state_path)
+    if cursor is None:
+        seed = reader.max_conversation_cursor(db_path)             # 首跑播种=全库最大 (ts,id)
         if seed is not None:
-            _state.save_watermark(state_path, seed)
-        rep["seeded"] = seed
-        return rep
-    rep = export(db_path, out_dir, limit=cap, since_ts=wm)         # 增量 >= 水位线
-    if rep["max_ts"] is not None:
-        _state.save_watermark(state_path, rep["max_ts"])
+            _state.save_cursor(state_path, seed[0], seed[1])
+        return {"written": [], "skipped": [], "errors": [], "total": 0,
+                "max_cursor": None, "seeded": seed}
+    rep = export(db_path, out_dir, limit=cap, since_cursor=cursor)  # 严格 keyset 增量 > 游标
+    if rep["max_cursor"] is not None:
+        _state.save_cursor(state_path, rep["max_cursor"][0], rep["max_cursor"][1])
     return rep
 
 
