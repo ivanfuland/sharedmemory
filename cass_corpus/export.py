@@ -7,6 +7,22 @@ from cass_corpus import reader, render
 from cass_corpus.pruner import DeterministicPruner
 
 
+def _atomic_write(path, text):
+    """原子写:先写同目录 tmp 再 os.replace 顶替。reader(gbrain autopilot)永远看完整文件,
+    不会撞写了一半的残包。失败清理 tmp。"""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def export(db_path, out_dir, limit=20, agents=None,
            min_turns=4, max_turns=None, min_chars=2000, pruner=None):
     pruner = pruner or DeterministicPruner()
@@ -21,8 +37,7 @@ def export(db_path, out_dir, limit=20, agents=None,
                 skipped.append((meta["id"], len(text)))
                 continue
             fn = render.transcript_filename(meta)
-            with open(os.path.join(out_dir, fn), "w", encoding="utf-8") as f:
-                f.write(text)
+            _atomic_write(os.path.join(out_dir, fn), text)
             written.append((fn, len(text), meta.get("title", "")))
         except Exception as e:
             errors.append((meta.get("id"), repr(e)[:200]))
