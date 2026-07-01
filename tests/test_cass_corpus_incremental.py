@@ -1,7 +1,7 @@
 # tests/test_cass_corpus_incremental.py
 import os
 import sqlite3
-from cass_corpus import reader
+from cass_corpus import reader, export, state
 
 
 def _mk_db(path, convs):
@@ -62,3 +62,30 @@ def test_max_conversation_ts_empty(tmp_path):
     p = str(tmp_path / "c.db")
     _mk_db(p, [])
     assert reader.max_conversation_ts(p) is None
+
+
+def test_run_feed_incremental_no_drop_busy_day(tmp_path):
+    """忙日 >cap 也不丢:两轮把全部增量 drain 完,水位线单调推进。"""
+    db = str(tmp_path / "c.db")
+    out = str(tmp_path / "out"); os.makedirs(out)
+    sp = str(tmp_path / "wm.json")
+    _mk_db(db, [(i, "a", i * 100, 6) for i in range(1, 6)])   # ts 100..500
+    state.save_watermark(sp, 0)                               # 播种 0 = 全量增量
+    r1 = export.run_feed(db, out, cap=2, state_path=sp)       # >=0 ASC cap2 → ts100,200
+    assert r1["max_ts"] == 200 and state.load_watermark(sp) == 200
+    r2 = export.run_feed(db, out, cap=2, state_path=sp)       # >=200 ASC cap2 → ts200,300
+    assert state.load_watermark(sp) == 300
+    for _ in range(3):
+        export.run_feed(db, out, cap=2, state_path=sp)
+    got = {f for f in os.listdir(out) if f.endswith(".md")}
+    assert len(got) == 5                                      # 全部 5 会话最终都导出,零丢失
+
+
+def test_run_feed_first_run_seeds_no_backfill(tmp_path):
+    """首跑无水位线:播种=当前 max ts,只导最新 N,不灌存量。"""
+    db = str(tmp_path / "c.db"); out = str(tmp_path / "out"); os.makedirs(out)
+    sp = str(tmp_path / "wm.json")   # 不存在 → load 返回 None
+    _mk_db(db, [(i, "a", i * 100, 6) for i in range(1, 6)])
+    r = export.run_feed(db, out, cap=2, state_path=sp)   # 首跑
+    assert state.load_watermark(sp) == 500               # 播种=全库 max
+    assert len(r["written"]) <= 2                         # 只导最新 cap 条(courtesy),不 backfill

@@ -26,3 +26,7 @@ infra/gbrain/serve/env.generated
 # M4 cass-mcp secrets（bearer token / 访问日志含 secret，绝不进 git）
 infra/cass-mcp/*.env
 infra/cass-mcp/*.log
+
+# 喂料水位线运行时状态(含真实 ts,不进 PUBLIC 仓)
+cass-corpus-feed/
+*.watermark.json
