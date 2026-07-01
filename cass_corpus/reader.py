@@ -21,7 +21,7 @@ JOIN messages m ON m.conversation_id = c.id
 {where}
 GROUP BY c.id
 HAVING COUNT(m.id) >= ?{max_clause}
-ORDER BY c.last_message_created_at DESC
+ORDER BY c.last_message_created_at {order}
 LIMIT ?
 """
 
@@ -34,23 +34,37 @@ def _connect(db_path):
     return db
 
 
-def select_conversations(db_path, limit=20, agents=None, min_turns=4, max_turns=None):
+def select_conversations(db_path, limit=20, agents=None, min_turns=4, max_turns=None, since_ts=None):
     """挑会话元数据。agents=None → 全来源(不按 agent 筛);min_turns 轻量 floor;
-    max_turns=None → 不设上限(长会话由 gbrain chunk 处理)。返回 list[dict]。"""
-    where, params = "", []
+    max_turns=None → 不设上限(长会话由 gbrain chunk 处理)。
+    since_ts=None → 旧行为(最新 N, DESC);since_ts 给值 → 增量
+    (last_message_created_at >= since_ts, ASC, 受 limit 安全帽)。返回 list[dict]。"""
+    where_parts, params = [], []
     if agents:
-        where = "WHERE a.slug IN (%s)" % ",".join("?" * len(agents))
+        where_parts.append("a.slug IN (%s)" % ",".join("?" * len(agents)))
         params += list(agents)
+    if since_ts is not None:
+        where_parts.append("c.last_message_created_at >= ?")
+        params.append(int(since_ts))
+    where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     params.append(min_turns)
     max_clause = ""
     if max_turns is not None:
         max_clause = " AND COUNT(m.id) <= ?"
         params.append(max_turns)
+    order = "ASC" if since_ts is not None else "DESC"
     params.append(limit)
-    sql = _SELECT_SQL.format(where=where, max_clause=max_clause)
+    sql = _SELECT_SQL.format(where=where, max_clause=max_clause, order=order)
     with closing(_connect(db_path)) as db:
         rows = db.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def max_conversation_ts(db_path):
+    """全库最大 last_message_created_at(首跑播种水位线用)。空库 → None。"""
+    with closing(_connect(db_path)) as db:
+        row = db.execute("SELECT MAX(last_message_created_at) AS m FROM conversations").fetchone()
+    return row["m"] if row and row["m"] is not None else None
 
 
 def read_messages(db_path, conv_id):
