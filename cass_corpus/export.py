@@ -100,11 +100,31 @@ def run_feed(db_path, out_dir, cap, state_path, backfill=False):
     return rep
 
 
+def parse_argv(argv):
+    """拆 argv → (conv, positionals, backfill)。
+    支持 `--conv 1898` 与 `--conv=1898`（codex 复审 P2：等号形不识别会静默走批量 run_feed 推进水位线）；
+    尾随 `--conv` 无值 → conv=None（不 IndexError）；positional 按**位置**排除 --conv 的值
+    （不按值排除，避免 out_dir 字符串恰等于 conv-id 时被误吞）。未知 --flag 忽略。"""
+    conv, positionals, skip_next = None, [], False
+    for i, a in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--conv":
+            conv = argv[i + 1] if i + 1 < len(argv) else None
+            skip_next = conv is not None  # 跳过它的值 token（若有）
+            continue
+        if a.startswith("--conv="):
+            conv = a.split("=", 1)[1] or None
+            continue
+        if a.startswith("--"):
+            continue  # 其它 flag（如 --backfill）不进 positional
+        positionals.append(a)
+    return conv, positionals, ("--backfill" in argv)
+
+
 def main():
-    argv = sys.argv[1:]
-    conv = next((argv[i + 1] for i, a in enumerate(argv) if a == "--conv"), None)
-    args = [a for a in argv if not a.startswith("--") and a != conv]
-    backfill = "--backfill" in argv
+    conv, args, backfill = parse_argv(sys.argv[1:])
     db = os.environ.get("CASS_CANON_DB",
                         os.path.expanduser("~/.local/share/coding-agent-search/agent_search.db"))
     out = args[0] if len(args) > 0 else os.path.expanduser("~/.local/share/gbrain/cass-transcripts-poc")

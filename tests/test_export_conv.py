@@ -69,3 +69,32 @@ def test_export_one_too_short_is_skipped(tmp_path):
     assert rep["written"] == []
     assert len(rep["skipped"]) == 1
     assert rep["exported_ts"] == 1782896385426  # 即便 skip 也记内容版本
+
+
+# --- CLI arg parsing (codex 复审 P2 + adapter reviewer coverage gap) ---
+
+def test_parse_argv_space_form():
+    conv, pos, bf = export.parse_argv(["/out", "--conv", "1898"])
+    assert conv == "1898" and pos == ["/out"] and bf is False
+
+
+def test_parse_argv_equals_form():
+    # codex 复审 P2：等号形必须识别（否则静默走批量 run_feed 推进水位线）
+    conv, pos, bf = export.parse_argv(["/out", "--conv=1898"])
+    assert conv == "1898" and pos == ["/out"]
+
+
+def test_parse_argv_no_conv_is_batch():
+    conv, pos, bf = export.parse_argv(["/out", "50", "--backfill"])
+    assert conv is None and pos == ["/out", "50"] and bf is True
+
+
+def test_parse_argv_trailing_conv_no_value():
+    conv, pos, bf = export.parse_argv(["/out", "--conv"])  # 尾随无值 → None，不崩
+    assert conv is None and pos == ["/out"]
+
+
+def test_parse_argv_out_dir_equal_conv_value():
+    # 按位置排除 --conv 值：out_dir 字符串恰等于 conv-id 也不被误吞
+    conv, pos, bf = export.parse_argv(["1898", "--conv", "1898"])
+    assert conv == "1898" and pos == ["1898"]
