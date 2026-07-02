@@ -53,6 +53,35 @@ def export(db_path, out_dir, limit=20, agents=None,
             "total": len(convs), "max_cursor": max_cursor}
 
 
+def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
+    """单条精确导出(Inngest F3 逐条驱动用;不碰 cursor)。选一条 → 读 → 清洗 → 渲染 → 原子写。
+    返回 report 含 exported_ts = 实际读到消息的 max created_at(文件真实内容版本,codex R5 P1-2/R6 P2-A)。"""
+    pruner = pruner or DeterministicPruner()
+    os.makedirs(out_dir, exist_ok=True)
+    meta = reader.get_conversation(db_path, conv_id)
+    if meta is None:
+        return {"written": [], "skipped": [], "errors": [], "total": 0, "exported_ts": None}
+    written, skipped, errors = [], [], []
+    exported_ts = None
+    try:
+        # 在 read_messages 之前取内容版本 → exported_ts ≤ 文件实际版本,安全欠标方向
+        # (最坏下 tick 冗余 re-feed、gbrain 幂等挡住,绝不丢)。read_messages 返 Msg 无 created_at,
+        # 故用专用 max_message_ts(codex R7 P1)。
+        exported_ts = reader.max_message_ts(db_path, meta["id"])
+        msgs = reader.read_messages(db_path, meta["id"])
+        text = render.render(meta, pruner.prune(msgs))
+        if len(text) < min_chars:
+            skipped.append((meta["id"], len(text)))
+        else:
+            fn = render.transcript_filename(meta)
+            _atomic_write(os.path.join(out_dir, fn), text)
+            written.append((fn, len(text), meta.get("title", "")))
+    except Exception as e:
+        errors.append((meta.get("id"), repr(e)[:200]))
+    return {"written": written, "skipped": skipped, "errors": errors, "total": 1,
+            "exported_ts": exported_ts}
+
+
 def run_feed(db_path, out_dir, cap, state_path, backfill=False):
     """水位线编排:读复合游标 → export 严格 keyset 增量 → 按 max_cursor 推进 → 存。
     首跑(无游标且非 backfill,codex P1-A fix a):**只播种游标=当前最新, import 0**
@@ -72,16 +101,21 @@ def run_feed(db_path, out_dir, cap, state_path, backfill=False):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    backfill = "--backfill" in sys.argv[1:]
+    argv = sys.argv[1:]
+    conv = next((argv[i + 1] for i, a in enumerate(argv) if a == "--conv"), None)
+    args = [a for a in argv if not a.startswith("--") and a != conv]
+    backfill = "--backfill" in argv
     db = os.environ.get("CASS_CANON_DB",
                         os.path.expanduser("~/.local/share/coding-agent-search/agent_search.db"))
     out = args[0] if len(args) > 0 else os.path.expanduser("~/.local/share/gbrain/cass-transcripts-poc")
-    cap = int(args[1]) if len(args) > 1 else 200
-    sp = _state.default_state_path()
-    rep = run_feed(db, out, cap=cap, state_path=sp, backfill=backfill)
+    if conv is not None:
+        rep = export_one(db, out, int(conv))
+    else:
+        cap = int(args[1]) if len(args) > 1 else 200
+        rep = run_feed(db, out, cap=cap, state_path=_state.default_state_path(), backfill=backfill)
     print(f"out_dir={out}")
     print(f"written={len(rep['written'])}  skipped={len(rep['skipped'])}  errors={len(rep['errors'])}  of {rep['total']} selected")
+    print(f"exported_ts={rep.get('exported_ts') or ''}")  # F3 解析它写 fed_msg_ts(codex R6 P1-B:必须在此打印)
     for fn, n, title in rep["written"]:
         print(f"  {n:7d}  {fn}   {title[:40]}")
 

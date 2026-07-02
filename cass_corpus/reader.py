@@ -27,6 +27,22 @@ LIMIT ?
 
 _MSGS_SQL = "SELECT idx, role, content FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
 
+# 按 id 精确取一条会话 meta（export_one 单条导出用）。列映射与 _SELECT_SQL 一致；
+# JOIN messages + GROUP BY → 0 消息/不存在会话返回无行（None）。不设 min_turns floor（显著性交 min_chars）。
+_GET_ONE_SQL = """
+SELECT c.id AS id, a.slug AS agent, c.title AS title, w.path AS workspace,
+       c.source_path AS source_path,
+       COALESCE(c.started_at, c.last_message_created_at) AS started_at,
+       c.last_message_created_at AS last_ts,
+       COUNT(m.id) AS turns, c.primary_model AS model
+FROM conversations c
+JOIN agents a ON a.id = c.agent_id
+LEFT JOIN workspaces w ON w.id = c.workspace_id
+JOIN messages m ON m.conversation_id = c.id
+WHERE c.id = ?
+GROUP BY c.id
+"""
+
 
 def _connect(db_path):
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -77,3 +93,20 @@ def read_messages(db_path, conv_id):
     with closing(_connect(db_path)) as db:
         rows = db.execute(_MSGS_SQL, (conv_id,)).fetchall()
     return [Msg(idx=r["idx"], role=r["role"], content=r["content"] or "") for r in rows]
+
+
+def get_conversation(db_path, conv_id):
+    """按 id 精确取一条会话 meta(export_one 单条导出用)。无消息/不存在 → None。"""
+    with closing(_connect(db_path)) as db:
+        row = db.execute(_GET_ONE_SQL, (int(conv_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def max_message_ts(db_path, conv_id):
+    """该会话消息的 max(created_at)(= 文件真实内容版本;canonical messages.created_at 是毫秒 epoch)。
+    read_messages 只返 Msg(idx,role,content) 无 created_at,故 export_one 靠这个取内容版本(codex R7 P1)。"""
+    with closing(_connect(db_path)) as db:
+        row = db.execute(
+            "SELECT max(created_at) AS ts FROM messages WHERE conversation_id = ?", (int(conv_id),)
+        ).fetchone()
+    return row["ts"] if row and row["ts"] is not None else None
