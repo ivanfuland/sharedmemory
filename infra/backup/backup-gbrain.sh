@@ -52,15 +52,24 @@ mkdir -p "$DEST"
 echo "[backup] dest=$DEST stamp=$STAMP keep=$KEEP"
 
 # 1) Postgres custom-format dump (restore via `pg_restore`; -Fc matches the manual 2026-07-05 baseline).
+#    Write to a .tmp (leading dot → never matched by rotation's gbrain-* glob) and only atomic-rename
+#    into place AFTER pg_restore -l validates it. A killed / timed-out run (SIGTERM mid-dump) then
+#    leaves NO truncated gbrain-*.dump in the rotation set — the trap removes the temp.
 DUMP="$DEST/gbrain-$STAMP.dump"
-if ! docker exec "$CONTAINER" pg_dump -U gbrain -Fc gbrain > "$DUMP"; then
-  echo "[backup] FATAL: pg_dump failed (is container '$CONTAINER' running?)"; rm -f "$DUMP"; exit 1
+TMP="$DEST/.gbrain-$STAMP.$$.dump.tmp"
+cleanup_tmp() { rm -f "$TMP" 2>/dev/null || true; }
+trap cleanup_tmp EXIT
+trap 'cleanup_tmp; exit 143' TERM
+trap 'cleanup_tmp; exit 130' INT
+if ! docker exec "$CONTAINER" pg_dump -U gbrain -Fc gbrain > "$TMP"; then
+  echo "[backup] FATAL: pg_dump failed (is container '$CONTAINER' running?)"; exit 1
 fi
 # Integrity check, not just a smell test: pg_restore -l reads the archive TOC; a truncated or corrupt
 # dump (incl. an interleaved partial write) fails here even if it starts with PGDMP and is large.
-if ! docker exec -i "$CONTAINER" pg_restore -l < "$DUMP" > /dev/null 2>&1; then
-  echo "[backup] FATAL: dump is not a readable pg_restore archive (truncated/corrupt); removing"; rm -f "$DUMP"; exit 1
+if ! docker exec -i "$CONTAINER" pg_restore -l < "$TMP" > /dev/null 2>&1; then
+  echo "[backup] FATAL: dump is not a readable pg_restore archive (truncated/corrupt)"; exit 1
 fi
+mv -f "$TMP" "$DUMP"   # atomic publish: only a validated, complete dump ever gets the final name
 echo "[backup] pg dump  → $DUMP ($(( $(stat -c %s "$DUMP") / 1024 / 1024 )) MB, pg_restore -l OK)"
 
 # 2) brain-repo markdown snapshot (timestamped mirror; --archive, never --delete).
