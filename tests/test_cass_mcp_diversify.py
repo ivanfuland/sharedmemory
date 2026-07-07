@@ -56,23 +56,28 @@ def test_cass_search_desc_mentions_limit_cap(monkeypatch):
 # ---- B3 fix: cass_search over-fetch 撞 256KB raw cap 回归测试（codex P1） ----
 
 def test_cass_search_overfetch_raw_large_final_small(monkeypatch):
-    """核心回归：over-fetch raw payload 远超 256KB，但砍回 user_limit 后应正常返回，
-    且传给 run_cass 的 max_bytes 必须是放大后的 _SEARCH_RAW_MAX_BYTES（>262144）。"""
+    """核心回归（codex 的确切场景）：raw over-fetch payload 曾在旧 1MB cap 之上、现在 8MB 之下，
+    150 条 hits 集中在少数 session（模拟真实脏数据分布），仍应正常返回、砍回 user_limit，
+    且传给 run_cass 的 max_bytes 必须精确等于 _SEARCH_RAW_MAX_BYTES（==8MB），
+    oversize_is_failure 必须显式传 False（raw 过大不连累熔断）。"""
     monkeypatch.setenv("CASS_MCP_BEARER", "0" * 64)   # server import-time fail-fast 需要
     from cass_mcp import server, runner
     monkeypatch.setattr(server, "_readiness", lambda: {"semantic": True, "lexical": True, "infinity": True})
 
-    # 150 条 hits，跨 25 个不同 source_path，每条 content 较大，模拟真实 over-fetch raw payload（远超 256KB）
-    hits = [{"source_path": f"conv-{i % 25}", "agent": "claude_code",
+    # 150 条 hits，集中在 5 个 source_path（模拟真实脏数据：少数长会话贡献大量命中），
+    # 每条 content 较大，模拟真实 over-fetch raw payload（远超旧 256KB/1MB cap，仍 << 8MB）
+    hits = [{"source_path": f"conv-{i % 5}", "agent": "claude_code",
              "score": 1.0 - i * 0.001, "snippet": "s" * 200, "content": "c" * 2000}
             for i in range(150)]
-    assert len(json.dumps({"hits": hits}, ensure_ascii=False).encode("utf-8")) > 262144   # 场景确实超 256KB
+    raw_size = len(json.dumps({"hits": hits}, ensure_ascii=False).encode("utf-8"))
+    assert 262144 < raw_size < 8 * 1024 * 1024   # 场景确实曾超旧 256KB/1MB cap，但 < 新 8MB cap
 
     captured = {}
 
     def fake_run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30,
-                       max_bytes=262144, breaker=None, _now=None):
+                       max_bytes=262144, breaker=None, _now=None, oversize_is_failure=True):
         captured["max_bytes"] = max_bytes
+        captured["oversize_is_failure"] = oversize_is_failure
         return {"hits": hits, "count": len(hits), "limit": 150,
                 "total_matches": 500, "hits_clamped": False}
 
@@ -84,10 +89,38 @@ def test_cass_search_overfetch_raw_large_final_small(monkeypatch):
     assert result["count"] == 10
     assert len(result["hits"]) == 10
     assert captured["max_bytes"] == server._SEARCH_RAW_MAX_BYTES
-    assert server._SEARCH_RAW_MAX_BYTES > 262144
+    assert server._SEARCH_RAW_MAX_BYTES == 8 * 1024 * 1024
+    assert captured["oversize_is_failure"] is False
     from collections import Counter
     counts = Counter(h["source_path"] for h in result["hits"])
-    assert max(counts.values()) <= 3   # 单会话软上限（这里够多样，不会触发回填）
+    assert max(counts.values()) <= 3   # 单会话软上限（回填分支才可能超）
+
+
+def test_cass_search_clamps_max_content_length(monkeypatch):
+    """max_content_length clamp：调用方传超大值必须被夹到 _MAX_CONTENT_LENGTH(4000)；
+    合理值（≤4000）原样透传，不被误改。"""
+    monkeypatch.setenv("CASS_MCP_BEARER", "0" * 64)
+    from cass_mcp import server, runner
+    monkeypatch.setattr(server, "_readiness", lambda: {"semantic": True, "lexical": True, "infinity": True})
+
+    captured = {}
+
+    def fake_run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30,
+                       max_bytes=262144, breaker=None, _now=None, oversize_is_failure=True):
+        captured["args"] = args
+        return {"hits": [], "count": 0, "limit": 10, "total_matches": 0, "hits_clamped": False}
+
+    monkeypatch.setattr(runner, "run_cass", fake_run_cass)
+
+    server.cass_search("q", max_content_length=10000)
+    args = captured["args"]
+    idx = args.index("--max-content-length")
+    assert args[idx + 1] == "4000"   # 夹到 clamp 上限，不是 10000
+
+    server.cass_search("q", max_content_length=500)
+    args = captured["args"]
+    idx = args.index("--max-content-length")
+    assert args[idx + 1] == "500"    # 合理值不被改动
 
 
 def test_cass_search_final_still_too_large_returns_error(monkeypatch):
@@ -102,7 +135,7 @@ def test_cass_search_final_still_too_large_returns_error(monkeypatch):
              "snippet": "s" * 100, "content": big_content} for i in range(5)]
 
     def fake_run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30,
-                       max_bytes=262144, breaker=None, _now=None):
+                       max_bytes=262144, breaker=None, _now=None, oversize_is_failure=True):
         return {"hits": hits, "count": len(hits), "limit": 5,
                 "total_matches": 5, "hits_clamped": False}
 
@@ -115,16 +148,20 @@ def test_cass_search_final_still_too_large_returns_error(monkeypatch):
 
 
 def test_call_default_max_bytes_none_other_tools_unchanged(monkeypatch):
-    """其他工具经 _call 不传 max_bytes → run_cass 收到自身默认值（回归：其他工具行为不变）。"""
+    """其他工具经 _call 不传 max_bytes/oversize_is_failure → run_cass 收到自身默认值
+    （回归：其他工具字节级行为不变，_call 的 None 默认不会被转发覆盖 run_cass 自身默认）。"""
     monkeypatch.setenv("CASS_MCP_BEARER", "0" * 64)
     from cass_mcp import server, runner
     captured = {}
+    _NOT_PASSED = object()   # 哨兵：区分「run_cass 自身默认」vs「_call 显式传入」
 
     def fake_run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30,
-                       max_bytes=262144, breaker=None, _now=None):
+                       max_bytes=262144, breaker=None, _now=None, oversize_is_failure=_NOT_PASSED):
         captured["max_bytes"] = max_bytes
+        captured["oversize_is_failure"] = oversize_is_failure
         return {"text": "ok"}
 
     monkeypatch.setattr(runner, "run_cass", fake_run_cass)
     server._call("cass_export", ["/p"])
     assert captured["max_bytes"] == 262144
+    assert captured["oversize_is_failure"] is _NOT_PASSED   # _call 未转发，run_cass 用了自己的默认(True)

@@ -16,7 +16,7 @@ class CircuitBreaker:
             self.fails += 1
             if self.fails >= self.threshold: self.open_until = now + self.cooldown_s
 
-def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_bytes=DEFAULT_MAX_BYTES, breaker=None, _now=None):
+def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_bytes=DEFAULT_MAX_BYTES, breaker=None, _now=None, oversize_is_failure=True):
     # max_bytes 256KB(~64k token)：单次工具返回上限。够 timeline 7d(实测204KB)/pack/sessions；
     # 更宽窗口超此回 result_too_large+narrow 提示（见下）。search 实测仅 7-10KB，远不触。
     now = _now if _now is not None else time.monotonic()
@@ -36,7 +36,7 @@ def run_cass(subcmd, args, *, want_json=True, cass_bin=None, timeout_s=30, max_b
     out = p.stdout
     if len(out) > max_bytes:
         if want_json:
-            if breaker: breaker.record(False, now)
+            if breaker and oversize_is_failure: breaker.record(False, now)   # 仅当视为失败才记熔断
             return {"error": "result_too_large", "bytes": len(out),
                     "hint": "narrow query: lower limit or max_content_length"}
         # 文本(export)截断不算失败（有意 cap，仍返回可用文本）
