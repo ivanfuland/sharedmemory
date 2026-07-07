@@ -80,11 +80,12 @@ def _call(tool, args, max_bytes=None, oversize_is_failure=None):
         status = "error" if (r is None or "error" in r) else "ok"
         _audit(tool, args, status, round((time.monotonic() - t0) * 1000))
 
-_MAX_CONTENT_LENGTH = 4000            # clamp 上限（默认 2000 的 2×）：bound 每条 hit 大小 → bound raw stdout（可证明）
+_MAX_CONTENT_LENGTH = 4000            # clamp 上限（默认 2000 的 2×）：bound 每条 hit 大小 → bound raw stdout
 _SEARCH_RAW_MAX_BYTES = 8 * 1024 * 1024   # 8MB raw over-fetch parse 上限（对齐 cass_export preflight）。
-# 数学界：max_content_length≤4000 → 每条 content≤4000 字符(中文 UTF-8 ~3B/字≈12KB)+snippet+meta ≈≤25KB；
-# over-fetch≤150 条 → raw worst-case ≈3.75MB << 8MB ⇒ raw 恒 parse 成功 ⇒ min(L,N) 恒成立。
-# 最终响应(≤user_limit 条)再按 runner.DEFAULT_MAX_BYTES(256KB) 复检。
+# 经验界（非 CASS 源码推导，snippet/meta 尺寸是黑盒 CLI 行为，留大余量兜底）：
+#   max_content_length≤4000 → 每条 content≤4000 字符(中文 UTF-8 ~3B/字≈12KB)+snippet+meta ≈≤25KB；
+#   over-fetch≤150 条 → raw worst-case ≈3.75MB << 8MB（cap 实际可容 ~53KB/条，2× 余量）⇒ realistic 输入下 raw 恒 parse 成功 ⇒ min(L,N) 成立。
+# 最终响应(≤user_limit 条)再按 runner.DEFAULT_MAX_BYTES(256KB) 复检（黑盒尺寸兜底闸）。
 
 CASS_SEARCH_DESC = (
     "语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
