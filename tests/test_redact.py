@@ -13,8 +13,8 @@ def test_redacts_known_secret_shapes():
     for c in cases:
         out = redact_secrets(f"prefix {c} suffix")
         assert "[REDACTED_SECRET]" in out, c
-        # 原始密钥体不残留（取密钥的一段特征子串验证）
-        assert c.split("=")[-1][:20] not in out or c.startswith("AKIA") is False, c
+        # 原始密钥体不残留：对每个用例都校验密钥体尾部特征子串已消失（无 AKIA 逃逸分支）
+        assert c.split("=")[-1][-20:] not in out, c
 
 def test_idempotent():
     x = redact_secrets("token=" + "z" * 30)
