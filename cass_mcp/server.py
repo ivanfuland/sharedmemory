@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier   # B0 auth_api.md 确认 fastmcp 3.4.2 可用
 from fastmcp.server.dependencies import get_access_token
 from cass_mcp import runner, contract, config                       # config import 即设语义 env 默认
+from cass_mcp.diversify import overfetch_limit, apply_search_postprocess
 
 # bearer fail-fast：模块加载即强制 CASS_MCP_BEARER，缺失即 raise——覆盖 import/ASGI/main 全路径，杜绝 fail-open
 _BEARER = os.environ.get("CASS_MCP_BEARER")
@@ -62,12 +63,15 @@ def _data_ready():
     dd = os.environ.get("CASS_DATA_DIR", "")
     return {"db": os.path.isfile(os.path.join(dd, "agent_search.db"))}
 
-def _call(tool, args):
+def _call(tool, args, max_bytes=None, oversize_is_failure=None):
     spec = contract.TOOLS[tool]                          # subcmd + want_json 单一来源
     t0 = time.monotonic()
     r = None
     try:
-        r = runner.run_cass(spec["subcmd"], args, want_json=spec["want_json"], cass_bin=config.CASS_BIN, breaker=_BREAKER)
+        extra = {}
+        if max_bytes is not None: extra["max_bytes"] = max_bytes
+        if oversize_is_failure is not None: extra["oversize_is_failure"] = oversize_is_failure
+        r = runner.run_cass(spec["subcmd"], args, want_json=spec["want_json"], cass_bin=config.CASS_BIN, breaker=_BREAKER, **extra)
         return r
     except Exception as e:                               # cass_bin 缺失等：MCP 工具返回 error，不穿透
         r = {"error": "cass_exception", "detail": str(e)[:300]}
@@ -76,22 +80,42 @@ def _call(tool, args):
         status = "error" if (r is None or "error" in r) else "ok"
         _audit(tool, args, status, round((time.monotonic() - t0) * 1000))
 
-@mcp.tool(description="语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
-                      "说『之前/上次/我们讨论过』、或问某事来龙去脉时用。返回 hits[]，每条含 source_path/agent/snippet/score；"
-                      "要更全上下文用 cass_expand。新鲜度=每日 pull，最新对话可能尚未入索引。")
+_MAX_CONTENT_LENGTH = 4000            # clamp 上限（默认 2000 的 2×）：bound 每条 hit 大小 → bound raw stdout
+_SEARCH_RAW_MAX_BYTES = 8 * 1024 * 1024   # 8MB raw over-fetch parse 上限（对齐 cass_export preflight）。
+# 经验界（非 CASS 源码推导，snippet/meta 尺寸是黑盒 CLI 行为，留大余量兜底）：
+#   max_content_length≤4000 → 每条 content≤4000 字符(中文 UTF-8 ~3B/字≈12KB)+snippet+meta ≈≤25KB；
+#   over-fetch≤150 条 → raw worst-case ≈3.75MB << 8MB（cap 实际可容 ~53KB/条，2× 余量）⇒ realistic 输入下 raw 恒 parse 成功 ⇒ min(L,N) 成立。
+# 最终响应(≤user_limit 条)再按 runner.DEFAULT_MAX_BYTES(256KB) 复检（黑盒尺寸兜底闸）。
+
+CASS_SEARCH_DESC = (
+    "语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
+    "说『之前/上次/我们讨论过』、或问某事来龙去脉时用。返回 hits[]，每条含 source_path/agent/snippet/score；"
+    "要更全上下文用 cass_expand。新鲜度=每日 pull，最新对话可能尚未入索引。"
+    "结果按会话多样化（单会话最多 3 条）；limit 上限 50，超出按 50 处理；max_content_length 上限 4000，超出按 4000。"
+)
+
+@mcp.tool(description=CASS_SEARCH_DESC)
 def cass_search(query: str, agent: str = "", workspace: str = "", limit: int = 10,
                 max_content_length: int = 2000):
-    # P1-3: 查询前就绪校验（语义 manifest + 词法 index + Infinity health）
+    # P1-3: 查询前就绪校验
     checks = _readiness()
     if not all(checks.values()):
         _audit("cass_search", [query], "not_ready", 0)
         return {"error": "not_ready", "checks": checks}
+    user_limit, overfetch = overfetch_limit(limit)          # ② clamp ≤50 + overfetch ≥ user_limit
+    mcl = max(1, min(int(max_content_length), _MAX_CONTENT_LENGTH))   # clamp → raw 可证明有界
     # P1-1: --rerank 恒开（已并入 SEMANTIC_FLAGS，无可关参数）
-    args = [query, *config.SEMANTIC_FLAGS]                          # --mode semantic --daemon --model bge-m3 --rerank（契约定）
-    args += ["--max-content-length", str(max_content_length), "--limit", str(limit)]  # 保 snippet，不 --fields minimal
+    args = [query, *config.SEMANTIC_FLAGS]                   # --mode semantic --daemon --model bge-m3 --rerank（契约定）
+    args += ["--max-content-length", str(mcl), "--limit", str(overfetch)]  # 保 snippet，不 --fields minimal
     if agent: args += ["--agent", agent]
     if workspace: args += ["--workspace", workspace]
-    return _call("cass_search", args)
+    r = _call("cass_search", args, max_bytes=_SEARCH_RAW_MAX_BYTES, oversize_is_failure=False)  # raw 恒能 parse；极端超限也不连累熔断
+    r = apply_search_postprocess(r, user_limit)                       # 多样化 + 砍回 user_limit
+    # 最终响应（≤user_limit 条）再按真正的 256KB MCP 契约复检；只有极端 max_content_length 才触
+    if isinstance(r, dict) and isinstance(r.get("hits"), list):
+        if len(json.dumps(r, ensure_ascii=False).encode("utf-8")) > runner.DEFAULT_MAX_BYTES:
+            return {"error": "result_too_large", "hint": "narrow query: lower limit or max_content_length"}
+    return r
 
 @mcp.tool(description="展开某会话片段上下文（拿 cass_search 的 source_path + line 后看前后消息）。")
 def cass_expand(source_path: str, line: int, context: int = 3):

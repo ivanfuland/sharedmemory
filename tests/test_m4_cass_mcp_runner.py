@@ -75,3 +75,28 @@ def test_default_cap_rejects_over_256kb_json(tmp_path):
     cass = _fake_cass(tmp_path, "python3 -c 'import json,sys; sys.stdout.write(json.dumps({\"d\":\"x\"*300000}))'")
     r = runner.run_cass("timeline", ["--since", "30d"], cass_bin=cass)
     assert r["error"] == "result_too_large" and r["bytes"] > 262144
+
+
+def test_oversize_is_failure_false_does_not_count_toward_breaker(tmp_path):
+    """codex P1 根治点：oversize_is_failure=False 时，too-large 不计入熔断失败计数
+    （search 的合理 over-fetch 超 raw cap 不该拖垮其他工具的共享熔断）。"""
+    cass = _fake_cass(tmp_path, 'python3 -c "print(\'x\'*100000)"')
+    cb = runner.CircuitBreaker(threshold=5, cooldown_s=300)
+    for _ in range(5):
+        r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb, oversize_is_failure=False)
+        assert r["error"] == "result_too_large"
+    assert cb.fails == 0
+    r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb, oversize_is_failure=False)
+    assert r["error"] == "result_too_large"   # 仍能正常报错，只是不算熔断失败
+
+
+def test_oversize_is_failure_default_true_still_counts_toward_breaker(tmp_path):
+    """对照：不传 oversize_is_failure（默认 True）时行为不变——too-large 仍计入熔断，
+    5 次后开启（回归 test_breaker_counts_result_too_large 的行为不被本次改动破坏）。"""
+    cass = _fake_cass(tmp_path, 'python3 -c "print(\'x\'*100000)"')
+    cb = runner.CircuitBreaker(threshold=5, cooldown_s=300)
+    for _ in range(5):
+        runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb)
+    assert cb.fails == 5
+    r = runner.run_cass("search", ["q"], cass_bin=cass, max_bytes=1000, breaker=cb)
+    assert r["error"] == "unavailable"   # 熔断已开
