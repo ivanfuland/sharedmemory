@@ -46,3 +46,8 @@ def test_apply_postprocess_on_real_fixture():
     assert out["limit"] == 1
     assert out["total_matches"] == tm
     assert out["hits_clamped"] == hc
+
+def test_cass_search_desc_mentions_limit_cap(monkeypatch):
+    monkeypatch.setenv("CASS_MCP_BEARER", "0" * 64)   # server import-time fail-fast 需要
+    from cass_mcp import server
+    assert "50" in server.CASS_SEARCH_DESC             # silent clamp 已在 description 告知

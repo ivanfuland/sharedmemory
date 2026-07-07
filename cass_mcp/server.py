@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier   # B0 auth_api.md 确认 fastmcp 3.4.2 可用
 from fastmcp.server.dependencies import get_access_token
 from cass_mcp import runner, contract, config                       # config import 即设语义 env 默认
+from cass_mcp.diversify import overfetch_limit, apply_search_postprocess
 
 # bearer fail-fast：模块加载即强制 CASS_MCP_BEARER，缺失即 raise——覆盖 import/ASGI/main 全路径，杜绝 fail-open
 _BEARER = os.environ.get("CASS_MCP_BEARER")
@@ -76,22 +77,27 @@ def _call(tool, args):
         status = "error" if (r is None or "error" in r) else "ok"
         _audit(tool, args, status, round((time.monotonic() - t0) * 1000))
 
-@mcp.tool(description="语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
-                      "说『之前/上次/我们讨论过』、或问某事来龙去脉时用。返回 hits[]，每条含 source_path/agent/snippet/score；"
-                      "要更全上下文用 cass_expand。新鲜度=每日 pull，最新对话可能尚未入索引。")
+CASS_SEARCH_DESC = (
+    "语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
+    "说『之前/上次/我们讨论过』、或问某事来龙去脉时用。返回 hits[]，每条含 source_path/agent/snippet/score；"
+    "要更全上下文用 cass_expand。新鲜度=每日 pull，最新对话可能尚未入索引。"
+    "结果按会话多样化（单会话最多 3 条）；limit 上限 50，超出按 50 处理。"
+)
+
+@mcp.tool(description=CASS_SEARCH_DESC)
 def cass_search(query: str, agent: str = "", workspace: str = "", limit: int = 10,
                 max_content_length: int = 2000):
-    # P1-3: 查询前就绪校验（语义 manifest + 词法 index + Infinity health）
+    # P1-3: 查询前就绪校验
     checks = _readiness()
     if not all(checks.values()):
         _audit("cass_search", [query], "not_ready", 0)
         return {"error": "not_ready", "checks": checks}
-    # P1-1: --rerank 恒开（已并入 SEMANTIC_FLAGS，无可关参数）
-    args = [query, *config.SEMANTIC_FLAGS]                          # --mode semantic --daemon --model bge-m3 --rerank（契约定）
-    args += ["--max-content-length", str(max_content_length), "--limit", str(limit)]  # 保 snippet，不 --fields minimal
+    user_limit, overfetch = overfetch_limit(limit)          # ② clamp ≤50 + overfetch ≥ user_limit
+    args = [query, *config.SEMANTIC_FLAGS]                   # --mode semantic --daemon --model bge-m3 --rerank
+    args += ["--max-content-length", str(max_content_length), "--limit", str(overfetch)]
     if agent: args += ["--agent", agent]
     if workspace: args += ["--workspace", workspace]
-    return _call("cass_search", args)
+    return apply_search_postprocess(_call("cass_search", args), user_limit)  # 多样化 + 改 count/limit
 
 @mcp.tool(description="展开某会话片段上下文（拿 cass_search 的 source_path + line 后看前后消息）。")
 def cass_expand(source_path: str, line: int, context: int = 3):
