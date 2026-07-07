@@ -63,12 +63,13 @@ def _data_ready():
     dd = os.environ.get("CASS_DATA_DIR", "")
     return {"db": os.path.isfile(os.path.join(dd, "agent_search.db"))}
 
-def _call(tool, args):
+def _call(tool, args, max_bytes=None):
     spec = contract.TOOLS[tool]                          # subcmd + want_json 单一来源
     t0 = time.monotonic()
     r = None
     try:
-        r = runner.run_cass(spec["subcmd"], args, want_json=spec["want_json"], cass_bin=config.CASS_BIN, breaker=_BREAKER)
+        extra = {} if max_bytes is None else {"max_bytes": max_bytes}
+        r = runner.run_cass(spec["subcmd"], args, want_json=spec["want_json"], cass_bin=config.CASS_BIN, breaker=_BREAKER, **extra)
         return r
     except Exception as e:                               # cass_bin 缺失等：MCP 工具返回 error，不穿透
         r = {"error": "cass_exception", "detail": str(e)[:300]}
@@ -76,6 +77,8 @@ def _call(tool, args):
     finally:
         status = "error" if (r is None or "error" in r) else "ok"
         _audit(tool, args, status, round((time.monotonic() - t0) * 1000))
+
+_SEARCH_RAW_MAX_BYTES = runner.DEFAULT_MAX_BYTES * 4   # over-fetch(≤3×) raw parse 上限；最终砍回 user_limit 后再按 DEFAULT_MAX_BYTES 复检
 
 CASS_SEARCH_DESC = (
     "语义搜索跨 agent 历史会话（概念/语义召回，不靠关键词字面匹配）。当用户引用早先对话、"
@@ -98,7 +101,13 @@ def cass_search(query: str, agent: str = "", workspace: str = "", limit: int = 1
     args += ["--max-content-length", str(max_content_length), "--limit", str(overfetch)]  # 保 snippet，不 --fields minimal
     if agent: args += ["--agent", agent]
     if workspace: args += ["--workspace", workspace]
-    return apply_search_postprocess(_call("cass_search", args), user_limit)  # 多样化 + 改 count/limit
+    r = _call("cass_search", args, max_bytes=_SEARCH_RAW_MAX_BYTES)   # 放大 raw cap，容 over-fetch payload
+    r = apply_search_postprocess(r, user_limit)                       # 多样化 + 砍回 user_limit
+    # 最终响应（≤user_limit 条）再按真正的 256KB MCP 契约复检；只有极端 max_content_length 才触
+    if isinstance(r, dict) and isinstance(r.get("hits"), list):
+        if len(json.dumps(r, ensure_ascii=False).encode("utf-8")) > runner.DEFAULT_MAX_BYTES:
+            return {"error": "result_too_large", "hint": "narrow query: lower limit or max_content_length"}
+    return r
 
 @mcp.tool(description="展开某会话片段上下文（拿 cass_search 的 source_path + line 后看前后消息）。")
 def cass_expand(source_path: str, line: int, context: int = 3):
