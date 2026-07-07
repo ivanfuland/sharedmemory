@@ -93,8 +93,9 @@ def cass_search(query: str, agent: str = "", workspace: str = "", limit: int = 1
         _audit("cass_search", [query], "not_ready", 0)
         return {"error": "not_ready", "checks": checks}
     user_limit, overfetch = overfetch_limit(limit)          # ② clamp ≤50 + overfetch ≥ user_limit
-    args = [query, *config.SEMANTIC_FLAGS]                   # --mode semantic --daemon --model bge-m3 --rerank
-    args += ["--max-content-length", str(max_content_length), "--limit", str(overfetch)]
+    # P1-1: --rerank 恒开（已并入 SEMANTIC_FLAGS，无可关参数）
+    args = [query, *config.SEMANTIC_FLAGS]                   # --mode semantic --daemon --model bge-m3 --rerank（契约定）
+    args += ["--max-content-length", str(max_content_length), "--limit", str(overfetch)]  # 保 snippet，不 --fields minimal
     if agent: args += ["--agent", agent]
     if workspace: args += ["--workspace", workspace]
     return apply_search_postprocess(_call("cass_search", args), user_limit)  # 多样化 + 改 count/limit
