@@ -3,13 +3,12 @@
 # 默认 DeterministicPruner 实现接地规则:
 #   - 系统/developer 提示=配置非情景记忆 → 整段丢(Letta/Mem0/Generative Agents;研究 §6)
 #   - user/assistant=意图/决定/推理 → 忠实保留不压(决定>观察;§3.1 §4.1)
-#   - tool 调用 → 压成一行 [tool: name](§9.1)
-#   - toolResult=观察/dump → 超阈值才"首尾保留+关键词采样+指针"截断,绝不盲截、不预摘要(§4.1-4.3)
+#   - tool_call/tool_result → 超阈值才"首尾保留+关键词采样+指针"截断,绝不盲截、不预摘要(§4.1-4.3)
 # 全程确定性、无 LLM、无模型依赖(gbrain deterministic-collectors 原则)。
-import json
 import re
+import sys
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional, Protocol
 
 
 @dataclass
@@ -17,86 +16,59 @@ class Msg:
     idx: int
     role: str
     content: str
+    tool_call_id: Optional[str] = None   # 配对标记(reader 从 extra_json 读)
+    unpaired: bool = False               # tool_result 无关联 call(契约 extra_json.unpaired)
 
 
 class Pruner(Protocol):
-    def prune(self, msgs: "list[Msg]") -> "list[Msg]":
-        """清洗一组消息:丢弃/截断/合并。返回保留(且 content 已变换)的消息。"""
-        ...
+    def prune(self, msgs: "list[Msg]") -> "list[Msg]": ...
 
 
-_TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
-_DEFAULT_KEYWORDS = r"ERROR|Exception|Traceback|Panic|Fatal|FAIL|WARN|assert"
 _HARD_ERR = re.compile(r"ERROR|FAIL|Traceback|Exception|Panic|Fatal|assert", re.IGNORECASE)
+
+# 语义分类:6-role + legacy 防御映射(迁移残留/smoke 跑未迁移库)
+_DROP = {"system", "developer", "error", "info"}          # 配置/事件噪声
+_KEEP = {"user", "assistant", "agent", "gemini"}          # 语义内容忠实留
+# role → (用哪个 cap 属性, 是否抢救硬错误)
+_CLAMP = {
+    "tool_call":   ("tool_call_cap",   True),
+    "tool_result": ("tool_result_cap", True),
+    "reasoning":   ("reasoning_cap",   False),            # 关抢救(散文里 assert/fail 非报错)
+    "tool":        ("tool_result_cap", True),             # legacy:工具输出,绝不 collapse
+    "toolResult":  ("tool_result_cap", True),             # legacy
+}
 
 
 class DeterministicPruner:
     MIN_CAP      = 200
     MAX_ERR_LINE = 300
     RESCUE_FRAC  = 4
-    max_err_lines = 10          # 类默认;Task 2 的 __init__ 会设为实例属性
 
-    def __init__(self, *, drop_roles=("developer",), tool_call_roles=("tool",),
-                 observation_roles=("toolResult",), tool_result_max_chars=1500,
-                 head_lines=6, tail_lines=6, max_line_chars=500, max_keyword_lines=20,
-                 keyword_pattern=_DEFAULT_KEYWORDS):
-        self.drop_roles = set(drop_roles)
-        self.tool_call_roles = set(tool_call_roles)
-        self.observation_roles = set(observation_roles)
-        self.tool_result_max_chars = tool_result_max_chars
-        self.head_lines = head_lines
-        self.tail_lines = tail_lines
-        self.max_line_chars = max_line_chars
-        self.max_keyword_lines = max_keyword_lines
-        self.keyword_re = re.compile(keyword_pattern, re.IGNORECASE)
+    def __init__(self, *, tool_call_cap=800, tool_result_cap=1500, reasoning_cap=1000,
+                 max_err_lines=10, warn=None):
+        # cap 是 provisional 默认(spec §7.1/§U1:真值待 franken 产真 role 后按分布量定)
+        self.tool_call_cap   = tool_call_cap
+        self.tool_result_cap = tool_result_cap
+        self.reasoning_cap   = reasoning_cap
+        self.max_err_lines   = max_err_lines
+        self._warn = warn or (lambda m: print(m, file=sys.stderr))   # 默认 loud(stderr),非 no-op
 
     def prune(self, msgs):
         out = []
         for m in msgs:
-            if m.role in self.drop_roles:
-                continue                                          # 配置噪声整段丢
-            if m.role in self.tool_call_roles:
-                out.append(Msg(m.idx, m.role, self._collapse_tool_call(m.content)))
-            elif m.role in self.observation_roles:
-                out.append(Msg(m.idx, m.role, self._truncate_observation(m.content)))
+            if m.role in _DROP:
+                continue
+            if m.role in _KEEP:
+                out.append(m)
+            elif m.role in _CLAMP:
+                cap_attr, rescue = _CLAMP[m.role]
+                out.append(Msg(m.idx, m.role,
+                               self._clamp(m.content, getattr(self, cap_attr), rescue_errors=rescue),
+                               m.tool_call_id, m.unpaired))
             else:
-                out.append(m)                                     # user/assistant 等忠实保留
+                self._warn(f"[pruner] unknown role kept: {m.role!r} (idx={m.idx})")  # 不 fail-open 静默
+                out.append(m)
         return out
-
-    def _collapse_tool_call(self, content):
-        name = None
-        try:
-            obj = json.loads(content)
-            if isinstance(obj, dict):
-                name = obj.get("name") or obj.get("tool") or obj.get("function")
-        except Exception:
-            mt = _TOOL_NAME_RE.search(content or "")
-            name = mt.group(1) if mt else None
-        return f"[tool: {name}]" if name else "[tool call]"
-
-    def _cap(self, line):
-        return line if len(line) <= self.max_line_chars else line[:self.max_line_chars] + "…"
-
-    def _truncate_observation(self, content):
-        if content is None:
-            return ""
-        if len(content) <= self.tool_result_max_chars:
-            return content                                        # 阈值内 → 原样(忠实)
-        lines = content.splitlines()
-        n = len(lines)
-        if n <= self.head_lines + self.tail_lines:
-            body = "\n".join(self._cap(l) for l in lines)         # 行少(或单行巨型)→ 仅按字符封顶
-        else:
-            head = [self._cap(l) for l in lines[:self.head_lines]]
-            tail = [self._cap(l) for l in lines[n - self.tail_lines:]]
-            middle = lines[self.head_lines:n - self.tail_lines]
-            kw = [self._cap(l) for l in middle if self.keyword_re.search(l)][:self.max_keyword_lines]
-            parts = list(head)
-            if kw:
-                parts += ["…〔关键行〕"] + kw
-            parts += [f"…〔截断 {len(middle) - len(kw)} 行〕"] + tail
-            body = "\n".join(parts)
-        return f"{body}\n〔原始工具输出已截断:{n} 行 / {len(content)} 字符;完整内容见 CASS 原会话〕"
 
     def _cap_line(self, l, at=0):
         # 超长行以 at(关键词位置)为中心取窗,总长 ≤ MAX_ERR_LINE(防越界 + 深埋 ERROR 被截没,codex R3 + plan R2 P2)
