@@ -1,6 +1,7 @@
 # cass_corpus/reader.py
 # 自包含只读 CASS canonical DB(不依赖/不修改 distill/cass_reader.py)。
 # 只读全量会话消息 + 元数据,供 transcript 渲染。
+import json
 import sqlite3
 from contextlib import closing
 from cass_corpus.pruner import Msg
@@ -25,7 +26,8 @@ ORDER BY c.last_message_created_at {order}
 LIMIT ?
 """
 
-_MSGS_SQL = "SELECT idx, role, content FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
+_MSGS_SQL_BASE  = "SELECT idx, role, content FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
+_MSGS_SQL_EXTRA = "SELECT idx, role, content, extra_json FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
 
 # 按 id 精确取一条会话 meta（export_one 单条导出用）。列映射与 _SELECT_SQL 一致；
 # JOIN messages + GROUP BY → 0 消息/不存在会话返回无行（None）。不设 min_turns floor（显著性交 min_chars）。
@@ -89,10 +91,29 @@ def max_conversation_cursor(db_path):
 
 
 def read_messages(db_path, conv_id):
-    """读一个会话的全部消息(按 idx 序)→ list[Msg]。"""
+    """读一个会话的全部消息(按 idx 序)→ list[Msg]。
+    **有 `extra_json` 列时**解析 tool_call_id/unpaired(配对标记,给 render 用);
+    **无该列**(老/合成 schema,如既有 incremental/export_conv fixture)→ 降级为无配对信息,不崩(codex plan R0 P0);
+    坏/空 JSON 同样降级。"""
     with closing(_connect(db_path)) as db:
-        rows = db.execute(_MSGS_SQL, (conv_id,)).fetchall()
-    return [Msg(idx=r["idx"], role=r["role"], content=r["content"] or "") for r in rows]
+        has_extra = any(r["name"] == "extra_json" for r in db.execute("PRAGMA table_info(messages)"))
+        sql = _MSGS_SQL_EXTRA if has_extra else _MSGS_SQL_BASE
+        rows = db.execute(sql, (conv_id,)).fetchall()
+    msgs = []
+    for r in rows:
+        tcid, unpaired = None, False
+        ej = r["extra_json"] if has_extra else None
+        if ej:
+            try:
+                d = json.loads(ej)
+                if isinstance(d, dict):
+                    tcid = d.get("tool_call_id")
+                    unpaired = bool(d.get("unpaired", False))
+            except (ValueError, TypeError):
+                pass                                        # 坏 JSON → 无配对信息,不崩
+        msgs.append(Msg(idx=r["idx"], role=r["role"], content=r["content"] or "",
+                        tool_call_id=tcid, unpaired=unpaired))
+    return msgs
 
 
 def get_conversation(db_path, conv_id):
