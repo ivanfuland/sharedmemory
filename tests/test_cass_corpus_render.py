@@ -33,3 +33,35 @@ def test_render_labels_roles_and_skips_empty():
     t = render.render(META, [Msg(0, "user", "改 bug"), Msg(1, "agent", "好"), Msg(2, "agent", "  ")])
     assert "### User" in t and "### Assistant" in t
     assert t.count("### Assistant") == 1   # 空内容 turn 跳过
+
+
+_META = {"id": 7, "agent": "codex", "started_at": 1_700_000_000_000, "title": "t"}
+
+
+def test_render_new_role_labels():
+    out = render.render(_META, [
+        Msg(0, "user", "问题"),
+        Msg(1, "assistant", "回答"),
+        Msg(2, "tool_call", "Bash: ls", tool_call_id="c1"),
+        Msg(3, "tool_result", "OK", tool_call_id="c1"),
+        Msg(4, "reasoning", "想了想"),
+    ])
+    assert "### User" in out and "### Assistant" in out
+    assert "### Tool Call [#c1]" in out                      # 标签 + 配对标记
+    assert "### Tool Result [#c1]" in out
+    assert "### Reasoning" in out
+
+
+def test_render_unpaired_result_marked():
+    out = render.render(_META, [Msg(0, "tool_result", "orphan out", unpaired=True)])
+    assert "### Tool Result [unpaired]" in out               # unpaired 显式标记,不留空让 gbrain 顺序脑补
+
+
+def test_render_result_without_id_marked_unpaired():
+    out = render.render(_META, [Msg(0, "tool_result", "no id out")])
+    assert "[unpaired]" in out                               # 结果无 id → 也标 unpaired
+
+
+def test_render_skips_empty_reasoning():
+    out = render.render(_META, [Msg(0, "user", "hi"), Msg(1, "reasoning", "")])
+    assert "### Reasoning" not in out                        # claude 空 reasoning 被跳过

@@ -9,7 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 _TZ = timezone(timedelta(hours=8))   # GMT+8:Ivan "哪天聊的" 语义,确定性
 _ROLE_LABEL = {"user": "User", "agent": "Assistant", "assistant": "Assistant",
-               "toolResult": "Tool Result", "tool": "Tool"}
+               "tool_call": "Tool Call", "tool_result": "Tool Result",
+               "toolResult": "Tool Result", "tool": "Tool Result",
+               "reasoning": "Reasoning"}
 _SLUG_SAFE = re.compile(r"[^a-z0-9]+")
 
 
@@ -43,6 +45,19 @@ def _frontmatter(meta):
     return "\n".join(lines)
 
 
+def _marker(m):
+    """配对标记:有 id → [#id];tool_result 无 id 或 unpaired → [unpaired](契约 P-原则-3)。"""
+    is_call = m.role == "tool_call"
+    is_res  = m.role in ("tool_result", "toolResult", "tool")
+    if not (is_call or is_res):
+        return ""
+    if m.unpaired:
+        return " [unpaired]"
+    if m.tool_call_id:
+        return f" [#{m.tool_call_id}]"
+    return " [unpaired]" if is_res else ""      # 结果无 id → unpaired;call 无 id 不标
+
+
 def render(meta, pruned_msgs):
     """meta(reader 元数据) + pruned_msgs(Pruner 输出)→ 完整 transcript 文本。"""
     parts = [_frontmatter(meta), ""]
@@ -51,7 +66,7 @@ def render(meta, pruned_msgs):
         content = (m.content or "").strip()
         if not content:
             continue
-        parts.append(f"### {label}")
+        parts.append(f"### {label}{_marker(m)}")
         parts.append(content)
         parts.append("")          # turn 间空行(对齐 gbrain chunker 边界)
     return "\n".join(parts).rstrip() + "\n"
