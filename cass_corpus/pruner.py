@@ -27,9 +27,15 @@ class Pruner(Protocol):
 
 _TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 _DEFAULT_KEYWORDS = r"ERROR|Exception|Traceback|Panic|Fatal|FAIL|WARN|assert"
+_HARD_ERR = re.compile(r"ERROR|FAIL|Traceback|Exception|Panic|Fatal|assert", re.IGNORECASE)
 
 
 class DeterministicPruner:
+    MIN_CAP      = 200
+    MAX_ERR_LINE = 300
+    RESCUE_FRAC  = 4
+    max_err_lines = 10          # 类默认;Task 2 的 __init__ 会设为实例属性
+
     def __init__(self, *, drop_roles=("developer",), tool_call_roles=("tool",),
                  observation_roles=("toolResult",), tool_result_max_chars=1500,
                  head_lines=6, tail_lines=6, max_line_chars=500, max_keyword_lines=20,
@@ -91,3 +97,40 @@ class DeterministicPruner:
             parts += [f"…〔截断 {len(middle) - len(kw)} 行〕"] + tail
             body = "\n".join(parts)
         return f"{body}\n〔原始工具输出已截断:{n} 行 / {len(content)} 字符;完整内容见 CASS 原会话〕"
+
+    def _cap_line(self, l, at=0):
+        # 超长行以 at(关键词位置)为中心取窗,总长 ≤ MAX_ERR_LINE(防越界 + 深埋 ERROR 被截没,codex R3 + plan R2 P2)
+        if len(l) <= self.MAX_ERR_LINE: return l
+        win = self.MAX_ERR_LINE - 2                      # 留 2 给两端省略号
+        start = max(0, min(at - win // 2, len(l) - win))
+        return ("…" if start > 0 else "") + l[start:start + win] + ("…" if start + win < len(l) else "")
+
+    def _clamp(self, content, cap, rescue_errors=True):
+        if content is None:      return ""
+        cap = max(cap, self.MIN_CAP)                 # 下界:cap 过小/0 不退化成整段
+        if len(content) <= cap:  return content      # 阈值内 → 原样(忠实)
+        rescue_budget = (cap // self.RESCUE_FRAC) if rescue_errors else 0
+        # 第一遍:head/tail 按 full cap 划,从中段抢救硬错误行(≤ rescue_budget)
+        head = content[: cap * 2 // 3]
+        tail = content[-(cap - len(head)):]
+        mid  = content[len(head): len(content) - len(tail)]
+        errs, used = [], 0
+        if rescue_errors:
+            for l in mid.splitlines():
+                m = _HARD_ERR.search(l)
+                if not m: continue
+                l = self._cap_line(l, m.start())                      # 以关键词位置截窗(plan R2 P2)
+                if len(errs) >= self.max_err_lines: break              # 行数到顶 → 停
+                if used + len(l) > rescue_budget: continue             # 太大塞不下 → 跳过找短的(codex plan R0 P1)
+                errs.append(l); used += len(l)
+        # 第二遍:有抢救则 head/tail 收缩 used(变小=子集,rescued 行仍在更大 mid 里、绝不重复;codex R3 回流 + plan R1 P2 去重)→ 总量 = cap
+        if used:
+            body = cap - used
+            head = content[: body * 2 // 3]
+            tail = content[-(body - len(head)):] if body - len(head) > 0 else ""
+        cut  = len(content) - len(head) - len(tail)
+        parts = [head]
+        if errs: parts.append("…〔硬错误行〕\n" + "\n".join(errs))
+        parts.append(f"…〔截断 {cut} 字符;完整见 CASS 原会话〕")
+        parts.append(tail)
+        return "\n".join(parts)
