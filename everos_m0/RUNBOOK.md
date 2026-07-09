@@ -147,9 +147,95 @@ spec §10 写：`mode=agent` 会顺带跑 user 侧 pipeline，写侧 LLM ≈ 翻
    必须带 `/v1`。故 `check_litellm_budget(admin_base, ...)` 与 `[llm] base_url` 是两个值，
    plan 里 `f"{base}/key/info"` 单参数签名会拼出 404 路径。
 
-## 5. 观测记录（Task 4/6 填）
+## 5. agent_case 的两道准入门（M0 最大的意外发现）
 
-- [ ] 异步时序：`/flush` 返回后 markdown 是否立刻出现（预期：否，异步）
-- [ ] U-5a owner 落点：agent_case 落 `agents/<agent_id>/`，user episode 落 `users/<user>/`
-- [ ] per-memcell 成本：一条 fixture 会话切了 N 个 memcell、触发 M 次 LLM
-- [ ] 终态是否需手动 `everos cascade --root <root> sync`
+**不是每条 coding 会话都会产出 `agent_case`。** everalgo 有两道门，都在 EverOS 之外
+（`everalgo/agent_memory/case.py`），不可经 `everos.toml` / `ome.toml` 配置：
+
+### 门 1 · 结构（`_should_skip` + `min_tool_call_rounds`）
+- `ToolCallRequest` 轮数 **≥ 3**（`min_tool_call_rounds=3` 是 `AgentCaseExtractor.__init__`
+  的默认参数，EverOS 构造时不传 → 写死）
+- **末条消息必须是 assistant 的 ChatMessage**（非 ToolCallRequest/Result），否则判
+  "Incomplete agent trajectory"
+- 需有 user 锚（`_strip_before_first_user` 会丢掉首条 user 之前的一切）
+
+### 门 2 · LLM 语义（`prompts/case_filter.py`）
+判「这条轨迹值不值得学」。**顺风顺水的线性流程一律拒**。原文判据：
+
+> Set False when the agent executed a known, linear procedure with no surprises.
+> **Complexity lives in the transferable lesson or the hard-won path, not in the
+> number of tool calls.**
+
+要过门必须有 *hard-won discovery*：走错路后回退，或撞上非显然的根因。
+实测被拒的 reason：`"Straightforward march: run test, read source, edit, verify
+— no detours or surprises."`
+
+### 对 spec / 下游的影响
+- **plan 原 fixture（1 轮 tool-call）永远产不出 agent_case**，端到端会神秘 TIMEOUT。
+  现 fixture = 7 轮 + dead end + 意外根因，两道门已编码成 `test_role_map.py` 的断言。
+- **spec §6.2 的终态机需要区分三态**，不能只有 `extracted` / `pending`：
+  `agent_case_skipped_by_algo` 是**确定性的合法「不产出」**（终态），不是「还没好」。
+  当 pending 处理会导致每次 retry 重扫、永远 pending。台账应写 **empty tombstone**。
+- **M1 测召回时，「喂 N 条会话只出 M 张卡片」是正常的，M ≪ N。** 这是 EverOS 的设计
+  （只学值得学的），不是 bug。
+
+## 6. 观测记录（M0 实测）
+
+### 6.1 U-5a owner 落点 ✅ 与 spec §5.1 一致
+```
+agents/ivan-coding/.cases/agent_case-2026-07-09.md    <- assistant/tool_call 的 sender
+users/ivan/episodes/episode-2026-07-09.md             <- user 消息的 sender
+users/ivan/.atomic_facts/atomic_fact-2026-07-09.md
+```
+
+### 6.2 异步时序（codex R0#3 说对了）
+- `feed 开始 → /flush 返回`：8s（`/add` 200 + `/flush` 200，status=`extracted`）
+- `/flush 返回 → agent_case 落盘`：**5s**（异步）
+- **`/flush` 返回 `extracted` ≠ 提取完成**。终态只能由「扫到 markdown 产物」确认。
+- **不需要手动 `cascade sync`**（M0 discovery ③ 关闭）：OME 自动 drain，
+  `cascade status` 显示 `pending: 0, done: 3, failed: 0`。
+
+### 6.3 per-memcell 成本（1 条 fixture 会话 = 701 tokens = 1 memcell）
+
+| 策略 | 侧 | run |
+|---|---|---|
+| `extract_agent_case` | agent | 1 |
+| `trigger_skill_clustering` | agent | 1 |
+| `extract_atomic_facts` | user | 1 |
+| `trigger_profile_clustering` | user | 1 |
+| `extract_user_profile` | user | 1 |
+| **合计** | | **5 run / memcell** |
+
+- spec §10 估的「每 memcell ≥3–5 次 LLM」**实测准确**（5）。
+- 但「mode=agent 使写侧 LLM ≈ 翻倍」应修正为：**user 侧占 5 个 run 里的 3 个（60%）**。
+  关掉 `ome.toml` 的三个 user 策略可省约 60% 写侧调用。
+- **真实花费**：`spend` delta = **$0.000456 / memcell**（deepseek-v4-flash）。
+  外推 1000 个同规模 memcell ≈ **$0.46**；`max_budget=100` 够跑约 21.9 万个。
+  ⚠️ fixture 仅 701 tokens，真实 coding 会话大得多且可能切多个 memcell，
+  按 token 线性放大后再估算 —— 但绝对量级表明 **spec §10 对成本的焦虑被证伪**。
+- **无 `agent_skill` 产出**：skill 是跨 session 涌现（cluster 驱动），单会话不够聚簇。
+  符合 spec §6.2「skill 不做 per-session 终态」。
+
+### 6.4 U-4a 关闭：提炼器**确实**消费 tool 结构
+`agent_case` 的 Approach 逐条复述了 tool 交互的具体内容——`pytest tests/test_foo.py -x`
+命令、`E assert 1 == 2` 报错原文、`git checkout --` 回退、commit hash `a1b2c3d`、
+`src/bar.py:20` 的 `return foo() + 2`。这些只可能来自 `tool_call.args` 与
+`tool_result.content`。spec §4.3 那条「`CanonicalMessage` 注释说 only type=text is
+parsed downstream」的疑虑，在 agent 路径不成立。→ §5.2 无需退化为 tool→text 渲染。
+
+### 6.5 输出语言
+- `agent_case`（我们要的）：**中文**（跟随输入语言）
+- `users/*/episodes`（v1 不消费）：**英文**（everalgo 的 episode prompt 强制英文）
+
+## 7. 安全事故记录（M0 自捅，已修）
+
+第一版启动脚本用 `source /tmp/cc-everos-m0/env.sh && setsid uv run everos server start`，
+`export` 的变量被子进程继承 → **`LITELLM_ADMIN_KEY`（admin 级、无预算上限）泄漏进
+EverOS 的 `/proc/<pid>/environ`**。EverOS 是黑盒第三方进程，能读自己的 environ。
+
+- **同 MEMORY「spawn 子进程别 `{...process.env}` 全泄漏」的 bash 版。**
+- 修复：`start-server.sh` 改用 `env -i` + 白名单（只给 `PATH/HOME/LANG` + `EVEROS_*`，
+  其中只含 everos-m0 那把有限额推理 key）。
+- 验证：`tr '\0' '\n' < /proc/<pid>/environ | grep KEY` 只剩
+  `EVEROS_LLM__API_KEY` / `EVEROS_EMBEDDING__API_KEY=EMPTY` / `EVEROS_RERANK__API_KEY=`（空串）。
+- **建议 M0 收尾轮换 admin key**（它曾在进程 env 与终端历史中出现）。
