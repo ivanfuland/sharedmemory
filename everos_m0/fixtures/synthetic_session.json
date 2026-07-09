@@ -1,5 +1,10 @@
 {
-  "_comment": "合成 6-role 会话（M0 不依赖真 CASS 语料）。形状照 franken 6-role 契约：role 六种、配对靠 extra_json.tool_call_id、无法关联的标 extra_json.unpaired=true。内容为通用 pytest 调试场景，不含任何真实私有信息。timestamp 为 ms epoch、组内唯一。",
+  "_comment": "合成 6-role 会话（M0 不依赖真 CASS 语料）。形状照 franken 6-role 契约：role 六种、配对靠 extra_json.tool_call_id、无法关联的标 extra_json.unpaired=true。内容为通用 pytest 调试场景，不含任何真实私有信息。timestamp 为 ms epoch、组内唯一递增。",
+  "_agent_case_gates": {
+    "structural": "everalgo AgentCaseExtractor（实测 everalgo/agent_memory/case.py）：① ToolCallRequest >= min_tool_call_rounds=3（EverOS 未传参、不可配）；② _should_skip 要求末条必须是 assistant 的 ChatMessage；③ 需有 user + assistant + tool calls。",
+    "semantic": "第二道门是 LLM 判「值不值得学」（prompts/case_filter.py）。顺风顺水的线性流程会被拒（实测 reason: 'Straightforward march ... no detours or surprises'）。必须有 hard-won discovery：走错路后回退，或撞上非显然的根因。堆 tool 调用数没用——'Complexity lives in the transferable lesson or the hard-won path, not in the number of tool calls'。",
+    "trajectory": "本 fixture 的弯路：先假设断言写反 → 改测试 → 意外弄挂 test_bar → 回退 → 查调用方 → 发现真因是上游改了 foo() 返回值却没同步 caller，测试暴露的是真 bug。教训可迁移：测试失败先别改测试。"
+  },
   "session_id": "m0-synth-0001",
   "messages": [
     {
@@ -11,7 +16,7 @@
     },
     {
       "role": "reasoning",
-      "content": "先跑一遍看报错栈，再决定改断言还是改实现",
+      "content": "先跑一遍看报错栈",
       "author": "deepseek",
       "extra_json": {},
       "timestamp": 1751961600100
@@ -27,23 +32,19 @@
       "role": "tool_call",
       "content": "[Tool: bash] pytest tests/test_foo.py -x",
       "author": "deepseek",
-      "extra_json": {
-        "tool_call_id": "tc1",
-        "tool_name": "bash",
-        "args": "pytest tests/test_foo.py -x"
-      },
+      "extra_json": { "tool_call_id": "tc1", "tool_name": "bash", "args": "pytest tests/test_foo.py -x" },
       "timestamp": 1751961600300
     },
     {
       "role": "tool_result",
-      "content": "E   assert 1 == 2\ntests/test_foo.py:12: AssertionError",
+      "content": "E   assert 1 == 2\ntests/test_foo.py:12: AssertionError\n1 failed in 0.03s",
       "author": "",
       "extra_json": { "tool_call_id": "tc1" },
       "timestamp": 1751961600400
     },
     {
       "role": "assistant",
-      "content": "断言写反了，把 assert foo() == 1 改成 assert foo() == 2。",
+      "content": "断言写反了，把 assert foo() == 1 改成 == 2。",
       "author": "deepseek",
       "extra_json": {},
       "timestamp": 1751961600500
@@ -55,23 +56,136 @@
       "extra_json": {
         "tool_call_id": "tc2",
         "tool_name": "edit",
-        "args": { "path": "tests/test_foo.py", "old": "== 1", "new": "== 2" }
+        "args": { "path": "tests/test_foo.py", "old": "assert foo() == 1", "new": "assert foo() == 2" }
       },
       "timestamp": 1751961600600
+    },
+    {
+      "role": "tool_result",
+      "content": "edited 1 line in tests/test_foo.py",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc2" },
+      "timestamp": 1751961600700
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: bash] pytest tests/ -x",
+      "author": "deepseek",
+      "extra_json": { "tool_call_id": "tc3", "tool_name": "bash", "args": "pytest tests/ -x" },
+      "timestamp": 1751961600800
+    },
+    {
+      "role": "tool_result",
+      "content": "tests/test_foo.py .                                   [ 50%]\ntests/test_bar.py F                                   [100%]\nE   assert compute() == 3\ntests/test_bar.py:8: AssertionError\n1 failed, 1 passed in 0.05s",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc3" },
+      "timestamp": 1751961600900
+    },
+    {
+      "role": "reasoning",
+      "content": "改完 test_foo 反而把 test_bar 弄挂了。说明 foo() 的返回值被别处依赖——测试没写错，是实现真的坏了。我改错方向了，先回退。",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961601000
+    },
+    {
+      "role": "assistant",
+      "content": "不对，我改错方向了。test_bar 本来是绿的，被我连带弄挂说明 foo() 的返回值有下游依赖。先回退我的改动。",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961601100
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: bash] git checkout -- tests/test_foo.py",
+      "author": "deepseek",
+      "extra_json": { "tool_call_id": "tc4", "tool_name": "bash", "args": "git checkout -- tests/test_foo.py" },
+      "timestamp": 1751961601200
+    },
+    {
+      "role": "tool_result",
+      "content": "",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc4" },
+      "timestamp": 1751961601300
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: bash] git log -1 --oneline -- src/foo.py && grep -rn 'foo()' src/",
+      "author": "deepseek",
+      "extra_json": {
+        "tool_call_id": "tc5",
+        "tool_name": "bash",
+        "args": "git log -1 --oneline -- src/foo.py && grep -rn 'foo()' src/"
+      },
+      "timestamp": 1751961601400
+    },
+    {
+      "role": "tool_result",
+      "content": "a1b2c3d refactor: simplify foo\nsrc/bar.py:20:    return foo() + 2",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc5" },
+      "timestamp": 1751961601500
+    },
+    {
+      "role": "assistant",
+      "content": "真因找到了：上个 commit a1b2c3d 把 foo() 的返回值从 1 改成 2，但没同步 src/bar.py:20 的调用方，compute() 因此多算了 1。test_foo 暴露的是真 bug，该改的是实现不是测试。",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961601600
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: edit] src/foo.py",
+      "author": "deepseek",
+      "extra_json": {
+        "tool_call_id": "tc6",
+        "tool_name": "edit",
+        "args": { "path": "src/foo.py", "old": "return 2", "new": "return 1" }
+      },
+      "timestamp": 1751961601700
+    },
+    {
+      "role": "tool_result",
+      "content": "edited 1 line in src/foo.py",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc6" },
+      "timestamp": 1751961601800
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: bash] pytest tests/ -x",
+      "author": "deepseek",
+      "extra_json": { "tool_call_id": "tc7", "tool_name": "bash", "args": "pytest tests/ -x" },
+      "timestamp": 1751961601900
+    },
+    {
+      "role": "tool_result",
+      "content": "tests/test_foo.py .                                   [ 50%]\ntests/test_bar.py .                                   [100%]\n2 passed in 0.04s",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc7" },
+      "timestamp": 1751961602000
     },
     {
       "role": "tool_result",
       "content": "orphan output with no matching call",
       "author": "",
       "extra_json": { "unpaired": true, "tool_name": "bash" },
-      "timestamp": 1751961600700
+      "timestamp": 1751961602100
     },
     {
       "role": "system",
       "content": "permission-mode: acceptEdits",
       "author": "",
       "extra_json": {},
-      "timestamp": 1751961600800
+      "timestamp": 1751961602200
+    },
+    {
+      "role": "assistant",
+      "content": "两个测试都绿了。教训：单个测试挂掉时不要直接改断言让它变绿——先跑全量测试看改动会不会连带弄挂别的。这次 test_bar 被连带弄挂，才暴露出 foo() 的返回值有下游调用方依赖，真正的 bug 在实现里而不是测试里。",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961602300
     }
   ]
 }
