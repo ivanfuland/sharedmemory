@@ -9,7 +9,10 @@ from datetime import datetime, timedelta, timezone
 
 _TZ = timezone(timedelta(hours=8))   # GMT+8:Ivan "哪天聊的" 语义,确定性
 _ROLE_LABEL = {"user": "User", "agent": "Assistant", "assistant": "Assistant",
-               "toolResult": "Tool Result", "tool": "Tool"}
+               "toolResult": "Tool Result", "tool": "Tool",
+               # franken 6-role(spec §2):新角色显式标签,避免 .get(role, role) fallback 漏出裸角色名
+               "tool_call": "Tool Call", "tool_result": "Tool Result",
+               "reasoning": "Reasoning", "system": "System"}
 _SLUG_SAFE = re.compile(r"[^a-z0-9]+")
 
 
