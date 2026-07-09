@@ -98,13 +98,14 @@ class DeterministicPruner:
         head_end, tail_start = len(head), len(content) - len(tail)
         errs, used, pos = [], 0, 0
         if rescue_errors:
-            for l in content.split("\n"):                            # 扫原文整行(不切片)→ 关键词/整行绝不被劈开(codex PR R1 P1)
-                start, end = pos, pos + len(l); pos = end + 1
-                if end <= head_end or start >= tail_start:
-                    continue                                          # 整行已在 head/tail 里(不重复、不丢)
+            for l in content.split("\n"):                            # 扫原文整行(不切片)→ 关键词绝不被劈开
+                line_start = pos; pos += len(l) + 1                  # +1 = split 丢弃的 "\n"
                 m = _HARD_ERR.search(l)
                 if not m: continue
-                l = self._cap_line(l, m.start())                      # 以关键词位置截窗
+                kw_start = line_start + m.start(); kw_end = line_start + m.end()
+                if kw_end <= head_end or kw_start >= tail_start:
+                    continue                                          # 关键词已完整可见于 head/tail → 不抢救(无重复、不白占预算,codex PR R2 P1)
+                l = self._cap_line(l, m.start())                      # 关键词落被丢弃区/横跨边界 → 抢救(关键词居中,codex PR R1 P1)
                 cost = len(l) + 1                                     # +1 计入 join 换行(严格守恒,codex PR R0 P2)
                 if len(errs) >= self.max_err_lines: break             # 行数到顶 → 停
                 if used + cost > rescue_budget: continue              # 塞不下 → 跳过找短的

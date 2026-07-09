@@ -34,10 +34,18 @@ def test_clamp_total_output_within_cap():
     for cap in (200, 800, 1500, 4000):
         assert len(_clamp(content, cap)) <= cap
 
-def test_clamp_no_error_lost_at_char_boundary():
-    # codex PR R1 P1:ERROR 关键词横跨 head 字符边界(无换行护栏)时,扫原文整行保证被抢救、不丢
-    content = "A" * 720 + "ERROR_CHAR_BOUNDARY_MARK tail\n" + "B" * 5000
-    assert "ERROR_CHAR_BOUNDARY_MARK" in _clamp(content, 1500)
+def test_clamp_rescues_dropped_region_error():
+    # 被丢弃中段的硬错误被抢救(稳健用例,与精确边界无关)
+    content = "A" * 4000 + "\nERROR_DEEP_IN_MIDDLE line\n" + "B" * 4000
+    assert "ERROR_DEEP_IN_MIDDLE" in _clamp(content, 1500)
+
+def test_clamp_head_visible_error_not_reduplicated_and_mid_rescued():
+    # codex PR R2 P1:head 里已可见的 ERROR 不被重复抢救、不白占预算;真·中段 ERROR 仍抢救
+    content = ("A" * 100 + "ERROR_IN_HEAD" + "X" * 2000 + "\n"
+               + "ERROR_REAL_MID_" + "Y" * 80 + "\n" + "B" * 5000)
+    out = _clamp(content, 1500)
+    assert out.count("ERROR_IN_HEAD") == 1           # head 可见,不重复
+    assert "ERROR_REAL_MID_" in out                   # 预算没被 head 那条偷走,中段错误保住
 
 def test_clamp_total_conserved_with_giant_error_lines():
     content = "H" * 150 + "\n" + "\n".join(f"ERROR {i} " + "Z" * 10000 for i in range(10)) + "\n" + "T" * 5000
