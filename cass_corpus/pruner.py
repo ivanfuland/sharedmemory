@@ -71,10 +71,11 @@ class DeterministicPruner:
                 out.append(m)
         return out
 
-    def _cap_line(self, l, at=0):
-        # 超长行以 at(关键词位置)为中心取窗,总长 ≤ MAX_ERR_LINE(防越界 + 深埋 ERROR 被截没,codex R3 + plan R2 P2)
-        if len(l) <= self.MAX_ERR_LINE: return l
-        win = self.MAX_ERR_LINE - 2                      # 留 2 给两端省略号
+    def _cap_line(self, l, at=0, max_len=None):
+        # 以 at(关键词位置)为中心取窗,总长 ≤ max_len(默认 MAX_ERR_LINE);预算紧时可传更小的窗
+        n = max_len if max_len is not None else self.MAX_ERR_LINE
+        if len(l) <= n: return l
+        win = n - 2                                     # 留 2 给两端省略号
         start = max(0, min(at - win // 2, len(l) - win))
         return ("…" if start > 0 else "") + l[start:start + win] + ("…" if start + win < len(l) else "")
 
@@ -96,7 +97,7 @@ class DeterministicPruner:
             nl = tail.find("\n")
             if nl != -1: tail = tail[nl:]
         head_end, tail_start = len(head), len(content) - len(tail)
-        errs, used, pos = [], 0, 0
+        errs, used, pos, skipped = [], 0, 0, []
         if rescue_errors:
             for l in content.split("\n"):                       # 逐行:短行整条抢救(便宜)、巨型行关键词居中截窗
                 line_start = pos; pos += len(l) + 1             # +1 = split 丢弃的 "\n"
@@ -109,8 +110,14 @@ class DeterministicPruner:
                 seg = self._cap_line(l, rescue_at)               # 短行原样、巨型行关键词居中截窗(codex PR R1 P1)
                 cost = len(seg) + 1                              # +1 计入 join 换行(严格守恒,codex PR R0 P2)
                 if len(errs) >= self.max_err_lines: break
-                if used + cost > rescue_budget: continue         # 塞不下 → 跳过找短的
+                if used + cost > rescue_budget:
+                    skipped.append((l, rescue_at)); continue     # 塞不下 → 记下,末尾用剩余预算补救(先给更短的机会)
                 errs.append(seg); used += cost
+            # 末尾:budget 有剩余且有被跳过的 ERROR → 用剩余预算截一个窗口,保证有预算就不静默丢(codex PR R4 P1)
+            room = rescue_budget - used
+            if skipped and len(errs) < self.max_err_lines and room > 20:
+                l, at = skipped[0]
+                errs.append(self._cap_line(l, at, room - 1))     # 窗口 ≤ 剩余预算
         cut  = len(content) - len(head) - len(tail)
         parts = [head]
         if errs: parts.append("…〔硬错误行〕\n" + "\n".join(errs))

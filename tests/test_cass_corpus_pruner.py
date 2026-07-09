@@ -52,6 +52,12 @@ def test_clamp_rescues_later_error_in_giant_line():
     content = "ERROR_HEAD_VIS" + "X" * 2000 + "ERROR_MID_DROPPED" + "Y" * 4000
     assert "ERROR_MID_DROPPED" in _clamp(content, 1500)
 
+def test_clamp_rescues_error_line_bigger_than_small_budget():
+    # codex PR R4 P1:小 cap 下 budget 小,略超预算的正常中段 ERROR 行不静默丢(末尾截窗补救)
+    lines = [f"pad {i}" for i in range(200)]
+    lines[100] = "P" * 80 + "ERROR_DROPPED_LONG_LINE" + "Q" * 120
+    assert "ERROR_DROPPED_LONG_LINE" in _clamp("\n".join(lines), 800)
+
 def test_clamp_total_conserved_with_giant_error_lines():
     content = "H" * 150 + "\n" + "\n".join(f"ERROR {i} " + "Z" * 10000 for i in range(10)) + "\n" + "T" * 5000
     out = _clamp(content, 1500)
