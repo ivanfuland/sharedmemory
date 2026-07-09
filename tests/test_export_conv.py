@@ -131,18 +131,78 @@ def test_export_mixed_escape_hatch(tmp_path, monkeypatch):
     _export._assert_no_legacy_names(str(out))           # 显式放行,不抛
 
 
-def test_export_detects_session_key_collision(tmp_path, monkeypatch):
-    """碰撞 → 后写覆盖先写 → 静默丢一整个会话。批内必须检测并记进 errors
-    (errors>0 会让 F3 throw、游标不推进,零静默丢失)。"""
+def test_collision_blocked_across_batches(tmp_path, monkeypatch):
+    """codex R2 P1:批内 seen_names 挡不住跨轮。round1 写 conv1、游标推进;round2 从 conv2 起,
+    旧实现无条件 os.replace 覆盖 conv1 且 errors=[] —— 静默丢一整个会话。"""
     monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
     dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    out = str(tmp_path / "out")
     monkeypatch.setattr(render, "transcript_filename", lambda meta: "collide.md")
-    # since_cursor 给值 → reader 按 (ts,id) ASC;max_cursor 的"无错前缀"语义只在此排序下成立
-    rep = _export.export(dbp, str(tmp_path / "out"), limit=10, min_turns=1, min_chars=1,
-                         since_cursor=(0, 0))
-    assert len(rep["written"]) == 1                                  # 先到的 conv 1 写出
-    assert len(rep["errors"]) == 1 and "碰撞" in rep["errors"][0][1]  # 后到的 conv 2 撞名 → loud
-    assert rep["max_cursor"] == (1735660800000, 1)                   # 游标停在出错那条之前,conv 2 下轮重试
+    r1 = _export.export(dbp, out, limit=1, min_turns=1, min_chars=1, since_cursor=(0, 0))
+    assert len(r1["written"]) == 1 and "external_id: ext-a" in open(os.path.join(out, "collide.md")).read()
+    r2 = _export.export(dbp, out, limit=1, min_turns=1, min_chars=1, since_cursor=r1["max_cursor"])
+    assert r2["written"] == []                                   # 绝不覆盖
+    assert len(r2["errors"]) == 1 and "拒绝覆盖" in r2["errors"][0][1]
+    assert "external_id: ext-a" in open(os.path.join(out, "collide.md")).read()   # conv1 完好
+
+
+def test_collision_blocked_in_export_one(tmp_path, monkeypatch):
+    """F3 真实路径。旧实现这里连 seen_names 都没有,直接覆盖。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(render, "transcript_filename", lambda meta: "collide.md")
+    assert len(_export.export_one(dbp, out, 1, min_chars=1)["written"]) == 1
+    rep = _export.export_one(dbp, out, 2, min_chars=1)            # 同名、不同身份
+    assert rep["written"] == [] and len(rep["errors"]) == 1
+    assert "拒绝覆盖" in rep["errors"][0][1]
+    assert "external_id: ext-a" in open(os.path.join(out, "collide.md")).read()
+
+
+def test_true_hash_collision_detected_by_preimage(tmp_path, monkeypatch):
+    """**真**碰撞:两个不同会话算出同一个 session_key(文件名与 frontmatter 的 key 都相同)。
+    此时比 session_key 两边永远相等 —— 抓不到。必须比原像 (external_id, source_id, agent)。
+    上面两条碰撞测试是 monkeypatch 文件名造的"假碰撞",不覆盖这条。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(render, "session_key", lambda meta: "scollide0000000")   # 强制碰撞
+    assert len(_export.export_one(dbp, out, 1, min_chars=1)["written"]) == 1
+    body = open(os.path.join(out, os.listdir(out)[0])).read()
+    assert "session_key: scollide0000000" in body and "external_id: ext-a" in body
+    rep = _export.export_one(dbp, out, 2, min_chars=1)      # 同 key、同名、不同 external_id
+    assert rep["written"] == [] and len(rep["errors"]) == 1
+    assert "拒绝覆盖" in rep["errors"][0][1]
+    assert "external_id: ext-a" in open(os.path.join(out, os.listdir(out)[0])).read()
+
+
+def test_same_session_reexport_overwrites_normally(tmp_path, monkeypatch):
+    """守卫只拦"同名不同身份"。同一会话的内容更新必须照常覆盖,否则增量 feed 就死了。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    out = str(tmp_path / "out")
+    assert len(_export.export_one(dbp, out, 1, min_chars=1)["written"]) == 1
+    rep = _export.export_one(dbp, out, 1, min_chars=1)            # 再导同一条
+    assert len(rep["written"]) == 1 and rep["errors"] == []
+
+
+def test_guard_refuses_foreign_file(tmp_path, monkeypatch):
+    """目标已存在但无 frontmatter(外来文件)→ 拒写,不当成自己的旧版覆盖掉。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    p = tmp_path / "x.md"; p.write_text("not a transcript", encoding="utf-8")
+    with pytest.raises(_export.TranscriptIdentityError):
+        _export._guard_write_target(str(p), {"external_id": "e", "source_id": "local", "agent": "codex"})
+
+
+def test_legacy_name_regex_does_not_hit_foreign_md(tmp_path, monkeypatch):
+    """codex R2 P2:`-\d+\.md$` 会误伤任意 note-123.md。锚到 CASS 形态。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    out = tmp_path / "d"; out.mkdir()
+    (out / "note-123.md").write_text("x", encoding="utf-8")
+    _export._assert_no_legacy_names(str(out))                    # 不该抛
+    (out / "2026-04-29-cass-codex-192.md").write_text("x", encoding="utf-8")
+    with pytest.raises(_export.LegacyCorpusDirError):
+        _export._assert_no_legacy_names(str(out))
 
 
 def _mk_db_two_convs(path):

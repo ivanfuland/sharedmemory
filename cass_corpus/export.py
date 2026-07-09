@@ -11,13 +11,62 @@ from cass_corpus.pruner import DeterministicPruner
 
 # 旧命名:<date>-cass-<agent>-<rowid>.md(末段纯数字)。新命名末段是 `s`+16hex,永不纯数字。
 # export 只写不删 → 直接刷进旧目录会新旧并存、gbrain 看到重复/孤儿 transcript。
-# 靠"记得先原子换目录"是靠不住的口头约定,这里做成代码级 fail-loud(codex PR#41 审出的 P1)。
-_LEGACY_NAME = re.compile(r"-\d+\.md$")
+# 靠"记得先原子换目录"是靠不住的口头约定,这里做成代码级 fail-loud(codex PR#41 R1 审出的 P1)。
+# 正则锚到 CASS transcript 形态,否则会误伤目录里任意 `note-123.md`(codex R2 P2)。
+_LEGACY_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-cass-.+-\d+\.md$")
 _ALLOW_MIXED_ENV = "CASS_CORPUS_ALLOW_MIXED"
+
+# 写目标已存在时的身份校验。
+# ⚠ **不能比 session_key**:碰撞的定义就是两个不同会话算出同一个 key(文件名也因此相同),
+#   比它两边永远相等。必须比**原像** (external_id, source_id, agent)。
+# 覆盖同名但不同身份的文件 = 静默丢一整个会话(codex R2 P1:实测 run_feed 跨轮 + export_one
+# 都会无条件 os.replace,errors=[] 零报错)。
+_FM_LINE = re.compile(r"^([A-Za-z_]+):\s*(.*)$")
+_IDENTITY_KEYS = ("external_id", "source_id", "agent")
 
 
 class LegacyCorpusDirError(RuntimeError):
     pass
+
+
+class TranscriptIdentityError(RuntimeError):
+    pass
+
+
+def _identity_of_meta(meta):
+    return tuple(meta.get(k) for k in _IDENTITY_KEYS)
+
+
+def _identity_of_file(path):
+    """读已有 transcript 的 frontmatter 身份。无 frontmatter(外来文件)→ 'FOREIGN'(拒写)。"""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        head = f.read(4096)
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "FOREIGN"
+    fm = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = _FM_LINE.match(line)
+        if m:
+            fm[m.group(1)] = m.group(2).strip()
+    return tuple(fm.get(k) for k in _IDENTITY_KEYS)
+
+
+def _guard_write_target(path, meta):
+    """持久 fail-loud:目标已存在且身份不同 → 绝不覆盖。
+    覆盖只允许发生在"同一逻辑会话的内容更新"上。
+    老/合成 schema 无 external_id → 两侧身份同为 (None, None, agent),放行
+    (那种库本就没有稳定身份;不同会话的 rowid 派生 key 不同名,不会走到这里)。"""
+    if not os.path.exists(path):
+        return
+    prev, cur = _identity_of_file(path), _identity_of_meta(meta)
+    if prev != cur:
+        raise TranscriptIdentityError(
+            f"拒绝覆盖 {os.path.basename(path)}:已有文件身份 {prev},待写身份 {cur}。"
+            f"同名不同会话 = session_key 碰撞或外来文件 —— 绝不静默覆盖。"
+            f"若为真碰撞,增大 render._KEY_BYTES 并重刷。")
 
 
 def _assert_no_legacy_names(out_dir):
@@ -57,7 +106,6 @@ def export(db_path, out_dir, limit=20, agents=None,
     os.makedirs(out_dir, exist_ok=True)
     convs = reader.select_conversations(db_path, limit, agents, min_turns, max_turns, since_cursor=since_cursor)
     written, skipped, errors = [], [], []
-    seen_names = {}                      # fn -> conv_id;批内 session_key 碰撞检测
     max_cursor, broke = None, False      # D2: max_cursor = 无错 (ts,id) ASC 前缀的末端(= 新游标候选)
     for meta in convs:                   # since_cursor 给值时 reader 已按 (ts,id) ASC 排序
         had_error = False
@@ -69,13 +117,9 @@ def export(db_path, out_dir, limit=20, agents=None,
                 skipped.append((meta["id"], len(text)))
             else:
                 fn = render.transcript_filename(meta)
-                # session_key 碰撞 → 后写覆盖先写 → **静默丢一整个会话**。批内可检测,必须 loud
-                # (codex PR#41 C:64bit 在 2424 条上零碰撞,但静默丢数据的失败模式不可接受)。
-                if fn in seen_names:
-                    raise RuntimeError(f"session_key 碰撞:{fn} 已由 conv {seen_names[fn]} 写出,"
-                                       f"conv {meta['id']} 撞名。绝不覆盖 —— 增大 render._KEY_BYTES。")
-                seen_names[fn] = meta["id"]
-                _atomic_write(os.path.join(out_dir, fn), text)
+                path = os.path.join(out_dir, fn)
+                _guard_write_target(path, meta)      # 持久:跨批、跨 retry 都拦得住
+                _atomic_write(path, text)
                 written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
         except Exception as e:
             errors.append((meta.get("id"), repr(e)[:200]))
@@ -111,7 +155,9 @@ def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
             skipped.append((meta["id"], len(text)))
         else:
             fn = render.transcript_filename(meta)
-            _atomic_write(os.path.join(out_dir, fn), text)
+            path = os.path.join(out_dir, fn)
+            _guard_write_target(path, meta)          # F3 逐条驱动也必须拦(codex R2 P1)
+            _atomic_write(path, text)
             written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
     except Exception as e:
         errors.append((meta.get("id"), repr(e)[:200]))
