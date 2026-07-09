@@ -3,7 +3,11 @@
 # 全合成数据（PUBLIC 仓隐私）。messages 带 created_at（毫秒 epoch）以验 max_message_ts / exported_ts。
 import os
 import sqlite3
+
+import pytest
+
 from cass_corpus import export, render
+from cass_corpus import export as _export
 
 
 def _mk_db(path, convs):
@@ -98,3 +102,65 @@ def test_parse_argv_out_dir_equal_conv_value():
     # 按位置排除 --conv 值：out_dir 字符串恰等于 conv-id 也不被误吞
     conv, pos, bf = export.parse_argv(["1898", "--conv", "1898"])
     assert conv == "1898" and pos == ["1898"]
+
+
+# ── 迁移守卫:拒绝把新命名刷进含旧 rowid 命名的目录（codex PR#41 P1）──
+
+def test_export_refuses_legacy_named_corpus_dir(tmp_path, monkeypatch):
+    """export 只写不删。直接刷进旧目录 → 新旧并存、gbrain 看到重复/孤儿。必须 fail loud。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    out = tmp_path / "corpus"; out.mkdir()
+    (out / "2026-04-29-cass-codex-192.md").write_text("legacy", encoding="utf-8")
+    with pytest.raises(_export.LegacyCorpusDirError) as e:
+        _export.export_one("/nonexistent.db", str(out), 1)
+    assert "192" in str(e.value)
+
+
+def test_export_ok_in_fresh_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    out = tmp_path / "fresh"
+    _export._assert_no_legacy_names(str(out))           # 不存在的目录 → 放行
+    out.mkdir(); (out / "2026-04-29-cass-codex-sdeadbeefdeadbeef.md").write_text("new", encoding="utf-8")
+    _export._assert_no_legacy_names(str(out))           # 只有新命名 → 放行
+
+
+def test_export_mixed_escape_hatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("CASS_CORPUS_ALLOW_MIXED", "1")
+    out = tmp_path / "corpus"; out.mkdir()
+    (out / "2026-04-29-cass-codex-192.md").write_text("legacy", encoding="utf-8")
+    _export._assert_no_legacy_names(str(out))           # 显式放行,不抛
+
+
+def test_export_detects_session_key_collision(tmp_path, monkeypatch):
+    """碰撞 → 后写覆盖先写 → 静默丢一整个会话。批内必须检测并记进 errors
+    (errors>0 会让 F3 throw、游标不推进,零静默丢失)。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    monkeypatch.setattr(render, "transcript_filename", lambda meta: "collide.md")
+    # since_cursor 给值 → reader 按 (ts,id) ASC;max_cursor 的"无错前缀"语义只在此排序下成立
+    rep = _export.export(dbp, str(tmp_path / "out"), limit=10, min_turns=1, min_chars=1,
+                         since_cursor=(0, 0))
+    assert len(rep["written"]) == 1                                  # 先到的 conv 1 写出
+    assert len(rep["errors"]) == 1 and "碰撞" in rep["errors"][0][1]  # 后到的 conv 2 撞名 → loud
+    assert rep["max_cursor"] == (1735660800000, 1)                   # 游标停在出错那条之前,conv 2 下轮重试
+
+
+def _mk_db_two_convs(path):
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+        CREATE TABLE conversations(id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+            workspace_id INTEGER, source_path TEXT, started_at INTEGER,
+            last_message_created_at INTEGER, primary_model TEXT,
+            external_id TEXT, source_id TEXT);
+        CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+            role TEXT, content TEXT, created_at INTEGER, extra_json TEXT, extra_bin BLOB);
+        INSERT INTO agents VALUES(1,'codex');
+        INSERT INTO conversations(id,agent_id,title,source_path,started_at,last_message_created_at,external_id,source_id)
+          VALUES(1,1,'a','/p',1735660800000,1735660800000,'ext-a','local'),
+                (2,1,'b','/p',1735660900000,1735660900000,'ext-b','local');
+        INSERT INTO messages(conversation_id,idx,role,content,created_at)
+          VALUES(1,0,'user','aaaa',1735660800000),(2,0,'user','bbbb',1735660900000);
+    """)
+    db.commit(); db.close()

@@ -2,11 +2,36 @@
 # 驱动:选会话 → 读 → Pruner 清洗 → 渲染 → 写 transcript 文件到 gbrain session_corpus 目录。
 # 用法:uv run python -m cass_corpus.export [out_dir] [limit]
 import os
+import re
 import sys
 from cass_corpus import reader, render
 from cass_corpus.redact import redact_secrets
 from cass_corpus import state as _state
 from cass_corpus.pruner import DeterministicPruner
+
+# 旧命名:<date>-cass-<agent>-<rowid>.md(末段纯数字)。新命名末段是 `s`+16hex,永不纯数字。
+# export 只写不删 → 直接刷进旧目录会新旧并存、gbrain 看到重复/孤儿 transcript。
+# 靠"记得先原子换目录"是靠不住的口头约定,这里做成代码级 fail-loud(codex PR#41 审出的 P1)。
+_LEGACY_NAME = re.compile(r"-\d+\.md$")
+_ALLOW_MIXED_ENV = "CASS_CORPUS_ALLOW_MIXED"
+
+
+class LegacyCorpusDirError(RuntimeError):
+    pass
+
+
+def _assert_no_legacy_names(out_dir):
+    """out_dir 里若有旧 rowid 命名的 transcript → 拒绝写入。
+    迁移姿势:导进**全新空目录**,再同盘 mv 原子换上(旧目录留作回滚点)。
+    确实要混写(调试)→ 显式 CASS_CORPUS_ALLOW_MIXED=1。"""
+    if os.environ.get(_ALLOW_MIXED_ENV) == "1" or not os.path.isdir(out_dir):
+        return
+    legacy = [n for n in os.listdir(out_dir) if n.endswith(".md") and _LEGACY_NAME.search(n)]
+    if legacy:
+        raise LegacyCorpusDirError(
+            f"{out_dir} 含 {len(legacy)} 个旧 rowid 命名的 transcript(如 {legacy[0]})。"
+            f"新命名用稳定 session_key,直接混写会造成新旧并存/孤儿。"
+            f"请导进全新空目录后原子 mv 换上;确需混写设 {_ALLOW_MIXED_ENV}=1。")
 
 
 def _atomic_write(path, text):
@@ -28,9 +53,11 @@ def _atomic_write(path, text):
 def export(db_path, out_dir, limit=20, agents=None,
            min_turns=4, max_turns=None, min_chars=2000, pruner=None, since_cursor=None):
     pruner = pruner or DeterministicPruner()
+    _assert_no_legacy_names(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     convs = reader.select_conversations(db_path, limit, agents, min_turns, max_turns, since_cursor=since_cursor)
     written, skipped, errors = [], [], []
+    seen_names = {}                      # fn -> conv_id;批内 session_key 碰撞检测
     max_cursor, broke = None, False      # D2: max_cursor = 无错 (ts,id) ASC 前缀的末端(= 新游标候选)
     for meta in convs:                   # since_cursor 给值时 reader 已按 (ts,id) ASC 排序
         had_error = False
@@ -42,6 +69,12 @@ def export(db_path, out_dir, limit=20, agents=None,
                 skipped.append((meta["id"], len(text)))
             else:
                 fn = render.transcript_filename(meta)
+                # session_key 碰撞 → 后写覆盖先写 → **静默丢一整个会话**。批内可检测,必须 loud
+                # (codex PR#41 C:64bit 在 2424 条上零碰撞,但静默丢数据的失败模式不可接受)。
+                if fn in seen_names:
+                    raise RuntimeError(f"session_key 碰撞:{fn} 已由 conv {seen_names[fn]} 写出,"
+                                       f"conv {meta['id']} 撞名。绝不覆盖 —— 增大 render._KEY_BYTES。")
+                seen_names[fn] = meta["id"]
                 _atomic_write(os.path.join(out_dir, fn), text)
                 written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
         except Exception as e:
@@ -59,6 +92,7 @@ def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
     """单条精确导出(Inngest F3 逐条驱动用;不碰 cursor)。选一条 → 读 → 清洗 → 渲染 → 原子写。
     返回 report 含 exported_ts = 实际读到消息的 max created_at(文件真实内容版本,codex R5 P1-2/R6 P2-A)。"""
     pruner = pruner or DeterministicPruner()
+    _assert_no_legacy_names(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     meta = reader.get_conversation(db_path, conv_id)
     if meta is None:

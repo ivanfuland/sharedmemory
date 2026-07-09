@@ -35,17 +35,21 @@ def _safe(s):
 #   文件名一变,gbrain 就把同一会话当新文档 → 全量重炼 + 留下孤儿页。
 # ⚠ 也不能只哈希 external_id:唯一约束带 source_id 和 agent。
 _KEY_BYTES = 8          # 64 bit;2424 会话零碰撞,10 万会话碰撞概率 ~3e-10
+# 前缀 's' 保证 key 永不为纯十进制串。裸 16 hex 有 (10/16)^16 ≈ 2.8e-4 概率全是数字
+# (实测真库 2424 条里就有 1 条:`...-3845786846798581.md`),会被下游按 rowid 的
+# `/-(\d+)\.md$/` 误捕(codex PR#41 审出)。
+_KEY_PREFIX = "s"
 
 
 def session_key(meta):
-    """跨重摄稳定的会话摘要(16 hex)。无 external_id(老/合成 schema)→ 回退到 rowid 派生,
+    """跨重摄稳定的会话摘要(`s` + 16 hex)。无 external_id(老/合成 schema)→ 回退到 rowid 派生,
     仍确定性但**不稳定**——如实反映"这个库没给出稳定身份",不假装有。"""
     ext = meta.get("external_id")
     if ext:
         raw = f"{meta.get('source_id') or ''}\x00{meta.get('agent') or ''}\x00{ext}"
     else:
         raw = f"__legacy_rowid__\x00{meta.get('agent') or ''}\x00{meta['id']}"
-    return hashlib.blake2b(raw.encode("utf-8"), digest_size=_KEY_BYTES).hexdigest()
+    return _KEY_PREFIX + hashlib.blake2b(raw.encode("utf-8"), digest_size=_KEY_BYTES).hexdigest()
 
 
 def transcript_filename(meta):
@@ -56,9 +60,11 @@ def transcript_filename(meta):
 
 def _frontmatter(meta):
     title = (meta.get("title") or "").replace("\n", " ").strip()
-    # conversation_id 保留,便于对**当前**库调试;但它是 rowid,重摄即变,不是身份。
-    # 稳定身份是 external_id + source_id(缺列时不写,不伪造)。
-    lines = ["---", "source: cass", f"conversation_id: {meta['id']}",
+    # ⚠ 绝不写 conversation_id(rowid):它重摄即变 → frontmatter 变 → content_hash 变 →
+    #   gbrain 仍把同一会话当新内容全量重炼。文件名稳定但正文漂移 = 修了一半等于没修
+    #   (codex PR#41 审出的 P1:实测同一会话 rowid 72→116,文件名不变但渲染 hash 变)。
+    #   要对当前库调试,用 external_id 反查:SELECT id FROM conversations WHERE external_id=?
+    lines = ["---", "source: cass", f"session_key: {session_key(meta)}",
              f"agent: {meta.get('agent', '')}", f"date: {_date(meta.get('started_at'))}"]
     if meta.get("external_id"):
         lines.append(f"external_id: {meta['external_id']}")
