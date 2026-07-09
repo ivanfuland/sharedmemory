@@ -60,7 +60,7 @@ class DeterministicPruner:
                 out.append(Msg(m.idx, m.role, self._truncate_observation(m.content)))
             elif m.role in self.reasoning_roles:
                 # 保留但有界:模型 thinking 不静默丢,也不放任无限膨胀刷屏(同一套截断规则)
-                out.append(Msg(m.idx, m.role, self._truncate_observation(m.content)))
+                out.append(Msg(m.idx, m.role, self._truncate_observation(m.content, kind="推理内容")))
             else:
                 out.append(m)                                     # user/assistant 等忠实保留
         return out
@@ -79,7 +79,7 @@ class DeterministicPruner:
     def _cap(self, line):
         return line if len(line) <= self.max_line_chars else line[:self.max_line_chars] + "…"
 
-    def _truncate_observation(self, content):
+    def _truncate_observation(self, content, kind="工具输出"):
         if content is None:
             return ""
         if len(content) <= self.tool_result_max_chars:
@@ -98,4 +98,4 @@ class DeterministicPruner:
                 parts += ["…〔关键行〕"] + kw
             parts += [f"…〔截断 {len(middle) - len(kw)} 行〕"] + tail
             body = "\n".join(parts)
-        return f"{body}\n〔原始工具输出已截断:{n} 行 / {len(content)} 字符;完整内容见 CASS 原会话〕"
+        return f"{body}\n〔原始{kind}已截断:{n} 行 / {len(content)} 字符;完整内容见 CASS 原会话〕"
