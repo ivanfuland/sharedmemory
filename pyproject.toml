@@ -5,6 +5,7 @@ description = "M0 contract artifacts for the shared-memory layer"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3.4.2,<4",
+    "httpx>=0.28.1",
     "msgpack>=1.0",          # 解 CASS canonical 的 messages.extra_bin(rmp_serde msgpack)
 ]
 

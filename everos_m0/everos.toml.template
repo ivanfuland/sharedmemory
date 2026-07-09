@@ -1,0 +1,46 @@
+# EverOS M0 配置模板 —— 对齐 `everos init --print` 的真实节结构。
+#
+# ⚠️ 实际部署不用这个文件填 secret。EverOS 的配置优先级（源自 init 模板注释）：
+#     1. shipped defaults (lowest)
+#     2. <root>/everos.toml
+#     3. 环境变量 EVEROS_<SECTION>__<KEY>      <-- M0 走这层
+#     4. programmatic init args (highest)
+# env 精度高于本文件，故 M0 用 `EVEROS_*` env 注入，**api_key 绝不落盘**。
+# 本文件的价值 = 记录「哪些字段必须设」及其语义，供 M1 产品化时参考。
+#
+# 生成隔离 root：  everos init --root /tmp/cc-everos-m0/.everos --force
+# 启动：           见 RUNBOOK.md（EVEROS_* env + setsid）
+
+[memorize]
+# "chat"  -> BoundaryDetector      + user_memory only
+# "agent" -> AgentBoundaryDetector + user_memory + agent_memory
+# M0 用 agent（要 agent 分区的 case/skill）。注意 agent 模式**同时**跑 user 侧，
+# 写侧 LLM 约翻倍 —— 见 RUNBOOK「成本」段：user 侧策略可在 <root>/ome.toml
+# 用 [strategies.<name>].enabled = false 关掉（配置面开关，无需 fork）。
+mode = "agent"
+
+[llm]
+# OME 提炼 + AGENTIC 召回。自动化路径 → 必须走 LiteLLM API key，绝不用订阅 OAuth。
+# key 必须是**有限额** virtual key（finite max_budget），preflight 会拒 max_budget=null。
+model    = "deepseek-v4-flash"
+api_key  = "<LITELLM_FINITE_KEY>"    # env: EVEROS_LLM__API_KEY
+base_url = "<LITELLM_BASE_URL>"      # OpenAI 兼容口，带 /v1；env: EVEROS_LLM__BASE_URL
+
+[embedding]
+# 无 shipped default —— model/api_key/base_url 三者必须设。指向本地 Infinity。
+model    = "BAAI/bge-m3"
+api_key  = "EMPTY"                   # SDK 要非空占位
+base_url = "http://127.0.0.1:7997"   # 不带 /v1
+
+[rerank]
+# provider 必须**显式** "vllm"：不设则从 base_url host 推断，未知 host（如
+# 127.0.0.1）回落 "deepinfra"，请求形状就错了。"vllm" -> POST {base_url}/rerank。
+provider = "vllm"
+model    = "BAAI/bge-reranker-v2-m3"
+api_key  = ""                        # 空串！非 "EMPTY" —— 非空会发出伪 Bearer 头
+base_url = "http://127.0.0.1:7997"
+
+[api]
+# EverOS 无内置 auth（见其 SECURITY.md），绝不绑 0.0.0.0。
+host = "127.0.0.1"
+port = 8000

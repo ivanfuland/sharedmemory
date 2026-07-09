@@ -1175,6 +1175,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "httpx" },
     { name = "msgpack" },
 ]
 
@@ -1186,6 +1187,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=3.4.2,<4" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "msgpack", specifier = ">=1.0" },
 ]
 
