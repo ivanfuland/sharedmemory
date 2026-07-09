@@ -33,3 +33,23 @@ def test_render_labels_roles_and_skips_empty():
     t = render.render(META, [Msg(0, "user", "改 bug"), Msg(1, "agent", "好"), Msg(2, "agent", "  ")])
     assert "### User" in t and "### Assistant" in t
     assert t.count("### Assistant") == 1   # 空内容 turn 跳过
+
+
+def test_new_6role_labels_registered_explicitly():
+    # franken 6-role(spec §2):新角色必须有显式标签,不能靠 .get(role, role) fallback 漏出裸角色名
+    for role in ("tool_call", "tool_result", "reasoning", "system"):
+        assert role in render._ROLE_LABEL
+        assert render._ROLE_LABEL[role] != role
+
+
+def test_render_new_roles_not_raw_in_output():
+    msgs = [Msg(0, "tool_call", "[tool: read_file]"), Msg(1, "tool_result", "ok"),
+            Msg(2, "reasoning", "先查日志"), Msg(3, "system", "sys prompt")]
+    t = render.render(META, msgs)
+    assert "### tool_call" not in t
+    assert "### tool_result" not in t
+    assert "### reasoning" not in t
+    assert "### system" not in t
+    assert "### Tool Call" in t
+    assert "### Reasoning" in t
+    assert "### System" in t

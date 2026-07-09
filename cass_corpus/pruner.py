@@ -30,13 +30,18 @@ _DEFAULT_KEYWORDS = r"ERROR|Exception|Traceback|Panic|Fatal|FAIL|WARN|assert"
 
 
 class DeterministicPruner:
-    def __init__(self, *, drop_roles=("developer",), tool_call_roles=("tool",),
-                 observation_roles=("toolResult",), tool_result_max_chars=1500,
+    # franken 6-role 归一化(spec §2/§10-①.5):新角色 user/assistant/tool_call/tool_result/
+    # reasoning/system,legacy 角色保留(过渡期/非目标 agent 数据),但 legacy "tool" 绝不再进
+    # tool_call_roles ——它在 codex 里是"结果"不是"调用",压成一行会丢 95% 内容(P0)。
+    def __init__(self, *, drop_roles=("developer", "system"), tool_call_roles=("tool_call",),
+                 observation_roles=("tool_result", "toolResult", "tool"),
+                 reasoning_roles=("reasoning",), tool_result_max_chars=1500,
                  head_lines=6, tail_lines=6, max_line_chars=500, max_keyword_lines=20,
                  keyword_pattern=_DEFAULT_KEYWORDS):
         self.drop_roles = set(drop_roles)
         self.tool_call_roles = set(tool_call_roles)
         self.observation_roles = set(observation_roles)
+        self.reasoning_roles = set(reasoning_roles)
         self.tool_result_max_chars = tool_result_max_chars
         self.head_lines = head_lines
         self.tail_lines = tail_lines
@@ -53,6 +58,9 @@ class DeterministicPruner:
                 out.append(Msg(m.idx, m.role, self._collapse_tool_call(m.content)))
             elif m.role in self.observation_roles:
                 out.append(Msg(m.idx, m.role, self._truncate_observation(m.content)))
+            elif m.role in self.reasoning_roles:
+                # 保留但有界:模型 thinking 不静默丢,也不放任无限膨胀刷屏(同一套截断规则)
+                out.append(Msg(m.idx, m.role, self._truncate_observation(m.content, kind="推理内容")))
             else:
                 out.append(m)                                     # user/assistant 等忠实保留
         return out
@@ -71,7 +79,7 @@ class DeterministicPruner:
     def _cap(self, line):
         return line if len(line) <= self.max_line_chars else line[:self.max_line_chars] + "…"
 
-    def _truncate_observation(self, content):
+    def _truncate_observation(self, content, kind="工具输出"):
         if content is None:
             return ""
         if len(content) <= self.tool_result_max_chars:
@@ -90,4 +98,4 @@ class DeterministicPruner:
                 parts += ["…〔关键行〕"] + kw
             parts += [f"…〔截断 {len(middle) - len(kw)} 行〕"] + tail
             body = "\n".join(parts)
-        return f"{body}\n〔原始工具输出已截断:{n} 行 / {len(content)} 字符;完整内容见 CASS 原会话〕"
+        return f"{body}\n〔原始{kind}已截断:{n} 行 / {len(content)} 字符;完整内容见 CASS 原会话〕"
