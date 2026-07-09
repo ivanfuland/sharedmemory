@@ -130,26 +130,37 @@ def max_conversation_cursor(db_path):
     return (row["ts"], row["id"]) if row and row["ts"] is not None else None
 
 
+# 只对 6-role 的 tool_result 推导 unpaired。legacy tool/toolResult 全无配对信息,
+# 逐条标记是噪声无信号;render 的 is_res fallback 已负责它们。
+_RESULT_ROLE = "tool_result"
+
+
 def read_messages(db_path, conv_id):
     """读一个会话的全部消息(按 idx 序)→ list[Msg]。
-    有 `extra_bin`/`extra_json` 列时解析 tool_call_id/unpaired(配对标记,给 render 用);
+    有 `extra_bin`/`extra_json` 列时解析 tool_call_id(配对 id,给 render 用);
     一列都没有(老/合成 schema,如既有 incremental/export_conv fixture)→ 降级为无配对信息,不崩(codex plan R0 P0);
-    坏 msgpack / 坏 JSON 同样降级。"""
+    坏 msgpack / 坏 JSON 同样降级。
+
+    `unpaired` 由本函数**推导**,不从 extra 读:`extra.unpaired` 全链路无人写(franken/CASS
+    源码均 0 命中),读它是死代码。reader 一次读完整个会话,手握全部 tool_call 的 id,
+    判"这条结果配不上任何调用"比 franken 逐条 emit 时准。配对按 id 不按顺序(契约 P-原则-3)。"""
     with closing(_connect(db_path)) as db:
         cols = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
         extra_cols = [c for c in _EXTRA_COLS if c in cols]
         rows = db.execute(_msgs_sql(extra_cols), (conv_id,)).fetchall()
-    msgs = []
+
+    parsed = []
     for r in rows:
         d = _extra_dict(r, extra_cols) or {}
-        # 类型收紧(codex 复审 P2)：Msg 契约是 Optional[str] / bool。
-        #   `tool_call_id` 非字符串(bytes/int) → render 会渲染成 `[#b'abc']`，宁可当没有。
-        #   `unpaired` 用 `is True`：`bool("false")` 为真，会打成 [unpaired] 并丢掉真实的 [#id]。
+        # 类型收紧(codex 复审 P2)：Msg 契约是 Optional[str]。
+        # `tool_call_id` 非字符串(bytes/int) → render 会渲染成 `[#b'abc']`，宁可当没有。
         tcid = d.get("tool_call_id")
-        msgs.append(Msg(idx=r["idx"], role=r["role"], content=r["content"] or "",
-                        tool_call_id=tcid if isinstance(tcid, str) and tcid else None,
-                        unpaired=d.get("unpaired") is True))
-    return msgs
+        parsed.append((r, tcid if isinstance(tcid, str) and tcid else None))
+
+    call_ids = {t for r, t in parsed if r["role"] == "tool_call" and t}
+    return [Msg(idx=r["idx"], role=r["role"], content=r["content"] or "", tool_call_id=t,
+                unpaired=(r["role"] == _RESULT_ROLE and (t is None or t not in call_ids)))
+            for r, t in parsed]
 
 
 def get_conversation(db_path, conv_id):
