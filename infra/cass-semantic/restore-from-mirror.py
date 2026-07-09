@@ -31,7 +31,8 @@ What it does
 (c) Write <staging>/.config/cass/sources.toml by rewriting every production
     source `paths` entry: prefix /home/ivan/ -> <staging>/ , preserving
     full_scan=true and all other fields. This is what lets re-ingest scan
-    GongShi (else its codex convs are silently missed).
+    cross-machine `[[sources]]` entries (else their codex convs are silently
+    missed: the default connectors only walk <home>/.claude, .codex, .openclaw).
 (d) Print counters + the RESTORE_LATEST_PER_PATH_OK marker ONLY on full success.
 
 Pure stdlib + blake3 (Python `blake3` package preferred, else `b3sum` binary).
