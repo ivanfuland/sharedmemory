@@ -1,0 +1,77 @@
+{
+  "_comment": "合成 6-role 会话（M0 不依赖真 CASS 语料）。形状照 franken 6-role 契约：role 六种、配对靠 extra_json.tool_call_id、无法关联的标 extra_json.unpaired=true。内容为通用 pytest 调试场景，不含任何真实私有信息。timestamp 为 ms epoch、组内唯一。",
+  "session_id": "m0-synth-0001",
+  "messages": [
+    {
+      "role": "user",
+      "content": "帮我修 pytest 里 test_foo 的失败",
+      "author": "",
+      "extra_json": {},
+      "timestamp": 1751961600000
+    },
+    {
+      "role": "reasoning",
+      "content": "先跑一遍看报错栈，再决定改断言还是改实现",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961600100
+    },
+    {
+      "role": "assistant",
+      "content": "我先跑测试看具体报错。",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961600200
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: bash] pytest tests/test_foo.py -x",
+      "author": "deepseek",
+      "extra_json": {
+        "tool_call_id": "tc1",
+        "tool_name": "bash",
+        "args": "pytest tests/test_foo.py -x"
+      },
+      "timestamp": 1751961600300
+    },
+    {
+      "role": "tool_result",
+      "content": "E   assert 1 == 2\ntests/test_foo.py:12: AssertionError",
+      "author": "",
+      "extra_json": { "tool_call_id": "tc1" },
+      "timestamp": 1751961600400
+    },
+    {
+      "role": "assistant",
+      "content": "断言写反了，把 assert foo() == 1 改成 assert foo() == 2。",
+      "author": "deepseek",
+      "extra_json": {},
+      "timestamp": 1751961600500
+    },
+    {
+      "role": "tool_call",
+      "content": "[Tool: edit] tests/test_foo.py",
+      "author": "deepseek",
+      "extra_json": {
+        "tool_call_id": "tc2",
+        "tool_name": "edit",
+        "args": { "path": "tests/test_foo.py", "old": "== 1", "new": "== 2" }
+      },
+      "timestamp": 1751961600600
+    },
+    {
+      "role": "tool_result",
+      "content": "orphan output with no matching call",
+      "author": "",
+      "extra_json": { "unpaired": true, "tool_name": "bash" },
+      "timestamp": 1751961600700
+    },
+    {
+      "role": "system",
+      "content": "permission-mode: acceptEdits",
+      "author": "",
+      "extra_json": {},
+      "timestamp": 1751961600800
+    }
+  ]
+}
