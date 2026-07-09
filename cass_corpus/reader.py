@@ -4,6 +4,9 @@
 import json
 import sqlite3
 from contextlib import closing
+
+import msgpack
+
 from cass_corpus.pruner import Msg
 
 # 注:CASS 的 user_message_count/assistant_message_count 列普遍未填(NULL),
@@ -26,8 +29,45 @@ ORDER BY c.last_message_created_at {order}
 LIMIT ?
 """
 
-_MSGS_SQL_BASE  = "SELECT idx, role, content FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
-_MSGS_SQL_EXTRA = "SELECT idx, role, content, extra_json FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
+# extra 的存储契约(CASS `src/storage/sqlite.rs::franken_message_insert_payload`):
+#   非空 extra   → rmp_serde msgpack 进 `extra_bin`,`extra_json` = NULL   ← 真实数据的绝大多数
+#   空对象 `{}`  → 字面 "{}" 进 `extra_json`,`extra_bin` = NULL
+#   历史 raw 包装 → 原始 JSON 文本进 `extra_json`,`extra_bin` = NULL
+# 二者互斥。只读 extra_json 会漏掉全部真实配对信息(实测真库 129734 条 tool 类消息里
+# `extra_json LIKE '%tool_call_id%'` 命中 0 条,而解 extra_bin 拿到 126680 条 = 97.6%)。
+_EXTRA_COLS = ("extra_bin", "extra_json")
+
+
+def _msgs_sql(extra_cols):
+    """按库里真实存在的 extra 列拼 SELECT(老/合成 schema 可能一列都没有)。"""
+    sel = "idx, role, content" + "".join(f", {c}" for c in extra_cols)
+    return f"SELECT {sel} FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
+
+
+# 坏数据降级只针对"解码/格式"类异常;MemoryError / RecursionError 这类系统性资源错误
+# 必须 loud fail,不能被降级路径吞掉(codex 复审 P2-#4)。
+_DECODE_ERRORS = (msgpack.exceptions.UnpackException, msgpack.exceptions.ExtraData,
+                  ValueError, TypeError, UnicodeDecodeError)
+
+
+def _extra_dict(row, extra_cols):
+    """取一条消息的 extra dict。extra_bin(msgpack) 优先,回退 extra_json。
+    坏 msgpack / 坏 JSON / 非 dict → None(降级为无配对信息,不崩)。"""
+    if "extra_bin" in extra_cols and row["extra_bin"] is not None:
+        try:
+            d = msgpack.unpackb(row["extra_bin"], raw=False, strict_map_key=False)
+        except _DECODE_ERRORS:
+            d = None
+        if isinstance(d, dict):
+            return d
+    if "extra_json" in extra_cols and row["extra_json"]:
+        try:
+            d = json.loads(row["extra_json"])
+        except (ValueError, TypeError):
+            d = None
+        if isinstance(d, dict):
+            return d
+    return None
 
 # 按 id 精确取一条会话 meta（export_one 单条导出用）。列映射与 _SELECT_SQL 一致；
 # JOIN messages + GROUP BY → 0 消息/不存在会话返回无行（None）。不设 min_turns floor（显著性交 min_chars）。
@@ -92,27 +132,23 @@ def max_conversation_cursor(db_path):
 
 def read_messages(db_path, conv_id):
     """读一个会话的全部消息(按 idx 序)→ list[Msg]。
-    **有 `extra_json` 列时**解析 tool_call_id/unpaired(配对标记,给 render 用);
-    **无该列**(老/合成 schema,如既有 incremental/export_conv fixture)→ 降级为无配对信息,不崩(codex plan R0 P0);
-    坏/空 JSON 同样降级。"""
+    有 `extra_bin`/`extra_json` 列时解析 tool_call_id/unpaired(配对标记,给 render 用);
+    一列都没有(老/合成 schema,如既有 incremental/export_conv fixture)→ 降级为无配对信息,不崩(codex plan R0 P0);
+    坏 msgpack / 坏 JSON 同样降级。"""
     with closing(_connect(db_path)) as db:
-        has_extra = any(r["name"] == "extra_json" for r in db.execute("PRAGMA table_info(messages)"))
-        sql = _MSGS_SQL_EXTRA if has_extra else _MSGS_SQL_BASE
-        rows = db.execute(sql, (conv_id,)).fetchall()
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
+        extra_cols = [c for c in _EXTRA_COLS if c in cols]
+        rows = db.execute(_msgs_sql(extra_cols), (conv_id,)).fetchall()
     msgs = []
     for r in rows:
-        tcid, unpaired = None, False
-        ej = r["extra_json"] if has_extra else None
-        if ej:
-            try:
-                d = json.loads(ej)
-                if isinstance(d, dict):
-                    tcid = d.get("tool_call_id")
-                    unpaired = bool(d.get("unpaired", False))
-            except (ValueError, TypeError):
-                pass                                        # 坏 JSON → 无配对信息,不崩
+        d = _extra_dict(r, extra_cols) or {}
+        # 类型收紧(codex 复审 P2)：Msg 契约是 Optional[str] / bool。
+        #   `tool_call_id` 非字符串(bytes/int) → render 会渲染成 `[#b'abc']`，宁可当没有。
+        #   `unpaired` 用 `is True`：`bool("false")` 为真，会打成 [unpaired] 并丢掉真实的 [#id]。
+        tcid = d.get("tool_call_id")
         msgs.append(Msg(idx=r["idx"], role=r["role"], content=r["content"] or "",
-                        tool_call_id=tcid, unpaired=unpaired))
+                        tool_call_id=tcid if isinstance(tcid, str) and tcid else None,
+                        unpaired=d.get("unpaired") is True))
     return msgs
 
 
