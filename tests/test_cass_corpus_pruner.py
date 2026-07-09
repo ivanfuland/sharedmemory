@@ -47,6 +47,11 @@ def test_clamp_head_visible_error_not_reduplicated_and_mid_rescued():
     assert out.count("ERROR_IN_HEAD") == 1           # head 可见,不重复
     assert "ERROR_REAL_MID_" in out                   # 预算没被 head 那条偷走,中段错误保住
 
+def test_clamp_rescues_later_error_in_giant_line():
+    # codex PR R3 P1:巨型单行第一个 ERROR 在 head 可见,后面 ERROR 落被丢弃区 → 后者仍被抢救
+    content = "ERROR_HEAD_VIS" + "X" * 2000 + "ERROR_MID_DROPPED" + "Y" * 4000
+    assert "ERROR_MID_DROPPED" in _clamp(content, 1500)
+
 def test_clamp_total_conserved_with_giant_error_lines():
     content = "H" * 150 + "\n" + "\n".join(f"ERROR {i} " + "Z" * 10000 for i in range(10)) + "\n" + "T" * 5000
     out = _clamp(content, 1500)

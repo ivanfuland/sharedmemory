@@ -98,18 +98,19 @@ class DeterministicPruner:
         head_end, tail_start = len(head), len(content) - len(tail)
         errs, used, pos = [], 0, 0
         if rescue_errors:
-            for l in content.split("\n"):                            # 扫原文整行(不切片)→ 关键词绝不被劈开
-                line_start = pos; pos += len(l) + 1                  # +1 = split 丢弃的 "\n"
-                m = _HARD_ERR.search(l)
-                if not m: continue
-                kw_start = line_start + m.start(); kw_end = line_start + m.end()
-                if kw_end <= head_end or kw_start >= tail_start:
-                    continue                                          # 关键词已完整可见于 head/tail → 不抢救(无重复、不白占预算,codex PR R2 P1)
-                l = self._cap_line(l, m.start())                      # 关键词落被丢弃区/横跨边界 → 抢救(关键词居中,codex PR R1 P1)
-                cost = len(l) + 1                                     # +1 计入 join 换行(严格守恒,codex PR R0 P2)
-                if len(errs) >= self.max_err_lines: break             # 行数到顶 → 停
-                if used + cost > rescue_budget: continue              # 塞不下 → 跳过找短的
-                errs.append(l); used += cost
+            for l in content.split("\n"):                       # 逐行:短行整条抢救(便宜)、巨型行关键词居中截窗
+                line_start = pos; pos += len(l) + 1             # +1 = split 丢弃的 "\n"
+                rescue_at = None
+                for m in _HARD_ERR.finditer(l):                 # 查该行所有 ERROR(不止第一个,codex PR R3 P1)
+                    if line_start + m.end() <= head_end or line_start + m.start() >= tail_start:
+                        continue                                 # 该关键词完整可见于 head/tail
+                    rescue_at = m.start(); break                 # 第一个落被丢弃区/横跨边界的关键词
+                if rescue_at is None: continue                   # 全部可见 或 无 ERROR → 不抢救(无重复,codex PR R2 P1)
+                seg = self._cap_line(l, rescue_at)               # 短行原样、巨型行关键词居中截窗(codex PR R1 P1)
+                cost = len(seg) + 1                              # +1 计入 join 换行(严格守恒,codex PR R0 P2)
+                if len(errs) >= self.max_err_lines: break
+                if used + cost > rescue_budget: continue         # 塞不下 → 跳过找短的
+                errs.append(seg); used += cost
         cut  = len(content) - len(head) - len(tail)
         parts = [head]
         if errs: parts.append("…〔硬错误行〕\n" + "\n".join(errs))
