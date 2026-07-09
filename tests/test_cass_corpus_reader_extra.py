@@ -233,6 +233,48 @@ def test_legacy_result_roles_not_derived(tmp_path):
     assert msgs[0].unpaired is False and msgs[1].unpaired is False
 
 
+# ── 稳定会话身份:external_id / source_id 列 ──
+
+def _mk_conv_db(path, with_id_cols):
+    """建一个只有 conversations/agents/messages 的最小库。with_id_cols=False 模拟老/合成 schema。"""
+    idcols = ", external_id TEXT, source_id TEXT" if with_id_cols else ""
+    db = sqlite3.connect(path)
+    db.executescript(f"""
+        CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+        CREATE TABLE conversations(id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+            workspace_id INTEGER, source_path TEXT, started_at INTEGER,
+            last_message_created_at INTEGER, primary_model TEXT{idcols});
+        CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER,
+            idx INTEGER, role TEXT, content TEXT, extra_json TEXT, extra_bin BLOB);
+        INSERT INTO agents(id, slug) VALUES(1, 'codex');
+    """)
+    if with_id_cols:
+        db.execute("INSERT INTO conversations(id,agent_id,title,source_path,started_at,"
+                   "last_message_created_at,external_id,source_id) VALUES(1,1,'t','/p',1735660800000,"
+                   "1735660800000,'.codex/sessions/x/rollout-abc','local')")
+    else:
+        db.execute("INSERT INTO conversations(id,agent_id,title,source_path,started_at,"
+                   "last_message_created_at) VALUES(1,1,'t','/p',1735660800000,1735660800000)")
+    db.execute("INSERT INTO messages(conversation_id,idx,role,content) VALUES(1,0,'user','hi')")
+    db.commit(); db.close()
+
+
+def test_reader_meta_carries_stable_id_cols(tmp_path):
+    dbp = str(tmp_path / "withid.db"); _mk_conv_db(dbp, True)
+    m = reader.get_conversation(dbp, 1)
+    assert m["external_id"] == ".codex/sessions/x/rollout-abc" and m["source_id"] == "local"
+    assert reader.select_conversations(dbp, min_turns=1)[0]["external_id"] == ".codex/sessions/x/rollout-abc"
+
+
+def test_reader_tolerates_schema_without_id_cols(tmp_path):
+    """老/合成 schema 缺 external_id/source_id → 不崩,meta 里也不伪造这两个键(codex plan R0 P0)。"""
+    dbp = str(tmp_path / "noid.db"); _mk_conv_db(dbp, False)
+    m = reader.get_conversation(dbp, 1)
+    assert m is not None and "external_id" not in m and "source_id" not in m
+    assert reader.select_conversations(dbp, min_turns=1)[0]["id"] == 1
+
+
 # ── 类型收紧（codex 复审 P2）──
 
 

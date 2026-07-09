@@ -14,7 +14,7 @@ from cass_corpus.pruner import Msg
 # 不按 agent 筛(归一化=统一格式;"值不值得记"交 gbrain 显著性闸逐会话判,agent 仅作 provenance 元数据)。
 _SELECT_SQL = """
 SELECT c.id AS id, a.slug AS agent, c.title AS title, w.path AS workspace,
-       c.source_path AS source_path,
+       c.source_path AS source_path,{idcols}
        COALESCE(c.started_at, c.last_message_created_at) AS started_at,
        c.last_message_created_at AS last_ts,
        COUNT(m.id) AS turns, c.primary_model AS model
@@ -36,6 +36,16 @@ LIMIT ?
 # 二者互斥。只读 extra_json 会漏掉全部真实配对信息(实测真库 129734 条 tool 类消息里
 # `extra_json LIKE '%tool_call_id%'` 命中 0 条,而解 extra_bin 拿到 126680 条 = 97.6%)。
 _EXTRA_COLS = ("extra_bin", "extra_json")
+
+# 稳定会话身份的来源列。老/合成 schema(既有 export_conv / incremental fixture)没有这两列
+# → 探测后不选,render 走 legacy 回退(codex plan R0 P0:不得因缺列崩)。
+_ID_COLS = ("external_id", "source_id")
+
+
+def _idcols_sql(db):
+    have = {r["name"] for r in db.execute("PRAGMA table_info(conversations)")}
+    cols = [c for c in _ID_COLS if c in have]
+    return "".join(f"\n       c.{c} AS {c}," for c in cols)
 
 
 def _msgs_sql(extra_cols):
@@ -73,7 +83,7 @@ def _extra_dict(row, extra_cols):
 # JOIN messages + GROUP BY → 0 消息/不存在会话返回无行（None）。不设 min_turns floor（显著性交 min_chars）。
 _GET_ONE_SQL = """
 SELECT c.id AS id, a.slug AS agent, c.title AS title, w.path AS workspace,
-       c.source_path AS source_path,
+       c.source_path AS source_path,{idcols}
        COALESCE(c.started_at, c.last_message_created_at) AS started_at,
        c.last_message_created_at AS last_ts,
        COUNT(m.id) AS turns, c.primary_model AS model
@@ -114,8 +124,9 @@ def select_conversations(db_path, limit=20, agents=None, min_turns=4, max_turns=
         params.append(max_turns)
     order = "ASC, c.id ASC" if since_cursor is not None else "DESC"
     params.append(limit)
-    sql = _SELECT_SQL.format(where=where, max_clause=max_clause, order=order)
     with closing(_connect(db_path)) as db:
+        sql = _SELECT_SQL.format(where=where, max_clause=max_clause, order=order,
+                                 idcols=_idcols_sql(db))
         rows = db.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
@@ -166,7 +177,7 @@ def read_messages(db_path, conv_id):
 def get_conversation(db_path, conv_id):
     """按 id 精确取一条会话 meta(export_one 单条导出用)。无消息/不存在 → None。"""
     with closing(_connect(db_path)) as db:
-        row = db.execute(_GET_ONE_SQL, (int(conv_id),)).fetchone()
+        row = db.execute(_GET_ONE_SQL.format(idcols=_idcols_sql(db)), (int(conv_id),)).fetchone()
     return dict(row) if row else None
 
 

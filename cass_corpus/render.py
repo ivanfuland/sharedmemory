@@ -4,6 +4,7 @@
 #   - frontmatter / 文件名 必须确定性(同会话内容不变 → content_hash 不变 → gbrain 自动去重)。
 #     绝不放导出时间戳。
 #   - 绝不带 dream_generated / mode:lsd(否则触发 gbrain self-consumption guard 被跳过)。
+import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -28,15 +29,47 @@ def _safe(s):
     return _SLUG_SAFE.sub("-", (s or "").lower()).strip("-") or "x"
 
 
+# 稳定会话身份 = CASS canonical 的唯一约束 UNIQUE(source_id, agent_id, external_id)。
+# ⚠ 绝不能用 conversation_id:它是 SQLite 的 rowid,全量重摄重建库即重新发号
+#   (2026-07-09 6-role 换库实测:2361 个会话里 2290 个变号,71 个纯属巧合没变)。
+#   文件名一变,gbrain 就把同一会话当新文档 → 全量重炼 + 留下孤儿页。
+# ⚠ 也不能只哈希 external_id:唯一约束带 source_id 和 agent。
+_KEY_BYTES = 8          # 64 bit;2424 会话零碰撞,10 万会话碰撞概率 ~3e-10
+# 前缀 's' 保证 key 永不为纯十进制串。裸 16 hex 有 (10/16)^16 ≈ 2.8e-4 概率全是数字
+# (实测真库 2424 条里就有 1 条:`...-3845786846798581.md`),会被下游按 rowid 的
+# `/-(\d+)\.md$/` 误捕(codex PR#41 审出)。
+_KEY_PREFIX = "s"
+
+
+def session_key(meta):
+    """跨重摄稳定的会话摘要(`s` + 16 hex)。无 external_id(老/合成 schema)→ 回退到 rowid 派生,
+    仍确定性但**不稳定**——如实反映"这个库没给出稳定身份",不假装有。"""
+    ext = meta.get("external_id")
+    if ext:
+        raw = f"{meta.get('source_id') or ''}\x00{meta.get('agent') or ''}\x00{ext}"
+    else:
+        raw = f"__legacy_rowid__\x00{meta.get('agent') or ''}\x00{meta['id']}"
+    return _KEY_PREFIX + hashlib.blake2b(raw.encode("utf-8"), digest_size=_KEY_BYTES).hexdigest()
+
+
 def transcript_filename(meta):
-    """确定性文件名:<date>-cass-<agent>-<convid>.md(convid 稳定 → 同会话同名)。"""
-    return f"{_date(meta.get('started_at'))}-cass-{_safe(meta.get('agent'))}-{meta['id']}.md"
+    """确定性且跨重摄稳定的文件名:<date>-cass-<agent>-<session_key>.md。
+    date/agent 只为人眼可读;身份由 session_key 承担。"""
+    return f"{_date(meta.get('started_at'))}-cass-{_safe(meta.get('agent'))}-{session_key(meta)}.md"
 
 
 def _frontmatter(meta):
     title = (meta.get("title") or "").replace("\n", " ").strip()
-    lines = ["---", "source: cass", f"conversation_id: {meta['id']}",
+    # ⚠ 绝不写 conversation_id(rowid):它重摄即变 → frontmatter 变 → content_hash 变 →
+    #   gbrain 仍把同一会话当新内容全量重炼。文件名稳定但正文漂移 = 修了一半等于没修
+    #   (codex PR#41 审出的 P1:实测同一会话 rowid 72→116,文件名不变但渲染 hash 变)。
+    #   要对当前库调试,用 external_id 反查:SELECT id FROM conversations WHERE external_id=?
+    lines = ["---", "source: cass", f"session_key: {session_key(meta)}",
              f"agent: {meta.get('agent', '')}", f"date: {_date(meta.get('started_at'))}"]
+    if meta.get("external_id"):
+        lines.append(f"external_id: {meta['external_id']}")
+    if meta.get("source_id"):
+        lines.append(f"source_id: {meta['source_id']}")
     if meta.get("workspace"):
         lines.append(f"workspace: {meta['workspace']}")
     if title:
