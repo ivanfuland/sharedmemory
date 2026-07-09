@@ -30,3 +30,6 @@ infra/cass-mcp/*.log
 # 喂料水位线运行时状态(含真实 ts,不进 PUBLIC 仓)
 cass-corpus-feed/
 *.watermark.json
+
+# 本机私有 agent 指令(CLAUDE.local.md),永不进本 PUBLIC 仓
+CLAUDE.local.md
