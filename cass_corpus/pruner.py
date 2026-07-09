@@ -40,9 +40,10 @@ _CLAMP = {
 
 
 class DeterministicPruner:
-    MIN_CAP      = 200
-    MAX_ERR_LINE = 300
-    RESCUE_FRAC  = 4
+    MIN_CAP        = 200
+    MAX_ERR_LINE   = 300
+    RESCUE_FRAC    = 4
+    MARKER_RESERVE = 48     # 给指针/标记/join 换行预留额度,保证总输出 ≤ cap(codex PR R1 P2)
 
     def __init__(self, *, tool_call_cap=800, tool_result_cap=1500, reasoning_cap=1000,
                  max_err_lines=10, warn=None):
@@ -81,20 +82,30 @@ class DeterministicPruner:
         if content is None:      return ""
         cap = max(cap, self.MIN_CAP)                 # 下界:cap 过小/0 不退化成整段
         if len(content) <= cap:  return content      # 阈值内 → 原样(忠实)
-        rescue_budget = (cap // self.RESCUE_FRAC) if rescue_errors else 0
-        # 预留 rescue_budget:head/tail 固定占 cap - rescue_budget(不回流、不收缩)。
-        # 抢救只从被丢弃的 mid 扫,mid 与 head/tail 不相交 → 无重复、也无 shrink 夹缝丢错误(codex PR P1)。
-        body = cap - rescue_budget
+        avail = cap - self.MARKER_RESERVE            # 预留 marker 额度 → 总输出 ≤ cap(codex PR R1 P2)
+        rescue_budget = (avail // self.RESCUE_FRAC) if rescue_errors else 0
+        # 预留 rescue_budget:head/tail 固定占 avail - rescue_budget(不回流、不收缩)。
+        # 抢救只从被丢弃的 mid 扫(与 head/tail 不相交)→ 无重复、无 shrink 夹缝丢错误(codex PR R0 P1)。
+        body = avail - rescue_budget
         head = content[: body * 2 // 3]
         tail = content[-(body - len(head)):] if body - len(head) > 0 else ""
-        mid  = content[len(head): len(content) - len(tail)]
-        errs, used = [], 0
+        # 行边界 snap:head 缩到最后一个换行、tail 扩到最前一个换行,避免把一行(及其 ERROR 关键词)从中劈开(codex PR R1 P1)
+        nl = head.rfind("\n")
+        if nl != -1: head = head[:nl + 1]
+        if tail:
+            nl = tail.find("\n")
+            if nl != -1: tail = tail[nl:]
+        head_end, tail_start = len(head), len(content) - len(tail)
+        errs, used, pos = [], 0, 0
         if rescue_errors:
-            for l in mid.splitlines():
+            for l in content.split("\n"):                            # 扫原文整行(不切片)→ 关键词/整行绝不被劈开(codex PR R1 P1)
+                start, end = pos, pos + len(l); pos = end + 1
+                if end <= head_end or start >= tail_start:
+                    continue                                          # 整行已在 head/tail 里(不重复、不丢)
                 m = _HARD_ERR.search(l)
                 if not m: continue
                 l = self._cap_line(l, m.start())                      # 以关键词位置截窗
-                cost = len(l) + 1                                     # +1 计入 join 换行(严格守恒,codex PR P2)
+                cost = len(l) + 1                                     # +1 计入 join 换行(严格守恒,codex PR R0 P2)
                 if len(errs) >= self.max_err_lines: break             # 行数到顶 → 停
                 if used + cost > rescue_budget: continue              # 塞不下 → 跳过找短的
                 errs.append(l); used += cost

@@ -28,6 +28,17 @@ def test_clamp_no_hard_error_lost_at_head_boundary():
     out = _clamp(content, 1500)
     assert "ERROR_HEAD_BOUNDARY_MARK" in out              # 不丢(旧 shrink 版会丢)
 
+def test_clamp_total_output_within_cap():
+    # 总输出(含指针/标记/换行)≤ cap —— marker 已预留(codex PR R1 P2)
+    content = "ERROR line here\n" * 100 + "x" * 5000
+    for cap in (200, 800, 1500, 4000):
+        assert len(_clamp(content, cap)) <= cap
+
+def test_clamp_no_error_lost_at_char_boundary():
+    # codex PR R1 P1:ERROR 关键词横跨 head 字符边界(无换行护栏)时,扫原文整行保证被抢救、不丢
+    content = "A" * 720 + "ERROR_CHAR_BOUNDARY_MARK tail\n" + "B" * 5000
+    assert "ERROR_CHAR_BOUNDARY_MARK" in _clamp(content, 1500)
+
 def test_clamp_total_conserved_with_giant_error_lines():
     content = "H" * 150 + "\n" + "\n".join(f"ERROR {i} " + "Z" * 10000 for i in range(10)) + "\n" + "T" * 5000
     out = _clamp(content, 1500)
