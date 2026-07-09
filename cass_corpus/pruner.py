@@ -16,8 +16,8 @@ class Msg:
     idx: int
     role: str
     content: str
-    tool_call_id: Optional[str] = None   # 配对标记(reader 从 extra_json 读)
-    unpaired: bool = False               # tool_result 无关联 call(契约 extra_json.unpaired)
+    tool_call_id: Optional[str] = None   # 配对 id(reader 从 extra_bin msgpack 读,回退 extra_json)
+    unpaired: bool = False               # tool_result 配不上本会话任何 call(reader 推导,非 extra 字段)
 
 
 class Pruner(Protocol):
