@@ -44,13 +44,19 @@ def _msgs_sql(extra_cols):
     return f"SELECT {sel} FROM messages WHERE conversation_id = ? ORDER BY idx ASC"
 
 
+# 坏数据降级只针对"解码/格式"类异常;MemoryError / RecursionError 这类系统性资源错误
+# 必须 loud fail,不能被降级路径吞掉(codex 复审 P2-#4)。
+_DECODE_ERRORS = (msgpack.exceptions.UnpackException, msgpack.exceptions.ExtraData,
+                  ValueError, TypeError, UnicodeDecodeError)
+
+
 def _extra_dict(row, extra_cols):
     """取一条消息的 extra dict。extra_bin(msgpack) 优先,回退 extra_json。
     坏 msgpack / 坏 JSON / 非 dict → None(降级为无配对信息,不崩)。"""
     if "extra_bin" in extra_cols and row["extra_bin"] is not None:
         try:
             d = msgpack.unpackb(row["extra_bin"], raw=False, strict_map_key=False)
-        except Exception:                                    # noqa: BLE001 — 坏 msgpack 降级,不崩
+        except _DECODE_ERRORS:
             d = None
         if isinstance(d, dict):
             return d
@@ -136,8 +142,13 @@ def read_messages(db_path, conv_id):
     msgs = []
     for r in rows:
         d = _extra_dict(r, extra_cols) or {}
+        # 类型收紧(codex 复审 P2)：Msg 契约是 Optional[str] / bool。
+        #   `tool_call_id` 非字符串(bytes/int) → render 会渲染成 `[#b'abc']`，宁可当没有。
+        #   `unpaired` 用 `is True`：`bool("false")` 为真，会打成 [unpaired] 并丢掉真实的 [#id]。
+        tcid = d.get("tool_call_id")
         msgs.append(Msg(idx=r["idx"], role=r["role"], content=r["content"] or "",
-                        tool_call_id=d.get("tool_call_id"), unpaired=bool(d.get("unpaired", False))))
+                        tool_call_id=tcid if isinstance(tcid, str) and tcid else None,
+                        unpaired=d.get("unpaired") is True))
     return msgs
 
 

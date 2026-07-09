@@ -148,3 +148,48 @@ def test_reader_with_only_extra_bin_column(tmp_path):
                " VALUES(1,0,'tool_call','x',?)", (_bin({"tool_call_id": "c8"}),))
     db.commit(); db.close()
     assert reader.read_messages(dbp, 1)[0].tool_call_id == "c8"
+
+
+# ── 类型收紧（codex 复审 P2）──
+
+def test_unpaired_truthy_string_is_not_true(tmp_path):
+    """`bool("false")` 为真 → 会打成 [unpaired] 并丢掉真实的 [#c1]。只接受布尔真值。"""
+    dbp = str(tmp_path / "unp.db")
+    _mk_db(dbp, [(0, "tool_result", "x", None, _bin({"unpaired": "false", "tool_call_id": "c1"}))])
+    m = reader.read_messages(dbp, 1)[0]
+    assert m.unpaired is False and m.tool_call_id == "c1"
+
+
+def test_unpaired_true_bool_still_works(tmp_path):
+    dbp = str(tmp_path / "unp2.db")
+    _mk_db(dbp, [(0, "tool_result", "x", None, _bin({"unpaired": True}))])
+    assert reader.read_messages(dbp, 1)[0].unpaired is True
+
+
+def test_non_string_tool_call_id_is_dropped(tmp_path):
+    """bytes / int 的 id 会被 render 渲染成 `[#b'abc']`；契约是 Optional[str]，宁可当没有。"""
+    dbp = str(tmp_path / "tid.db")
+    _mk_db(dbp, [
+        (0, "tool_call",   "x", None, _bin({"tool_call_id": b"abc"})),
+        (1, "tool_call",   "y", None, _bin({"tool_call_id": 123})),
+        (2, "tool_call",   "z", None, _bin({"tool_call_id": ""})),
+        (3, "tool_call",   "w", None, _bin({"tool_call_id": "ok"})),
+    ])
+    msgs = reader.read_messages(dbp, 1)
+    assert msgs[0].tool_call_id is None
+    assert msgs[1].tool_call_id is None
+    assert msgs[2].tool_call_id is None
+    assert msgs[3].tool_call_id == "ok"
+
+
+def test_memory_error_is_not_swallowed(tmp_path, monkeypatch):
+    """系统性资源错误必须 loud fail，不能被"坏数据降级"路径吞掉。"""
+    import pytest
+    dbp = str(tmp_path / "mem.db")
+    _mk_db(dbp, [(0, "tool_call", "x", None, _bin({"tool_call_id": "c1"}))])
+
+    def boom(*a, **k):
+        raise MemoryError("simulated")
+    monkeypatch.setattr(reader.msgpack, "unpackb", boom)
+    with pytest.raises(MemoryError):
+        reader.read_messages(dbp, 1)
