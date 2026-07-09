@@ -16,8 +16,17 @@ def test_clamp_none_and_empty():
 
 def test_clamp_total_conserved_no_error():
     out = _clamp("X" * 5000, 1500)
-    assert 1500 <= len(out) <= 1500 + 60                 # 内容恰 cap + 指针,不 1125 不 16×
+    assert len(out) <= 1500                               # 守恒:绝不超 cap(reserve-upfront)
+    assert 1000 <= len(out)                                # head/tail 用满预留正文(~3/4 cap),非退化
     assert "截断" in out and "CASS" in out
+
+def test_clamp_no_hard_error_lost_at_head_boundary():
+    # codex PR P1:head 边界附近(位置 850)的硬错误不因抢救/收缩被静默丢
+    content = ("A" * 850 + "ERROR_HEAD_BOUNDARY_MARK\n"
+               + "B" * 300 + "ERROR_MID_LONG_" + "M" * 287 + "\n"
+               + "C" * 3000)
+    out = _clamp(content, 1500)
+    assert "ERROR_HEAD_BOUNDARY_MARK" in out              # 不丢(旧 shrink 版会丢)
 
 def test_clamp_total_conserved_with_giant_error_lines():
     content = "H" * 150 + "\n" + "\n".join(f"ERROR {i} " + "Z" * 10000 for i in range(10)) + "\n" + "T" * 5000

@@ -82,24 +82,22 @@ class DeterministicPruner:
         cap = max(cap, self.MIN_CAP)                 # 下界:cap 过小/0 不退化成整段
         if len(content) <= cap:  return content      # 阈值内 → 原样(忠实)
         rescue_budget = (cap // self.RESCUE_FRAC) if rescue_errors else 0
-        # 第一遍:head/tail 按 full cap 划,从中段抢救硬错误行(≤ rescue_budget)
-        head = content[: cap * 2 // 3]
-        tail = content[-(cap - len(head)):]
+        # 预留 rescue_budget:head/tail 固定占 cap - rescue_budget(不回流、不收缩)。
+        # 抢救只从被丢弃的 mid 扫,mid 与 head/tail 不相交 → 无重复、也无 shrink 夹缝丢错误(codex PR P1)。
+        body = cap - rescue_budget
+        head = content[: body * 2 // 3]
+        tail = content[-(body - len(head)):] if body - len(head) > 0 else ""
         mid  = content[len(head): len(content) - len(tail)]
         errs, used = [], 0
         if rescue_errors:
             for l in mid.splitlines():
                 m = _HARD_ERR.search(l)
                 if not m: continue
-                l = self._cap_line(l, m.start())                      # 以关键词位置截窗(plan R2 P2)
-                if len(errs) >= self.max_err_lines: break              # 行数到顶 → 停
-                if used + len(l) > rescue_budget: continue             # 太大塞不下 → 跳过找短的(codex plan R0 P1)
-                errs.append(l); used += len(l)
-        # 第二遍:有抢救则 head/tail 收缩 used(变小=子集,rescued 行仍在更大 mid 里、绝不重复;codex R3 回流 + plan R1 P2 去重)→ 总量 = cap
-        if used:
-            body = cap - used
-            head = content[: body * 2 // 3]
-            tail = content[-(body - len(head)):] if body - len(head) > 0 else ""
+                l = self._cap_line(l, m.start())                      # 以关键词位置截窗
+                cost = len(l) + 1                                     # +1 计入 join 换行(严格守恒,codex PR P2)
+                if len(errs) >= self.max_err_lines: break             # 行数到顶 → 停
+                if used + cost > rescue_budget: continue              # 塞不下 → 跳过找短的
+                errs.append(l); used += cost
         cut  = len(content) - len(head) - len(tail)
         parts = [head]
         if errs: parts.append("…〔硬错误行〕\n" + "\n".join(errs))
