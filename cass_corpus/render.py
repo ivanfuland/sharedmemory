@@ -11,7 +11,7 @@ _TZ = timezone(timedelta(hours=8))   # GMT+8:Ivan "哪天聊的" 语义,确定�
 _ROLE_LABEL = {"user": "User", "agent": "Assistant", "assistant": "Assistant",
                "tool_call": "Tool Call", "tool_result": "Tool Result",
                "toolResult": "Tool Result", "tool": "Tool Result",
-               "reasoning": "Reasoning"}
+               "reasoning": "Reasoning", "system": "System"}
 _SLUG_SAFE = re.compile(r"[^a-z0-9]+")
 
 

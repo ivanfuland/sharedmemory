@@ -138,6 +138,12 @@ def test_legacy_tool_clamped_not_collapsed():
     out = DeterministicPruner(tool_result_cap=300).prune([Msg(0, "tool", body)])
     assert "[tool call]" not in out[0].content and "截断" in out[0].content
 
+def test_legacy_toolresult_clamped_not_collapsed():
+    # legacy role=toolResult 与 tool 同route(tool_result_cap):截断保留,绝不 collapse
+    body = "Chunk ID: abc\nProcess exited 0\nOutput:\n" + "\n".join(f"src line {i}" for i in range(500))
+    out = DeterministicPruner(tool_result_cap=300).prune([Msg(0, "toolResult", body)])
+    assert "[tool call]" not in out[0].content and "截断" in out[0].content
+
 def test_legacy_developer_and_events_dropped():
     msgs = [Msg(0, "developer", "20000字系统注入"), Msg(1, "error", "x"), Msg(2, "info", "y"), Msg(3, "user", "hi")]
     assert [m.role for m in DeterministicPruner().prune(msgs)] == ["user"]

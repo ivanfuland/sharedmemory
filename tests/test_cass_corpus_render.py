@@ -38,6 +38,13 @@ def test_render_labels_roles_and_skips_empty():
 _META = {"id": 7, "agent": "codex", "started_at": 1_700_000_000_000, "title": "t"}
 
 
+def test_new_6role_labels_registered_explicitly():
+    # franken 6-role(spec §2):新角色必须有显式标签,不能靠 .get(role, role) fallback 漏出裸角色名。
+    # system 被 pruner drop、够不着 render,标签仍要在(防御:route 变更时不漏裸角色名)。
+    for role in ("tool_call", "tool_result", "reasoning", "system"):
+        assert role in render._ROLE_LABEL
+        assert render._ROLE_LABEL[role] != role
+
 def test_render_new_role_labels():
     out = render.render(_META, [
         Msg(0, "user", "问题"),
