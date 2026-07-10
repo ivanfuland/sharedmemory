@@ -54,7 +54,10 @@ RETENTION_RESET="${CASS_BACKUP_RETENTION_RESET:-}"
 RETENTION_RESET_REASON="${CASS_BACKUP_RETENTION_RESET_REASON:-}"
 
 ALERT_FLAG=0        # step 4 的 RECOVERABLE 救援会置 1；即使备份本身成功也要 exit 非零（DEV-6）
-TRAP_INCOMPLETE=""   # 占位，Task 10 起指向 .incomplete-$STAMP，供 trap 在异常路径改名/清理
+TRAP_INCOMPLETE=""   # step 10 起指向 $DEST/.incomplete-$STAMP；非空时 EXIT trap 会 rm -rf
+                      # 它——覆盖「没走 fail_incomplete 就意外退出」的路径（SIGTERM/未预料
+                      # 的 set -e 击杀）。fail_incomplete 改名前、以及临时成功出口前都必须
+                      # 先清空它，否则刚保下来的东西会被这里删掉（spec §6.6 实现注意）。
 STG=""               # step 2 通过后赋值为本轮 staging 工作目录
 
 cleanup() {
@@ -62,6 +65,9 @@ cleanup() {
   # 故只管清理，不需要手动保存/恢复退出码。
   if [ -n "$STG" ]; then
     rm -rf "$STG" 2>/dev/null || true
+  fi
+  if [ -n "$TRAP_INCOMPLETE" ]; then
+    rm -rf "$TRAP_INCOMPLETE" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -227,12 +233,146 @@ elif [ "$GATE_RC" -ne 0 ]; then
   exit 1
 fi
 
-# === STEP 10+ (Task 10/11/12/13) ===
-# 后续 task 在此扩展 step 10 起的 .incomplete 落盘 / O_DIRECT 读回 / blobs+manifests 双门 /
-# sessions 通道 / digest.json / COMPLETE 发布 / keep-N 轮转 / 周校验。
+# === STEP 10+ (Task 10 实现到 14b；sessions 通道 / digest.json / COMPLETE 发布 /
+#     keep-N 轮转 / 周校验是 Task 11-13 待办) ===
+
+# ---------------------------------------------------------------------------
+# step 10 — .incomplete-$STAMP 落盘：db / db.sha256 / census.tsv / manifests/ /
+# manifests.sha256sum（spec §6 step 10）。digest.json 此时还不能写——它要含
+# sessions_tsv_sha256，而 sessions.tsv 到 step 13e 才生成（Task 11+）。
+#
+# 从此刻起半成品对 EXIT trap 可见（TRAP_INCOMPLETE，见上方 cleanup()）：任何没
+# 走 fail_incomplete 就退出的路径（SIGTERM/未预料的 set -e 击杀）都会被自动
+# rm -rf，不留一个既未校验、也未改名求助的半成品在 NAS 上。
+# ---------------------------------------------------------------------------
+INCOMPLETE_DIR="$DEST/.incomplete-$STAMP"
+
+fail_incomplete() {
+  # spec §6.6 实现注意：改名成 INCOMPLETE-* 之后必须先清空 trap 记录的路径，否则
+  # EXIT trap 会把刚保下来的东西删掉。**先清空**（mv -T 之前）而不是之后——这样
+  # 即使 mv -T 本身失败（源目录未被移动），trap 也不会趁乱把它删掉，两种结局
+  # （改名成功 / mv 失败原地留守）都保住取证现场。
+  local reason="$1"
+  TRAP_INCOMPLETE=""
+  mv -T "$INCOMPLETE_DIR" "$DEST/INCOMPLETE-$STAMP"
+  echo "[backup] FATAL: $reason"
+  exit 1
+}
+
+mkdir "$INCOMPLETE_DIR"
+TRAP_INCOMPLETE="$INCOMPLETE_DIR"
+
+cp -a "$STG/db" "$INCOMPLETE_DIR/db"
+(cd "$STG" && sha256sum db > db.sha256) 8>&-
+LOCAL_SHA="$(cut -d' ' -f1 <"$STG/db.sha256")"
+cp -a "$STG/db.sha256" "$INCOMPLETE_DIR/db.sha256"
+cp -a "$STG/census.tsv" "$INCOMPLETE_DIR/census.tsv"
+cp -a "$STG/manifests" "$INCOMPLETE_DIR/manifests"
+# 相对路径形态（cd 进 STG 再算）——落 NAS 后必须能在 .incomplete-$STAMP/ 内直接
+# `sha256sum -c manifests.sha256sum` 校验（R3-P2：manifests 走 cp -a 而非 rsync -a，
+# 因为 quick-check 只看 size+mtime，同 size 同 mtime 不同内容会被跳过）。
+(cd "$STG" && sha256sum manifests/*.json > manifests.sha256sum) 8>&-
+cp -a "$STG/manifests.sha256sum" "$INCOMPLETE_DIR/manifests.sha256sum"
+
+# DEV-7 测试专用故障注入（枚举写死，默认无操作；cron 白名单传不进 CASS_BACKUP_FAULT，
+# 见 plan 偏离登记 DEV-7）。两个注入点都作用于 NAS 侧刚落地的 .incomplete 副本，模拟
+# 「A（staging）与 B（NAS）不一致」——step 11 的 O_DIRECT 读回必须抓住它们。
+case "$FAULT" in
+  flip-nas-db)
+    printf '\xFF' | dd of="$INCOMPLETE_DIR/db" bs=1 count=1 seek=0 conv=notrunc status=none 8>&-
+    ;;
+  unlink-nas-db-before-readback)
+    rm -f "$INCOMPLETE_DIR/db"
+    ;;
+  *)
+    : # 无操作——生产默认（空值）与尚未消费的未来枚举值（Task 12/13 复用并扩充）
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# step 11 — O_DIRECT 读回校验（spec §6.4）：五腿门通过的是 staging 上的 A，落 NAS
+# 的是另一份拷贝 B，必须证明 A ≡ B。脚本全局 set -euo pipefail：dd 失败会让 shell
+# 在 RC 捕获之前直接退出，fail_incomplete 变成死代码——必须临时关闭再恢复
+# （codex R2-P0）。`dd | sha256sum` 的 `$?` 是 sha256sum 的（dd 读失败仍会吐出
+# 空输入的哈希），必须 `RC=("${PIPESTATUS[@]}")` 紧跟管道一次性整数组捕获；禁止
+# 用 `管道 || true` 抑制 -e——`|| true` 分支执行后 PIPESTATUS 会被 true 覆盖成
+# 单元素数组。
+# ---------------------------------------------------------------------------
+set +e +o pipefail
+dd if="$INCOMPLETE_DIR/db" bs=1M iflag=direct status=none 8>&- | sha256sum 8>&- > "$STG/r.h"
+RC=("${PIPESTATUS[@]}")
+set -e -o pipefail
+[ "${RC[0]}" -eq 0 ] && [ "${RC[1]}" -eq 0 ] || fail_incomplete "O_DIRECT readback failed (dd rc=${RC[0]}, sha256sum rc=${RC[1]})"
+[ "$(cut -d' ' -f1 <"$STG/r.h")" = "$LOCAL_SHA" ] || fail_incomplete "db readback mismatch (staging A != NAS B)"
+
+# ---------------------------------------------------------------------------
+# step 12 — blobs 池：共享目录，只增不改。`--ignore-existing` 只准用于 blobs/
+# （spec §11 硬约束——用在 manifests/ 会冻结 db_links，用在 sessions/ 会永久截断
+# 半截会话）。`raw-mirror/v1/tmp/` 排除出备份。
+# ---------------------------------------------------------------------------
+mkdir -p "$DEST/raw-mirror/v1/blobs"
+rsync -a --ignore-existing --exclude='v1/tmp/' --stats \
+    "$CASS_DATA_DIR/raw-mirror/v1/blobs/" "$DEST/raw-mirror/v1/blobs/" 8>&- > "$STG/blobs.stats" \
+  || fail_incomplete "blobs rsync failed"
+# 供 V11 断言复用：STG 在脚本退出时被 cleanup() 清掉，测试拿不到 $STG/blobs.stats，
+# 故把关键行 echo 到 stdout。
+BLOBS_TRANSFERRED="$(sed -n 's/^Number of regular files transferred: \([0-9,]*\).*/\1/p' "$STG/blobs.stats")"
+echo "[backup] blobs rsync: transferred ${BLOBS_TRANSFERRED:-?} files"
+
+# ---------------------------------------------------------------------------
+# step 14a — manifest 快照完整性门（spec §6 step 14a）：对 .incomplete-$STAMP/
+# manifests/ 的每个文件读前 fadvise(DONTNEED) 后核对 manifests.sha256sum。裸
+# `sha256sum -c` 不带 fadvise，绕不过「刚写完立刻读，读到的是本地页缓存」这一类
+# 问题（同 §6.4 db 读回的机理）——故用 cass_common.sha256_file(fadvise=True) 逐文件
+# 核对，而不是直接 shell 出 `sha256sum -c`。任一不符 → fail_incomplete。
+#
+# **不能只靠 14b**：把某个 manifest 整体换成另一份真实自洽的 manifest，14b 的四项
+# （形状/basename/存在/st_size/内容 hash）全过（因为它校验的是替换后那份 manifest
+# 自己的 blob）——只有这里的 manifests.sha256sum 能抓出「内容被整体调包」。
+# ---------------------------------------------------------------------------
+if ! LIB="$LIB" MANIFESTS_DIR="$INCOMPLETE_DIR/manifests" SHA256SUM_FILE="$INCOMPLETE_DIR/manifests.sha256sum" \
+    "$VENV_PY" 8>&- - <<'PYEOF'
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["LIB"])
+import cass_manifest_census  # noqa: E402
+
+ok, problems = cass_manifest_census.verify_manifests_sha256sum(
+    pathlib.Path(os.environ["MANIFESTS_DIR"]), pathlib.Path(os.environ["SHA256SUM_FILE"])
+)
+if not ok:
+    for p in problems:
+        print(f"[step14a] {p}", file=sys.stderr)
+    sys.exit(1)
+print("[step14a] manifests.sha256sum verified")
+sys.exit(0)
+PYEOF
+then
+  fail_incomplete "step 14a manifest snapshot integrity gate (manifests.sha256sum) failed"
+fi
+
+# ---------------------------------------------------------------------------
+# step 14b — 发布前闭合检查（spec §6 step 14b）：遍历 manifests，`blob_relative_path`
+# 形状 + basename/目录一致性 + NAS 池文件存在 + st_size + fadvise 重算 BLAKE3。
+# 路径永远只由 blob_blake3 推导（cass_manifest_census.py 的 blob_path_for），
+# blob_relative_path 只做形状/一致性校验，绝不参与文件系统操作（V13d）。
+# ---------------------------------------------------------------------------
+"$VENV_PY" "$LIB/cass_manifest_census.py" --publish-check \
+    --manifests-dir "$INCOMPLETE_DIR/manifests" --blobs-root "$DEST/raw-mirror/v1/blobs" 8>&- \
+  || fail_incomplete "step 14b publish-check (manifest/blob pool closure) failed"
+
+# ---------------------------------------------------------------------------
+# 临时出口（Task 11-13 落地前）：sessions 通道 / digest.json / COMPLETE 发布 /
+# keep-N 轮转 / 周校验尚未实现，`.incomplete-$STAMP/` 有意留在 DEST 上（供后续
+# task 与测试检视本 task 的产出）——故必须先清空 TRAP_INCOMPLETE，否则 EXIT trap
+# 会把这次成功跑出来的东西当半成品删掉（同 fail_incomplete 的清空时机原则）。
+# ---------------------------------------------------------------------------
+TRAP_INCOMPLETE=""
 if [ "$ALERT_FLAG" = 1 ]; then
   echo "[backup] gate passed but a stale RECOVERABLE-* alert was raised above — exiting non-zero (DEV-6)"
   exit 1
 fi
-echo "[backup] gate passed (steps 10+ not yet implemented)"
+echo "[backup] step 12/14 done (13/14c/15 not yet implemented)"
 exit 0
