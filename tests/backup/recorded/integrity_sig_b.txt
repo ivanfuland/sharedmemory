@@ -1,0 +1,17 @@
+Error: stepping, database disk image is malformed (11)
+*** in database main ***
+Page 585330: never used
+Page 585331: never used
+Page 585332: never used
+Page 585333: never used
+Page 585347: never used
+Page 585494: never used
+Page 585495: never used
+Page 585496: never used
+Page 586225: never used
+Page 586226: never used
+Page 586227: never used
+Page 586228: never used
+Command exited with non-zero status 11
+
+elapsed=0.26 s
