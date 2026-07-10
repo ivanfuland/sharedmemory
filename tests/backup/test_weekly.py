@@ -53,7 +53,6 @@ import cass_weekly
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 VENV_PY = REPO / ".venv" / "bin" / "python"
 WEEKLY_SCRIPT = REPO / "infra" / "backup" / "cass" / "cass_weekly.py"
-BACKUP_SCRIPT = REPO / "infra" / "backup" / "backup-cass.sh"
 
 requires_cass = pytest.mark.skipif(
     shutil.which("cass") is None, reason="需要真 cass 二进制构建 synth_dd"
