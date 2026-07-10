@@ -202,10 +202,16 @@ GATE_ARGS=(
 if [ -n "$REBASELINE" ]; then
   GATE_ARGS+=(--rebaseline "$REBASELINE" --rebaseline-reason "$REBASELINE_REASON")
 fi
-DB_GATE_FAIL=0
-"$VENV_PY" "$LIB/cass_backup_gate.py" "${GATE_ARGS[@]}" 8>&- || DB_GATE_FAIL=1
+# gate 的 exit 语义三分，必须按精确 rc 分流（不能 `|| FAIL=1` 一锅端）：
+#   0 = PASS → 继续
+#   1 = 数据 FAIL → census/gate.json 已落盘（CLI 契约：产物无论 PASS/FAIL 都写），走 SUSPECT 取证
+#   2 = 用法/环境错（如 rebaseline 目标非法）→ 此时产物根本没写；若误并进 SUSPECT 路径，
+#       cp 不存在的文件会被 set -e 中途击杀 → NAS 留半拉 SUSPECT-*/db 孤儿 + FATAL 消息
+#       没打出来 + 真实 stderr 被埋。环境错没有取证价值——不落 SUSPECT，直接 FATAL。
+GATE_RC=0
+"$VENV_PY" "$LIB/cass_backup_gate.py" "${GATE_ARGS[@]}" 8>&- || GATE_RC=$?
 
-if [ "$DB_GATE_FAIL" = 1 ]; then
+if [ "$GATE_RC" -eq 1 ]; then
   SUSPECT_DIR="$DEST/SUSPECT-$STAMP"
   mkdir "$SUSPECT_DIR"
   cp -a "$STG/db" "$SUSPECT_DIR/db"
@@ -215,6 +221,9 @@ if [ "$DB_GATE_FAIL" = 1 ]; then
   # sidecar 判断这是迁移还是事故，spec §5.7 原文）是 Task 13 的升级点；本 task 先落
   # db + census.tsv + gate.json（进度 ledger 已记「Task 13 待办注入」）。无 COMPLETE 不入链。
   echo "[backup] FATAL: five-leg gate failed — forensics landed at $SUSPECT_DIR"
+  exit 1
+elif [ "$GATE_RC" -ne 0 ]; then
+  echo "[backup] FATAL: gate usage/env error (rc=$GATE_RC) — see stderr above; no SUSPECT written"
   exit 1
 fi
 

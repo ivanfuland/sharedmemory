@@ -568,3 +568,109 @@ def test_blake3_preflight_fails_before_doctor_invoked(tmp_home, run_backup, tmp_
     assert not (tmp_home / ".cass-was-invoked").exists(), (
         "blake3 preflight 必须在 doctor 被调用之前拦截"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review 修复回归：gate exit 2（用法/环境错）≠ exit 1（数据 FAIL）——绝不落 SUSPECT
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_gate_exit2_env_error_no_suspect_orphan(tmp_home, run_backup, synth_dd, cass_stub, tmp_path):
+    """rebaseline 目标非法 → gate exit 2（此时 census/gate.json 根本没写）。修复前
+    脚本把 2 并进 DB_GATE_FAIL：SUSPECT 块 `cp` 不存在的文件被 set -e 中途击杀 →
+    NAS 留半拉 `SUSPECT-*/db` 孤儿 + FATAL 消息没打出来。修后：exit 非零、输出指认
+    usage/env 错 + gate 自己的 rebaseline stderr 可见、DEST 零 SUSPECT（无孤儿）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _write_verified_doctor_stub(tmp_home, synth_dd / "raw-mirror" / "v1" / "manifests")
+
+    rc, out, _dest = run_backup(
+        env={
+            "CASS_DATA_DIR": str(synth_dd),
+            "CASS_BACKUP_DEST": str(dest),
+            "CASS_BACKUP_STAGING": str(tmp_path / "staging"),
+            "CASS_BACKUP_REBASELINE": "cass-genuinely-does-not-exist",
+            "CASS_BACKUP_REBASELINE_REASON": "exit-2 regression test",
+            "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+    )
+
+    assert rc != 0, out
+    assert "gate usage/env error (rc=2)" in out, out
+    assert "rebaseline" in out, f"gate 自己的 stderr（环境错根因）必须可见，不能被埋: {out}"
+    assert not list(dest.glob("SUSPECT-*")), (
+        f"exit 2 环境错绝不落 SUSPECT（含半拉孤儿）: {list(dest.iterdir())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review 覆盖缺口：step 4 陈旧 .incomplete-* 的两条分支（DEV-6 RECOVERABLE / 直接 rm）
+# ---------------------------------------------------------------------------
+
+
+def _make_stale_incomplete(dest: pathlib.Path, name: str, with_complete: bool) -> pathlib.Path:
+    """预造 mtime 2 天前的 `.incomplete-<name>/`，内含载荷文件（可选顶层 COMPLETE）。"""
+    stale = dest / f".incomplete-{name}"
+    stale.mkdir(parents=True)
+    (stale / "db").write_bytes(b"precious payload bytes")
+    if with_complete:
+        (stale / "COMPLETE").touch()
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(stale, (two_days_ago, two_days_ago))
+    return stale
+
+
+@requires_cass
+def test_stale_incomplete_with_complete_becomes_recoverable_and_alerts(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """DEV-6：含顶层 COMPLETE 的陈旧 `.incomplete-*` → `mv -T` 成 `RECOVERABLE-<同名尾巴>`
+    （内容原封不动），当晚备份照常继续走到临时成功出口，但最终 exit 非零（ALERT_FLAG，
+    告警不丢）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    stale = _make_stale_incomplete(dest, "old", with_complete=True)
+    _write_verified_doctor_stub(tmp_home, synth_dd / "raw-mirror" / "v1" / "manifests")
+
+    rc, out, _dest = run_backup(
+        env={
+            "CASS_DATA_DIR": str(synth_dd),
+            "CASS_BACKUP_DEST": str(dest),
+            "CASS_BACKUP_STAGING": str(tmp_path / "staging"),
+            "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+    )
+
+    assert rc != 0, out  # 备份本身成功也要 exit 非零——告警不丢（DEV-6）
+    recoverable = dest / "RECOVERABLE-old"
+    assert recoverable.is_dir(), out
+    assert (recoverable / "COMPLETE").exists()
+    assert (recoverable / "db").read_bytes() == b"precious payload bytes", "载荷必须原封不动"
+    assert not stale.exists(), "原 .incomplete-* 应已被改名走"
+    assert "gate passed" in out, f"当晚备份应照常继续到临时成功出口: {out}"
+    assert "RECOVERABLE" in out, out
+
+
+@requires_cass
+def test_stale_incomplete_without_complete_removed_and_backup_succeeds(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """不含 COMPLETE 的陈旧 `.incomplete-*` = 半成品垃圾 → rm -rf，当晚备份正常 exit 0。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    stale = _make_stale_incomplete(dest, "old2", with_complete=False)
+    _write_verified_doctor_stub(tmp_home, synth_dd / "raw-mirror" / "v1" / "manifests")
+
+    rc, out, _dest = run_backup(
+        env={
+            "CASS_DATA_DIR": str(synth_dd),
+            "CASS_BACKUP_DEST": str(dest),
+            "CASS_BACKUP_STAGING": str(tmp_path / "staging"),
+            "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+    )
+
+    assert rc == 0, out
+    assert not stale.exists(), "无 COMPLETE 的陈旧半成品应被清掉"
+    assert not list(dest.glob("RECOVERABLE-*")), "无 COMPLETE 不应走 RECOVERABLE 救援"
