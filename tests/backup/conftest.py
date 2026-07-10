@@ -7,12 +7,16 @@ import pathlib
 import shutil
 import stat
 import subprocess
+import sys
 
 import pytest
 
 import fixture_factory
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
+
+# infra/backup/cass/ 不是 package，测试文件直接 `import cass_common` 需要它在 sys.path 上。
+sys.path.insert(0, str(REPO / "infra" / "backup" / "cass"))
 
 
 @pytest.fixture
