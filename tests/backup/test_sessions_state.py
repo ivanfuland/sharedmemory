@@ -276,6 +276,32 @@ def test_v12l_recorded_present_missing_from_nas_fails_and_leaves_state_untouched
     assert not out_tsv.exists(), "FAIL 时不该写出任何 out-tsv"
 
 
+def test_v12l_absent_at_source_record_missing_from_nas_also_fails(tmp_path):
+    """review Important #1（控制器按 spec 原文仲裁）：`absent_at_source` 记录的
+    NAS 文件不存在同样必须 FAIL——spec §6.3.1 发布门原文「对清单里的**每一条**
+    记录从 NAS 读回内容重算 blake3：文件不存在 ⇒ FAIL」没有状态豁免；§6.5 反面
+    教训①：源端已删除、NAS 仍保留的会话正是 Tier 0′ 最该保住的。源端已没了，
+    NAS 是最后一份，丢它必须响（与 V12l 的 present 版对称）。"""
+    sessions_root = tmp_path / "sessions"
+    (sessions_root / "alpha").mkdir(parents=True)  # 该文件在 NAS 上不存在
+    state_path = tmp_path / "state.tsv"
+    original = [SessionRec("alpha/gone.jsonl", 12, "a" * 64, "absent_at_source")]
+    cass_common.state_write_atomic(state_path, original)
+    original_bytes = state_path.read_bytes()
+    transferred = tmp_path / "transferred.txt"
+    transferred.write_text("")
+    out_tsv = tmp_path / "out" / "sessions.tsv"
+
+    rc = cass_sessions.publish_gate(
+        str(state_path), str(sessions_root), "alpha=" + str(tmp_path / "src"), str(transferred),
+        str(out_tsv),
+    )
+
+    assert rc == 1, "absent_at_source 的 NAS 副本是最后一份——丢了不能静默结转"
+    assert state_path.read_bytes() == original_bytes, "FAIL 时旧 state 必须原封不动（现场保留）"
+    assert not out_tsv.exists(), "FAIL 时不该写出任何 out-tsv"
+
+
 def test_v12f_orphan_not_in_transferred_fails_without_adopt(tmp_path):
     sessions_root = tmp_path / "sessions"
     (sessions_root / "alpha").mkdir(parents=True)
@@ -731,6 +757,55 @@ def test_v12n_deleted_header_line_rejected(tmp_path):
     transferred.write_text("")
     rc = cass_sessions.update_state(str(state_path), str(sessions_root), str(transferred))
     assert rc == 1
+
+
+def test_v12n_publish_gate_kill_before_state_publish_old_state_intact_then_next_run_ok(tmp_path):
+    """review Minor #2：`publish-gate` 自己的 state 重写（13f）与 13e 走同一个
+    `CASS_BACKUP_FAULT=kill-before-state-publish` 注入口——「两次写入都要
+    crash 安全」。构造一个会改写 state 的场景（向前漂移修正），注入后被
+    SIGKILL：旧 state 原封不动、out-tsv 没写出；下一轮（无注入）正常收敛。
+
+    走 CLI subprocess 直接打 publish-gate（不走全脚本 e2e——e2e 里同名 FAULT 会
+    先杀死更早执行的 update-state，够不到 13f 的写入点）。"""
+    sessions_root = tmp_path / "sessions"
+    (sessions_root / "alpha").mkdir(parents=True)
+    old_content = b"good1\ngood2\n"
+    new_content = old_content + b"good3\n"
+    (sessions_root / "alpha" / "d.jsonl").write_bytes(new_content)
+    src_root = tmp_path / "src" / "alpha"
+    src_root.mkdir(parents=True)
+    (src_root / "d.jsonl").write_bytes(new_content)
+    state_path = tmp_path / "state.tsv"
+    cass_common.state_write_atomic(state_path, [_rec("alpha/d.jsonl", old_content)])
+    baseline_bytes = state_path.read_bytes()
+    transferred = tmp_path / "transferred.txt"
+    transferred.write_text("")
+    out_tsv = tmp_path / "out" / "sessions.tsv"
+
+    cmd = [
+        str(VENV_PY), str(SESSIONS_SCRIPT), "publish-gate",
+        "--state", str(state_path), "--sessions-root", str(sessions_root),
+        "--roots", f"alpha={src_root}", "--transferred", str(transferred),
+        "--out-tsv", str(out_tsv),
+    ]
+    crashed = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "CASS_BACKUP_FAULT": "kill-before-state-publish"},
+    )
+    assert crashed.returncode == -9, (
+        f"注入必须真的以 SIGKILL 终止进程: rc={crashed.returncode} "
+        f"stdout={crashed.stdout!r} stderr={crashed.stderr!r}"
+    )
+    assert state_path.read_bytes() == baseline_bytes, (
+        "写 .tmp 后、os.replace 前被杀——旧 state 必须原封不动（13f 的写入与 13e 同样 crash 安全）"
+    )
+    assert not out_tsv.exists(), "被杀在 state 发布前——out-tsv 更不该已写出"
+
+    env_clean = {k: v for k, v in os.environ.items() if k != "CASS_BACKUP_FAULT"}
+    healed = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env_clean)
+    assert healed.returncode == 0, healed.stdout + healed.stderr
+    assert cass_common.state_read(state_path) == [_rec("alpha/d.jsonl", new_content)]
+    assert out_tsv.read_bytes() == state_path.read_bytes()
 
 
 # ---------------------------------------------------------------------------

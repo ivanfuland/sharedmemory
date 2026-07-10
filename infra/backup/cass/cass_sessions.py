@@ -342,7 +342,11 @@ def publish_gate(
 
     判据（逐条对应 spec §6.3.1 第 2 点 + task 12 brief 的 R3-P1 binding）：
 
-    - 清单记录 `present` 但 `--sessions-root` 下找不到对应文件 ⇒ **FAIL**（V12l）。
+    - 清单记录在 `--sessions-root` 下找不到对应文件 ⇒ **FAIL**（V12l），**不分
+      `present` / `absent_at_source`**——spec §6.3.1 发布门原文「对清单里的每一
+      条记录从 NAS 读回内容重算 blake3：文件不存在 ⇒ FAIL」没有状态豁免；且
+      §6.5 反面教训①点名「源端已删除、NAS 仍保留的会话（absent_at_source）正是
+      Tier 0′ 最该保住的」——源端已没了，NAS 是最后一份，丢它必须响。
     - 记录存在且文件存在：内容全量比对——
         - size/hash 都与记录相符 ⇒ 通过，原样结转（状态可能因源端消失而降级，见下）。
         - 不符：仅当「向前漂移」（NAS 更长 **且** `blake3(NAS[0:记录.nas_size]) ==
@@ -424,11 +428,15 @@ def publish_gate(
         nas_path = sessions_root_path / relpath
 
         if not nas_path.exists():
-            if existing_rec is not None and existing_rec.status == "present":
-                problems.append(f"recorded present but missing from NAS: {relpath}")
-                continue
+            # 有记录、NAS 无文件 ⇒ 无条件 FAIL，不分 present / absent_at_source
+            # （spec §6.3.1「文件不存在 ⇒ FAIL」无状态豁免；absent_at_source 的
+            # NAS 副本是最后一份，丢它更要响——见函数 docstring 第一条判据）。
+            # existing_rec is None 的分支结构上不可达：relpath ∈ all_relpaths 却
+            # 两边都没有（不在 state、也不在磁盘扫描）不可能发生。
             if existing_rec is not None:
-                final_records[relpath] = existing_rec  # absent_at_source，原样结转
+                problems.append(
+                    f"recorded (status={existing_rec.status}) but missing from NAS: {relpath}"
+                )
             continue
 
         actual_size = nas_path.stat().st_size
@@ -463,7 +471,10 @@ def publish_gate(
         return 1
 
     records = [final_records[relpath] for relpath in sorted(final_records)]
-    cass_common.state_write_atomic(state_path, records)
+    # 13f 的 state 重写与 13e 的走同一个 crash 注入口子（V12n「两次写入都要
+    # crash 安全」的 plumbing）：.tmp 落盘后、os.replace 前被杀 ⇒ 旧 state 原封。
+    kill_before_replace = os.environ.get("CASS_BACKUP_FAULT") == "kill-before-state-publish"
+    cass_common.state_write_atomic(state_path, records, _kill_before_replace=kill_before_replace)
 
     out_path = pathlib.Path(out_tsv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
