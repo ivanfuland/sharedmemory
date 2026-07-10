@@ -1,4 +1,4 @@
-"""CASS 备份 PR1 DB 五腿门（本文件逐 task 累加：本次新增腿 2，已含腿 0 + 腿 1 + 腿 2）。
+"""CASS 备份 PR1 DB 五腿门（本文件逐 task 累加：本次新增腿 4，已含腿 0 + 腿 1 + 腿 2 + 腿 3）。
 
 跑在本地 staging 副本（`.backup` 产物）上，spec §5 全五腿合计 < 6 秒。任一腿失败 →
 不写 `COMPLETE` → exit 非零 → TG 告警（调用方职责，不在本模块）。
@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+import struct
 import subprocess
 from dataclasses import dataclass
 from typing import Literal
@@ -364,4 +365,209 @@ def leg3(
 
     return Leg3Result(
         ok=ok, detail="; ".join(detail_parts), census=census, fingerprint=fingerprint
+    )
+
+
+# ---------------------------------------------------------------------------
+# 腿 4 — append-only 前缀全列摘要 + 单调性 + meta 水位（spec §5.5）；
+# rebaseline 出口见 spec §5.7。
+# ---------------------------------------------------------------------------
+
+# 覆盖对象：仅 messages 与 conversations（append-only，id 主键，spec §5.5 逐字）。
+TABLES_FOR_LEG4: tuple[str, ...] = ("messages", "conversations")
+
+# spec §5.5(a) 必需水位键硬编码清单——缺任一即 FAIL，rebaseline 也不豁免
+# （与硬编码不变式的比对永不可关，spec §5.7）。
+REQUIRED_LEG4_WATERMARK_KEYS: tuple[str, ...] = (
+    "last_scan_ts",
+    "last_scan_ts:connector:claude",
+    "last_scan_ts:connector:codex",
+    "last_scan_ts:connector:gemini",
+    "last_scan_ts:connector:openclaw",
+    "last_scan_ts:connector:pi_agent",
+    "last_embedded_message_id",
+    "last_indexed_at",
+    "schema_version",
+)
+
+_LEG4_UINT_RE = re.compile(r"^[0-9]+$")
+
+
+def _enc(v):
+    """spec §5.5 逐字：单射长度前缀编码，无分隔符。存储类以 SQLite 的 typeof() 为准
+    （即本函数的 isinstance 判断作用在 sqlite3 驱动已还原出的 python 值上）。"""
+    if v is None:            return b"\x00"
+    if isinstance(v, int):   d = str(v).encode();   return b"i" + struct.pack(">Q", len(d)) + d
+    if isinstance(v, float): return b"r" + struct.pack(">d", v)
+    if isinstance(v, str):   d = v.encode("utf-8"); return b"t" + struct.pack(">Q", len(d)) + d
+    d = bytes(v);            return b"b" + struct.pack(">Q", len(d)) + d
+
+
+def prefix_digests(con, table, prev_max_id):
+    """单遍流：返回 (digest_at_prev_max, digest_at_cur_max, cur_max, cur_count)。
+    hashlib .copy() 在越过 prev_max_id 边界时留存前缀摘要 —— messages 4 s 只跑一遍。
+
+    spec §5.5 逐字（= 附录 A 探针同构，见 `tests/backup/reference_digest_probe.py`）。
+    """
+    cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+    h = hashlib.sha256(); h.update(struct.pack(">Q", len(cols)))
+    for c in cols:
+        d = c.encode("utf-8"); h.update(struct.pack(">Q", len(d))); h.update(d)
+    h_pre, cur_max, cnt = None, 0, 0
+    for row in con.execute(f'SELECT * FROM "{table}" ORDER BY id'):
+        if prev_max_id is not None and h_pre is None and row[0] > prev_max_id:
+            h_pre = h.copy()                      # 越过基线边界，留存前缀摘要
+        h.update(struct.pack(">Q", len(row)))
+        for v in row: h.update(_enc(v))
+        cur_max, cnt = row[0], cnt + 1
+    if prev_max_id is not None and h_pre is None:
+        h_pre = h.copy()                          # cur_max == prev_max（当晚无新增）
+    return ((h_pre or h).hexdigest(), h.hexdigest(), cur_max, cnt)
+
+
+@dataclass
+class Leg4Result:
+    """腿 4 结果。`tables`/`meta_watermarks` 无论 `ok` 为何都会被算出，供 sidecar
+    落盘（下一晚拿今晚的 `tables[表名]` 整份当 `prev_tables` 传入）。
+
+    `tables`：`{表名: {"max_id": int, "count": int, "prefix_digest": str}}`——
+    `prefix_digest` 是**今晚的全量摘要**（`digest_at_cur_max`），不是 `digest_at_prev_max`。
+    `meta_watermarks`：`{水位键: 字符串值}`，只含 `REQUIRED_LEG4_WATERMARK_KEYS`
+    里实际存在的键。
+    """
+
+    ok: bool
+    detail: str
+    tables: dict[str, dict[str, int | str]]
+    meta_watermarks: dict[str, str]
+
+
+def _leg4_parse_uint(value) -> int | None:
+    """`^[0-9]+$` 校验后解析为无符号整数；不满足正则或非字符串一律返回 None
+    （调用方按「解析失败即 FAIL」处理，不是跳过）。"""
+    if not isinstance(value, str) or not _LEG4_UINT_RE.match(value):
+        return None
+    return int(value)
+
+
+def _leg4_watermarks(
+    con, prev_watermarks: dict[str, str] | None, rebaseline: bool
+) -> tuple[list[str], dict[str, str]]:
+    """meta 水位两部分：(a) 必需键存在（硬编码清单，缺任一 FAIL，rebaseline 也不
+    豁免）；(b) 单调不减（先 `^[0-9]+$` 校验再按无符号整数比较，解析失败即 FAIL）。
+    `rebaseline=True` 或 `prev_watermarks is None`（首晚）时跳过 (b)。"""
+    placeholders = ",".join("?" * len(REQUIRED_LEG4_WATERMARK_KEYS))
+    rows = con.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
+        REQUIRED_LEG4_WATERMARK_KEYS,
+    ).fetchall()
+    current = dict(rows)
+
+    problems: list[str] = []
+    missing = [key for key in REQUIRED_LEG4_WATERMARK_KEYS if key not in current]
+    if missing:
+        problems.append("必需水位键缺失: " + ", ".join(missing))
+
+    if not rebaseline and prev_watermarks is not None:
+        for key in REQUIRED_LEG4_WATERMARK_KEYS:
+            if key not in current or key not in prev_watermarks:
+                continue
+            cur_int = _leg4_parse_uint(current[key])
+            prev_int = _leg4_parse_uint(prev_watermarks[key])
+            if cur_int is None or prev_int is None:
+                problems.append(
+                    f'水位键 "{key}" 解析失败（当前值={current[key]!r}, '
+                    f"上次值={prev_watermarks[key]!r}）"
+                )
+                continue
+            if cur_int < prev_int:
+                problems.append(f'水位键 "{key}" 回退（{prev_int} → {cur_int}）')
+
+    return problems, current
+
+
+def leg4(
+    con,
+    prev_tables: dict[str, dict] | None,
+    prev_watermarks: dict[str, str] | None,
+    rebaseline: bool = False,
+) -> Leg4Result:
+    """腿 4 — append-only 前缀全列摘要 + 单调性 + meta 水位（spec §5.5）。
+
+    每张表（`TABLES_FOR_LEG4`）三道前置自检，任一不满足 ⇒ FAIL 不是跳过：
+    1. gap=0：`COUNT(*) == MAX(id)`（空表 MAX=0/COUNT=0 视为 gap 0，见 `prefix_digests`
+       的初值）。**始终执行，`rebaseline` 不豁免。**
+    2. `MAX(id) >= prev.max_id`。
+    3. `COUNT(*) >= prev.count`。
+    外加前缀摘要比对：本晚重算 `prev.max_id` 处的前缀（`digest_at_prev_max`）必须
+    与 `prev.prefix_digest` 逐字节相等。
+
+    `rebaseline=True`：跳过 2/3 与摘要比对（与 prev 的比对整体关闭），但 1 照跑。
+    `prev_tables is None`（首晚）：登记模式，2/3 与摘要比对天然跳过（无基线可比），
+    `ok` 只取决于 1 + meta 必需水位键存在。
+
+    `meta` 水位检查见 `_leg4_watermarks`：(a) 必需键存在永不可关（即使 rebaseline）；
+    (b) 单调不减，`rebaseline` 或首晚时跳过。
+    """
+    problems: list[str] = []
+    tables: dict[str, dict[str, int | str]] = {}
+
+    for table in TABLES_FOR_LEG4:
+        prev_entry = prev_tables.get(table) if prev_tables is not None else None
+        prev_max_id = prev_entry["max_id"] if prev_entry is not None else None
+
+        digest_at_prev_max, digest_at_cur_max, cur_max, cnt = prefix_digests(
+            con, table, prev_max_id
+        )
+        tables[table] = {
+            "max_id": cur_max,
+            "count": cnt,
+            "prefix_digest": digest_at_cur_max,
+        }
+
+        if cnt != cur_max:
+            problems.append(
+                f'"{table}": gap 自检 FAIL（COUNT={cnt} != MAX(id)={cur_max}）'
+            )
+
+        if not rebaseline and prev_entry is not None:
+            if cur_max < prev_entry["max_id"]:
+                problems.append(
+                    f'"{table}": max_id 回退（{prev_entry["max_id"]} → {cur_max}）'
+                )
+            if cnt < prev_entry["count"]:
+                problems.append(
+                    f'"{table}": count 回退（{prev_entry["count"]} → {cnt}）'
+                )
+            if digest_at_prev_max != prev_entry["prefix_digest"]:
+                problems.append(f'"{table}": 前缀摘要不符（历史前缀被改写）')
+
+    watermark_problems, meta_watermarks = _leg4_watermarks(
+        con, prev_watermarks, rebaseline
+    )
+    problems.extend(watermark_problems)
+
+    detail_parts: list[str] = []
+    if rebaseline:
+        detail_parts.append(
+            "rebaseline=True：跳过与 prev 的摘要/单调性/水位单调性比对"
+            "（gap 自检与必需水位键存在照跑）"
+        )
+    elif prev_tables is None:
+        detail_parts.append("首晚登记：无历史基线，tables/meta_watermarks 已记录")
+
+    if problems:
+        detail_parts.append("; ".join(problems))
+        ok = False
+    else:
+        ok = True
+        detail_parts.append(
+            "; ".join(
+                f"{name}: max_id={info['max_id']} count={info['count']}"
+                for name, info in tables.items()
+            )
+        )
+
+    return Leg4Result(
+        ok=ok, detail="; ".join(detail_parts), tables=tables, meta_watermarks=meta_watermarks
     )
