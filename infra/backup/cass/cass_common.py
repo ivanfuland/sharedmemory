@@ -74,29 +74,56 @@ def read_digest(backup_dir) -> dict | None:
     return json.loads(raw)
 
 
-def latest_published(dest) -> tuple[str, dict] | None:
-    """在 `dest` 下扫含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json，返回
-    `generation` 最大者的 `(目录名, digest dict)`。不看 mtime；读不到 digest/generation
-    的目录跳过；一个都没有返回 None。"""
+def _iter_published(dest) -> list[tuple[int, str, dict]]:
+    """扫 `dest` 下含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json，返回
+    `(generation, 目录名, digest dict)` 列表（未排序）。不看 mtime；读不到
+    digest/generation 的目录（无 digest.json / 坏 JSON / 缺键 / 目录本身不可读，
+    如轮转失败留下的 `chmod 000` 半成品）一律跳过，既不参与 `latest_published`
+    的 tip 判定，也不参与 `rotation_victims` 的轮转。`is_dir()`/`COMPLETE`
+    存在性探针与 digest 读取包在同一个 try 里——Python 3.12 起 `Path.exists()`
+    不再吞 `PermissionError`（只吞 `FileNotFoundError`/`NotADirectoryError`），
+    单条目不可读不该让整个扫描崩掉。`latest_published`/`rotation_victims`
+    共用这份扫描逻辑（同族）。"""
     dest = pathlib.Path(dest)
-    best: tuple[int, str, dict] | None = None
+    out: list[tuple[int, str, dict]] = []
     for entry in sorted(dest.glob("cass-*")):
-        if not entry.is_dir():
-            continue
-        if not (entry / "COMPLETE").exists():
-            continue
         try:
+            if not entry.is_dir():
+                continue
+            if not (entry / "COMPLETE").exists():
+                continue
             digest = read_digest(entry)
         except (OSError, json.JSONDecodeError):
             continue
         if not digest or "generation" not in digest:
             continue
-        generation = digest["generation"]
-        if best is None or generation > best[0]:
-            best = (generation, entry.name, digest)
-    if best is None:
+        out.append((digest["generation"], entry.name, digest))
+    return out
+
+
+def latest_published(dest) -> tuple[str, dict] | None:
+    """在 `dest` 下扫含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json，返回
+    `generation` 最大者的 `(目录名, digest dict)`。不看 mtime；读不到 digest/generation
+    的目录跳过；一个都没有返回 None。"""
+    published = _iter_published(dest)
+    if not published:
         return None
-    return (best[1], best[2])
+    generation, name, digest = max(published, key=lambda t: t[0])
+    return (name, digest)
+
+
+def rotation_victims(dest, keep: int) -> list[str]:
+    """keep-N 轮转选点（spec §6 step 16/17、§7、§11）：在 `dest` 下扫含 `COMPLETE`
+    的 `cass-*/` 目录，按各自 digest.json 的 `generation` 升序排序，返回超出
+    `keep` 个之后、最旧的那些目录名（待删）。不看 mtime——`touch`/`cp -a`/restore
+    演练都会改写它。读不到 `generation` 的目录（无 digest.json / 坏 JSON / 缺键）
+    不参与排序也不出现在返回值里（`_iter_published` 已经把它们筛掉）。候选总数
+    未超过 `keep` 时返回空列表。"""
+    published = sorted(_iter_published(dest), key=lambda t: t[0])
+    if len(published) <= keep:
+        return []
+    n_victims = len(published) - keep
+    return [name for _generation, name, _digest in published[:n_victims]]
 
 
 def state_read(path) -> list[SessionRec]:
