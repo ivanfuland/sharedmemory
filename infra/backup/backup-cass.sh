@@ -289,8 +289,8 @@ elif [ "$GATE_RC" -ne 0 ]; then
 fi
 
 # === STEP 10+ (Task 10 实现到 14b；Task 11 补 sessions 通道 A 的 13b-13d；
-#     13a 完整语义/ADOPT/13e-13g、digest.json、COMPLETE 发布、keep-N 轮转、
-#     周校验是 Task 12-13 待办) ===
+#     13a 完整语义/ADOPT/13e-13g、digest.json、COMPLETE 发布见 Task 12-13；
+#     keep-N 轮转见 Task 14；周校验（step 18）见 Task 16，脚本末尾) ===
 
 # ---------------------------------------------------------------------------
 # step 10 — .incomplete-$STAMP 落盘：db / db.sha256 / census.tsv / manifests/ /
@@ -835,16 +835,35 @@ if [ "$ROTATE_FAIL" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 最终 exit 语义：备份本身已发布成功（cass-$STAMP/ 完好），但三类人工告警
+# step 18 — 周深度校验（spec §6.5，Task 16）：`date +%u` 命中 `VERIFY_DOW` 才跑。
+# 备份本身已发布，周校验失败不回滚它，但必须让脚本 exit 非零（同 ROTATE_FAIL/
+# TG_ALERT 的「告警不能被主线成功吞掉」构型）。`cass_weekly.py` 内部五件事全部
+# 用 `cass_common.sha256_file(fadvise=True)`/`blake3_file(fadvise=True)` 读 NAS，
+# 不 shell out 到 `sha256sum -c`（codex R3-P1：后者不带 fadvise，绕不过本地页
+# 缓存）。
+# ---------------------------------------------------------------------------
+WEEKLY_FAIL=0
+TODAY_DOW="$(date +%u)"
+if [ "$TODAY_DOW" = "$VERIFY_DOW" ]; then
+  echo "[backup] weekly verify: running (today dow=$TODAY_DOW == VERIFY_DOW=$VERIFY_DOW)"
+  "$VENV_PY" "$LIB/cass_weekly.py" --dest "$DEST" --keep "$KEEP" 8>&- || WEEKLY_FAIL=1
+else
+  echo "[backup] weekly verify: skipped (today dow=$TODAY_DOW != VERIFY_DOW=$VERIFY_DOW)"
+fi
+
+# ---------------------------------------------------------------------------
+# 最终 exit 语义：备份本身已发布成功（cass-$STAMP/ 完好），但四类人工告警
 # 若发生仍要 exit 非零（DEV-6 的 RECOVERABLE 救援 / TG 发送失败 / 轮转删除
-# 失败）——告警不能因为「主线成功」就被吞掉。周校验（step 18）是 Task 16 的
-# 范围，尚未实现。
+# 失败 / 周校验 FAIL）——告警不能因为「主线成功」就被吞掉。
 # ---------------------------------------------------------------------------
 if [ "$ALERT_FLAG" = 1 ]; then
   echo "[backup] gate passed but a stale RECOVERABLE-* alert was raised above — exiting non-zero (DEV-6)"
 fi
-if [ "$ALERT_FLAG" = 1 ] || [ "$TG_ALERT" = 1 ] || [ "$ROTATE_FAIL" = 1 ]; then
+if [ "$WEEKLY_FAIL" = 1 ]; then
+  echo "[backup] gate passed but weekly deep verify (step 18) FAILED above — exiting non-zero"
+fi
+if [ "$ALERT_FLAG" = 1 ] || [ "$TG_ALERT" = 1 ] || [ "$ROTATE_FAIL" = 1 ] || [ "$WEEKLY_FAIL" = 1 ]; then
   exit 1
 fi
-echo "[backup] published: $PUBLISHED_DIR (weekly verify not yet implemented — Task 16)"
+echo "[backup] published: $PUBLISHED_DIR"
 exit 0
