@@ -110,11 +110,14 @@ def verify_chain(dest, keep: int) -> list[str]:
         # 一条读不到 digest 的具体原因，不再额外补「无备份」这类误导性文案。
         return problems
 
-    # generation 重复检测（非正 int 已在 _scan_r 拦）。
+    # generation 重复检测（非正 int 已在 _scan_r 拦）。重复时 tip/head（max/min
+    # by generation）的选取失去良定义，继续走链/算下界只会产出误导性的次生问题
+    # ——已经确定 FAIL，就此返回。
     gen_counts = Counter(d["generation"] for d in valid.values())
     dup_gens = sorted(g for g, c in gen_counts.items() if c > 1)
     if dup_gens:
         problems.append(f"generation 重复: {dup_gens}")
+        return problems
 
     tip_name = max(valid, key=lambda n: valid[n]["generation"])
     head_name = min(valid, key=lambda n: valid[n]["generation"])
@@ -176,6 +179,17 @@ def verify_chain(dest, keep: int) -> list[str]:
         # RECOVERABLE-* / 读不到 digest 因而不在 valid 里）。仅当 cur 是 R 中
         # 最老者时允许（链头）；否则 FAIL。
         if cur == head_name:
+            # spec §8.3「无分叉、无环、无缺环」：B 终止 = 正常走通到链头。此时
+            # tip→head 的路径必须覆盖 R 的全部合法成员——否则未覆盖者是孤儿/
+            # 分叉（如 g3.prev 直指 g1 绕过 g2：g2 从此不被任何一跳校验触及，
+            # 而 |R| 又可能恰好等于计数下界 → 假 PASS，reviewer 实际构造过）。
+            # 只在 B 终止时检查：C1/C2 是合法断链（链头语义 / rebaseline），
+            # 断点之前的成员允许留在 R 却不在走查路径上（V15b/V15j 场景）。
+            orphans = sorted(set(valid) - visited)
+            if orphans:
+                problems.append(
+                    f"孤儿/分叉：成员 {orphans} 不在 tip({tip_name})→链头({head_name}) 的走查路径上"
+                )
             break
         problems.append(
             f"{cur}: 前驱 {prev_field!r} 不在保留集内，且 {cur} 不是链头（应为 {head_name}）"
@@ -192,6 +206,15 @@ def verify_chain(dest, keep: int) -> list[str]:
     ]
     if reset_holders:
         r_name, r = max(reset_holders, key=lambda t: t[1])
+        # 独立于链走查的再断言（spec §8.3「带它的那份必须是链头」）：C1 的链头
+        # 检查在遍历环内，只覆盖被走到的节点——若生效 reset 持有者离路（走查经
+        # B 在别处终止，从不路过它），那条检查永远不触发，而这里的下界改算却会
+        # 无条件采用它的 r，把「必须 |R|==KEEP」静默降成 n → 删除掩盖后门
+        # （reviewer 实际构造过：gens {3,5,6,7,9}、KEEP=7、reset@g5 离路）。
+        if r_name != head_name:
+            problems.append(
+                f"{r_name}: 带 retention_reset（生效重置点）但不是链头（R 中最老者应为 {head_name}）"
+            )
         n = g - r + 1
         expected = keep if n >= keep else n
         bound_desc = f"retention_reset 生效点={r_name}(generation={r})，n={n}"
@@ -199,6 +222,10 @@ def verify_chain(dest, keep: int) -> list[str]:
         expected = keep if g >= keep else g
         bound_desc = f"g={g}"
 
+    # 不变式说明：spec 的 |R| 按定义是 len(all_names)（所有含 COMPLETE 的
+    # cass-*/）。这里用 len(valid)——两者不等时（有成员 digest 读不到），
+    # `_scan_r` 已为每个差额成员各记了一条 FAIL 问题，整体判定已经是 FAIL，
+    # 本条下界的具体数字只影响报文不影响判定；两者相等时（正常情况）就是 |R|。
     if len(valid) != expected:
         problems.append(
             f"计数下界不满足：{bound_desc}，KEEP={keep}，期望 |R|=={expected}，实际 |R|=={len(valid)}"

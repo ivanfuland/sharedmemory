@@ -24,6 +24,14 @@
   - 与真实产物集成一测：跑两晚真备份（`run_backup`）→ `verify_chain` PASS
     （钉住 `make_fake_backup` 与真产物的字段一致性）
   - CLI：exit 0/1 与 `--dest`/`--keep`
+  - Review 修复轮钉子（两个 reviewer 实际构造并验证过的绕过）：
+    · 离路 retention_reset（gens {3,5,6,7,9}、KEEP=7、reset@g5 不在走查路径上）
+      → FAIL 指认 reset 非链头——遍历环内的 C1 链头检查对没被走到的节点不触发，
+      下界改算必须独立再断言 `r_name == head_name`；
+    · 孤儿/分叉（g1←g2 与 g1←g3，g3.prev 直指 g1 绕过 g2，|R| 恰好等于下界）
+      → FAIL 指认孤儿——B 终止时必须断言走查路径覆盖全部合法成员
+      （spec §8.3「无分叉、无缺环」）
+  - generation 重复 → FAIL（spec「generation 重复/非正 int → FAIL」）
 
 本文件自包含，不跨文件 import 其它测试文件的私有函数（同代码库既有约定）。
 """
@@ -470,6 +478,76 @@ def test_missing_digest_json_in_complete_dir_fails_not_skipped(tmp_path):
     problems = cass_chain.verify_chain(dest, keep=7)
     assert problems != []
     assert any("cass-nodigest" in p for p in problems), problems
+
+
+# ---------------------------------------------------------------------------
+# Review 修复轮钉子 #1：离路 retention_reset 不得降低计数下界（reviewer 构造 A2）
+# ---------------------------------------------------------------------------
+
+
+def test_off_path_retention_reset_does_not_lower_bound(tmp_path):
+    """gens {3,5,6,7,9}、KEEP=7：主链 g9→A→g7→A→g6→A→g3 经 B 终止在 g3（链头），
+    从不路过带 retention_reset 的 g5——遍历环内的 C1 链头检查因此永不触发。
+    若下界改算无条件采用 max-gen reset holder 的 r，期望值会从 KEEP=7 被静默
+    降到 n = 9-5+1 = 5，恰好 |R|==5 → 假 PASS，g8 的删除被掩盖。修复后必须
+    FAIL 且指认 reset 非链头（外加孤儿指认——g5 也不在走查路径上）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    b3 = make_fake_backup(dest, "cass-a3", gen=3)
+    make_fake_backup(
+        dest, "cass-a5", gen=5,
+        retention_reset=True, retention_reset_reason="离路伪造：不在 tip→head 路径上",
+    )
+    sha3 = cass_common.sha256_file(b3 / "digest.json")
+    b6 = make_fake_backup(dest, "cass-a6", gen=6, prev_name="cass-a3", prev_sha=sha3)
+    sha6 = cass_common.sha256_file(b6 / "digest.json")
+    b7 = make_fake_backup(dest, "cass-a7", gen=7, prev_name="cass-a6", prev_sha=sha6)
+    sha7 = cass_common.sha256_file(b7 / "digest.json")
+    make_fake_backup(dest, "cass-a9", gen=9, prev_name="cass-a7", prev_sha=sha7)
+
+    problems = cass_chain.verify_chain(dest, keep=7)
+    assert problems != [], "离路 retention_reset 不得把下界从 KEEP 降到 n"
+    assert any(
+        "retention_reset" in p and "链头" in p and "cass-a5" in p for p in problems
+    ), problems
+
+
+# ---------------------------------------------------------------------------
+# Review 修复轮钉子 #2：孤儿/分叉逃逸（reviewer 构造 A1，spec §8.3「无分叉/无缺环」）
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_fork_off_main_path_fails(tmp_path):
+    """g1←g2 与 g1←g3 两条边（g3.prev 直指 g1、sha256 正确，绕过 g2）：走查
+    g3→A→g1 经 B 合法终止在链头 g1，g2 从不被任何一跳校验触及；且 g=3 < KEEP=7
+    ⇒ expected=|R|=3，计数下界也放行。修复前假 PASS；修复后 B 终止时必须断言
+    走查路径覆盖全部合法成员 → FAIL 指认孤儿 g2。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    b1 = make_fake_backup(dest, "cass-f1", gen=1)
+    sha1 = cass_common.sha256_file(b1 / "digest.json")
+    make_fake_backup(dest, "cass-f2", gen=2, prev_name="cass-f1", prev_sha=sha1)
+    make_fake_backup(dest, "cass-f3", gen=3, prev_name="cass-f1", prev_sha=sha1)
+
+    problems = cass_chain.verify_chain(dest, keep=7)
+    assert problems != [], "分叉（g2 孤儿不在 tip→head 路径上）必须 FAIL"
+    assert any("cass-f2" in p and ("孤儿" in p or "分叉" in p) for p in problems), problems
+
+
+# ---------------------------------------------------------------------------
+# generation 重复 → FAIL（spec「generation 重复/非正 int → FAIL」）
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_generation_fails(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    make_fake_backup(dest, "cass-dup-a", gen=2)
+    make_fake_backup(dest, "cass-dup-b", gen=2)
+
+    problems = cass_chain.verify_chain(dest, keep=7)
+    assert problems != []
+    assert any("generation 重复" in p for p in problems), problems
 
 
 # ---------------------------------------------------------------------------
