@@ -187,6 +187,12 @@ def test_attack1_meta_missing_v4(gate_baseline, tmp_path):
     # 如实断言实测行为——leg1/leg4 在本攻击构造下也正确 FAIL（发现见 docstring）：
     assert "[leg 1] FAIL" in out
     assert "[leg 4] FAIL" in out
+    # FAIL 时产物仍必须落地（SUSPECT 取证需要完整画像，不能因为门 FAIL 就不写）：
+    assert out_census.exists()
+    assert out_gate.exists()
+    assert json.loads(out_gate.read_bytes())["census_sha256"] == hashlib.sha256(
+        out_census.read_bytes()
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +259,8 @@ def test_attacks_targeting_leg4(gate_baseline, tmp_path, attack_name):
 
     assert rc == 1, f"{attack_name}: stdout={out}\nstderr={err}"
     assert "[leg 4] FAIL" in out, f"{attack_name}: stdout={out}"
+    assert out_census.exists(), f"{attack_name}: FAIL 时产物仍必须落地（SUSPECT 取证）"
+    assert out_gate.exists(), f"{attack_name}: FAIL 时产物仍必须落地（SUSPECT 取证）"
 
 
 # ---------------------------------------------------------------------------
