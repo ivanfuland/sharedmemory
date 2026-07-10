@@ -141,7 +141,8 @@ def test_rebaseline_without_reason_exit2(tmp_path):
     )
 
     assert rc == 2, f"stdout={out}\nstderr={err}"
-    assert "rebaseline" in err.lower() or "rebaseline" in err
+    assert "rebaseline" in err
+    assert "成对" in err
 
 
 def test_rebaseline_reason_without_rebaseline_exit2(tmp_path):
@@ -158,6 +159,8 @@ def test_rebaseline_reason_without_rebaseline_exit2(tmp_path):
     )
 
     assert rc == 2, f"stdout={out}\nstderr={err}"
+    assert "rebaseline" in err
+    assert "成对" in err
 
 
 # ---------------------------------------------------------------------------

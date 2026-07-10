@@ -41,6 +41,7 @@ import hashlib
 import json
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import time
 
@@ -240,6 +241,86 @@ def test_missing_db_path_exit2(tmp_path):
     assert rc == 2, f"stdout={out}\nstderr={err}"
     assert "Traceback" not in err, "应走干净的 exit 2 路径，不应是裸 traceback"
     assert not missing_db.exists(), "存在性检查不应有「顺手创建文件」的副作用"
+
+
+# ---------------------------------------------------------------------------
+# 单腿崩溃防御（review 修复）：缺 messages 表 / 任意腿抛异常都不得击穿产物落盘
+# ---------------------------------------------------------------------------
+
+
+def test_db_without_messages_table_fails_controlled_with_artifacts(tmp_path):
+    """review 实测复现的修复回归：缺 `messages` 表的库曾让 CLI 在 leg0 处裸
+    traceback 崩溃——零产物、无 [leg N] 行，违反「不短路 + 产物无论 PASS/FAIL
+    都写」契约。修后：leg0 受控 FAIL（sqlite3.DatabaseError 捕获），五条腿全部
+    打印，census/gate.json 照落盘，exit 1。"""
+    db = tmp_path / "no-messages.db"
+    con = sqlite3.connect(str(db))
+    con.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT)")
+    con.execute("INSERT INTO conversations (title) VALUES ('x')")
+    con.commit()
+    con.close()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    out_census = tmp_path / "census.tsv"
+    out_gate = tmp_path / "gate.json"
+
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"stdout={out}\nstderr={err}"
+    assert "Traceback" not in err, "单腿失败必须受控，不允许裸 traceback"
+    for i in range(5):
+        assert f"[leg {i}] " in out, f"缺 [leg {i}] 行（不短路契约），stdout={out}"
+    assert "[leg 0] FAIL" in out
+    assert "messages" in out
+    assert out_census.exists(), "FAIL 时 census.tsv 仍必须落地"
+    assert out_gate.exists(), "FAIL 时 gate.json 仍必须落地"
+    gate = json.loads(out_gate.read_bytes())
+    assert set(gate) >= {"schema_fingerprint", "tables", "meta_watermarks", "census_sha256"}
+
+
+@requires_cass
+def test_top_level_safety_net_degrades_crashing_leg_to_fail(synth_dd, tmp_path, monkeypatch, capsys):
+    """顶层安全网：任何单腿抛出任何异常（不只 sqlite3 系）→ 该腿降级 FAIL
+    （detail 含异常类型+文本），其余腿照跑、产物照写、exit 1。
+
+    monkeypatch 无法穿透 subprocess，本测试按 review 裁决直接调 `main()` 函数级
+    验证（模块内 `main` 按全局名查找 `leg2`，monkeypatch 生效）。"""
+    import cass_backup_gate
+
+    def _boom(con):
+        raise RuntimeError("synthetic leg2 crash for safety-net test")
+
+    monkeypatch.setattr(cass_backup_gate, "leg2", _boom)
+
+    db = synth_dd / "agent_search.db"
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    out_census = tmp_path / "census.tsv"
+    out_gate = tmp_path / "gate.json"
+
+    rc = cass_backup_gate.main(
+        [
+            "--db",
+            str(db),
+            "--dest",
+            str(dest),
+            "--out-census",
+            str(out_census),
+            "--out-gate-json",
+            str(out_gate),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "[leg 2] FAIL" in out
+    assert "RuntimeError" in out, "detail 必须含异常类型"
+    assert "synthetic leg2 crash" in out, "detail 必须含异常文本"
+    # 其余腿照跑（健康合成库上应 PASS）：
+    for i in (0, 1, 3, 4):
+        assert f"[leg {i}] PASS" in out, f"stdout={out}"
+    assert out_census.exists(), "单腿崩溃不得击穿产物落盘承诺"
+    assert out_gate.exists(), "单腿崩溃不得击穿产物落盘承诺"
 
 
 # ---------------------------------------------------------------------------

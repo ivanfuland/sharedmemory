@@ -44,9 +44,16 @@ class LegResult:
 
 
 def leg0(con) -> LegResult:
-    """`SELECT COUNT(*) FROM messages` / `FROM conversations` 均须 > 0，否则 FAIL。"""
-    messages_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    conversations_count = con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    """`SELECT COUNT(*) FROM messages` / `FROM conversations` 均须 > 0，否则 FAIL。
+
+    缺表 / schema 损坏抛的 `sqlite3.DatabaseError`（含子类 `OperationalError`）→
+    受控 FAIL 不裸 crash——与腿 2/3/4 对损坏的处理同一套哲学（review 修复：缺
+    `messages` 表的库曾让整个 CLI 裸 traceback 崩溃、零产物）。"""
+    try:
+        messages_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        conversations_count = con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        return LegResult(ok=False, detail=f"防呆 COUNT 失败 — {exc}")
     detail = f"messages={messages_count} conversations={conversations_count}"
     if messages_count > 0 and conversations_count > 0:
         return LegResult(ok=True, detail=detail)
@@ -653,6 +660,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # 人工通道成对性校验（CLI 双保险；bash 层的成对校验见 Task 9）：缺一即拒绝运行。
+    # 注意 `bool()` 让空字符串（`--rebaseline ""`）与「未提供」同义：混搭（一空
+    # 一非空）会在这里被拒绝（fail-closed），两个都空则整体当「无 rebaseline」
+    # 处理——这不是巧合而是有意选择：spec §5.7 要求 reason 非空，空串没有资格
+    # 当作「已提供」。
     if bool(args.rebaseline) != bool(args.rebaseline_reason):
         print(
             "错误: --rebaseline 与 --rebaseline-reason 必须成对提供，缺一即拒绝运行",
@@ -701,16 +712,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误: 无法打开 db（{db_path}）: {exc}", file=sys.stderr)
         return 2
 
-    try:
-        r0 = leg0(con)
+    def _safe(leg_fn, fallback_factory):
+        """顶层安全网（review 修复）：任何单腿抛出**任何异常**（含 leg1 的
+        subprocess 环境类失败）→ 该腿降级为 FAIL（detail 含异常类型+文本），
+        其余腿照跑、产物照写、exit 1。这是「SUSPECT 取证需完整画像」契约的
+        最后防线——单腿崩溃绝不允许击穿「不短路 + 产物无论 PASS/FAIL 都写」
+        的落盘承诺。各腿内部的 `sqlite3.DatabaseError` 受控处理仍是第一道防线
+        （detail 更精准）；这里兜的是它们没料到的一切。"""
+        try:
+            return leg_fn()
+        except Exception as exc:  # noqa: BLE001 — 最后防线，故意宽
+            return fallback_factory(f"腿内部异常（{type(exc).__name__}: {exc}）")
 
+    def _leg1():
         stdout, stderr, exit_code = run_integrity_check(args.db)
         sig = classify_integrity(stdout, stderr, exit_code)
-        r1 = LegResult(ok=sig in ("A", "B"), detail=f"integrity_check signature={sig}")
+        return LegResult(ok=sig in ("A", "B"), detail=f"integrity_check signature={sig}")
 
-        r2 = leg2(con)
-        r3 = leg3(con, prev_census, prev_fingerprint, rebaseline=rebaseline)
-        r4 = leg4(con, prev_tables, prev_watermarks, rebaseline=rebaseline)
+    def _leg_fail(detail: str) -> LegResult:
+        return LegResult(ok=False, detail=detail)
+
+    try:
+        r0 = _safe(lambda: leg0(con), _leg_fail)
+        r1 = _safe(_leg1, _leg_fail)
+        r2 = _safe(lambda: leg2(con), _leg_fail)
+        r3 = _safe(
+            lambda: leg3(con, prev_census, prev_fingerprint, rebaseline=rebaseline),
+            lambda detail: Leg3Result(ok=False, detail=detail, census={}, fingerprint=""),
+        )
+        r4 = _safe(
+            lambda: leg4(con, prev_tables, prev_watermarks, rebaseline=rebaseline),
+            lambda detail: Leg4Result(ok=False, detail=detail, tables={}, meta_watermarks={}),
+        )
     finally:
         con.close()
 
