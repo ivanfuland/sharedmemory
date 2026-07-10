@@ -189,17 +189,20 @@ def attack4(db: pathlib.Path) -> None:
         con.close()
 
 
-def attack5(db: pathlib.Path) -> None:
+def attack5(db: pathlib.Path, n_rows: int | None = None) -> None:
     """攻击库⑤：净缩尾——删掉 id 最大的一段连续尾部行（§9.1 V5c）。
 
     真实攻击删的是「上一份备份 max_id 之后」新增的 1000 行；本合成库没有基线概念，
-    按比例删尾部 N/3 行，效果等价：MAX(id) 与 COUNT 同步下降、gap 仍为 0——这正是
-    spec 里「任何百分比行数阈值都会放行，只有单调性判据能拦」的那个构造。
+    默认按比例删尾部 N/3 行，效果等价：MAX(id) 与 COUNT 同步下降、gap 仍为 0——这
+    正是 spec 里「任何百分比行数阈值都会放行，只有单调性判据能拦」的那个构造。
+
+    `n_rows`：显式指定删掉的尾行数（V5c 小幅净缩尾测试用 `n_rows=1`，删幅 <1%
+    贴近 spec 真实场景 1000/213195≈0.47%）；None 时保持原有 N/3 行为。
     """
     con = sqlite3.connect(str(db))
     try:
         n = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        k = n // 3
+        k = n_rows if n_rows is not None else n // 3
         if k > 0:
             ids = [
                 row[0]

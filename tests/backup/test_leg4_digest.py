@@ -190,7 +190,11 @@ def test_attack2_content_cleared_breaks_prefix_digest_v5(synth_dd):
 def _degraded_digest_first_n_cols(con, table, n):
     """劣化对照：只哈希前 n 列。messages 列序
     (id, conversation_id, idx, role, author, ...)——author 是第 5 列，取前 4 列
-    (id, conversation_id, idx, role) 确保 author 确实不在内。"""
+    (id, conversation_id, idx, role) 确保 author 确实不在内。
+
+    = spec 附录 B「5 列版」历史对照的等价物，关键性质是**不含 author 列**
+    （附录 B 那个「5 列版」哈希的是另一组选定列；本对照取前 4 列同样把 author
+    排除在外，对攻击④失明的机理一致）。"""
     cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')][:n]
     h = hashlib.sha256()
     h.update(struct.pack(">Q", len(cols)))
@@ -234,44 +238,93 @@ def test_attack4_full_column_catches_author_change_but_degraded_4col_is_blind_v5
 
 
 # ---------------------------------------------------------------------------
-# Step 2：攻击⑤——净缩尾，gap 仍 0，MAX(id)/COUNT 相对基线回退 ⇒ 单调性 FAIL（V5c）
+# Step 2：攻击⑤——小幅净缩尾，V5c 四断言逐条（gap / 幸存前缀 / 百分比阈值 / verdict）
 # ---------------------------------------------------------------------------
+
+_V5C_GROW_TO = 160  # 满库基线行数；删最后 1 行 ≈0.6%，贴近 spec 真实场景 1000/213195≈0.47%
+
+
+def _grow_messages_to(db, target_rows):
+    """把 messages 增长到 target_rows 行（id 连续追加，gap 保持 0），供 V5c 的
+    小幅净缩尾构造使用——合成库原生只有 6 行，删 1 行占比太大（16.7%），撑不起
+    「小幅删除 + 百分比阈值放行」的真实场景形态。"""
+    con = sqlite3.connect(str(db))
+    try:
+        cur, first_conv = con.execute(
+            "SELECT COUNT(*), (SELECT id FROM conversations ORDER BY id LIMIT 1) FROM messages"
+        ).fetchone()
+        for i in range(cur, target_rows):
+            con.execute(
+                "INSERT INTO messages (conversation_id, idx, role, author, created_at,"
+                " content, extra_json, extra_bin) VALUES (?, ?, 'user', 'synth-grower',"
+                " 0, ?, NULL, NULL)",
+                (first_conv, i, f"filler-{i}"),
+            )
+        con.commit()
+    finally:
+        con.close()
 
 
 @requires_cass
-def test_attack5_tail_deletion_gap_zero_but_monotonicity_fails_v5c(synth_dd):
-    """净缩尾：sqlite_sequence 为空、无 AUTOINCREMENT，删掉连续尾行后
-    `MAX(id) == COUNT(*)` 依然成立（gap 仍为 0）——任何百分比行数阈值都会
-    放行（跌幅可控），只有严格单调性（`>=` 不允许任何回退）能拦。
+def test_attack5_small_tail_deletion_all_four_v5c_assertions(synth_dd):
+    """V5c 四断言逐条（spec §5.5 攻击⑤，小幅净缩尾构造）：
 
-    注：本构造下 `digest_at_prev_max` 同样会不匹配——cur_max 一旦跌破
-    `prev.max_id`，流式哈希在更短的数据上无法复现「越过边界前」的内部状态
-    （sha256 的数学必然，不是实现 bug）。这与 U12 描述的「删尾+等量补插、
-    且替换发生在 prev 边界之上」不是同一场景，见下面 `test_delete_and_reinsert_*`。
+    以满库（160 行）为 prev 基线，删**最后 1 行**（≈0.6%，贴近 spec 真实场景
+    1000/213195≈0.47%）。逐条断言：
+    ① gap 仍 0（`COUNT == MAX(id)`，净缩尾不产生空洞）；
+    ② 幸存前缀摘要不变（夹具性格断言）：攻击前对 `id <= cur_max`（159）算的
+       摘要 == 攻击后的全量摘要，逐字节相等——被删的只有尾行，幸存数据一个
+       字节没动；
+    ③ 百分比阈值放行的对照演示：`159 >= 160*99//100 = 158` 为 True——99% 行数
+       阈值会放这个攻击过去（仿 V5d4 测试里 threshold_would_pass 的写法）；
+    ④ 门 verdict：FAIL 且单调性判据命中（「回退」）。**同时**门的摘要比对也
+       命中（「前缀摘要不符」）：cur_max 一旦跌破 prev 基线，流式哈希在更短的
+       数据上无法复现「越过边界前」的内部状态——SHA-256 机理必然，与②不矛盾
+       （②比的是「以 cur_max 为界」的幸存前缀性质，④比的是「以 prev.max_id
+       为界」的基线前缀）。spec V5c 的「只有单调性能拦」是对 gap 自检 / 百分比
+       阈值 / 幸存前缀性质这三类门说的——本测试用①②③证明那三类失明、用④
+       证明单调性命中。
     """
     db = synth_dd / "agent_search.db"
+    _grow_messages_to(db, _V5C_GROW_TO)
+
     con = sqlite3.connect(str(db))
     try:
         baseline = leg4(con, prev_tables=None, prev_watermarks=None)
+        assert baseline.ok is True
+        prev_max = baseline.tables["messages"]["max_id"]
+        prev_count = baseline.tables["messages"]["count"]
+        assert prev_max == prev_count == _V5C_GROW_TO, "前置条件：满库基线应为 160 行且 gap=0"
+        # 攻击前留存「幸存前缀」（id <= 159）的摘要，供断言②比对。
+        surviving_prefix_before, _, _, _ = prefix_digests(con, "messages", prev_max - 1)
     finally:
         con.close()
-    assert baseline.ok is True
-    prev_max = baseline.tables["messages"]["max_id"]
-    prev_count = baseline.tables["messages"]["count"]
 
-    fixture_factory.attack5(db)
+    fixture_factory.attack5(db, n_rows=1)
 
     con = sqlite3.connect(str(db))
     try:
         cur_max, cur_cnt = con.execute("SELECT MAX(id), COUNT(*) FROM messages").fetchone()
+        _, full_digest_after, _, _ = prefix_digests(con, "messages", None)
         result = leg4(con, baseline.tables, baseline.meta_watermarks)
     finally:
         con.close()
 
-    assert cur_max < prev_max and cur_cnt < prev_count, "前置条件：攻击⑤应让 max_id/count 双双回退"
+    assert cur_max == cur_cnt == prev_max - 1, "前置条件：应恰好删掉最后 1 行"
+
+    # ① gap 仍 0
     assert cur_cnt == cur_max, "gap 应仍为 0（净缩尾不产生空洞）"
+    # ② 幸存前缀摘要不变（逐字节相等）
+    assert full_digest_after == surviving_prefix_before, (
+        "幸存前缀（id <= cur_max）的摘要必须逐字节等于攻击前同前缀的摘要"
+    )
+    # ③ 百分比阈值放行（对照演示）
+    threshold_would_pass = cur_cnt >= prev_count * 99 // 100
+    assert threshold_would_pass is True, "前置条件：99% 阈值本该放行这次删除才有对照意义"
+    # ④ 门 verdict：单调性命中；基线前缀摘要比对同时命中（机理见 docstring）
     assert result.ok is False
     assert "回退" in result.detail
+    assert "前缀摘要不符" in result.detail
 
 
 # ---------------------------------------------------------------------------
