@@ -31,12 +31,13 @@
      R3-P1）。** `db.sha256`/`manifests.sha256sum` 自身是几十字节的文本文件，只
      记录别人的哈希，不是被验证的内容寻址产物本身——用普通 `read_text` 读取其
      文本内容，不占 fadvise 覆盖集（覆盖集 = blob 池全部 + db + manifests + census.tsv
-     + sessions.tsv，见 `verify_backup_self`/`verify_blob_pool` 与测试 V14c）。
+     + sessions.tsv + sessions.state.tsv，见 `verify_backup_self`/`verify_blob_pool`/
+     `verify_state_header` 与测试 V14c）。
   5. **`$DEST/sessions.state.tsv`** 首行 `#sha256` 自校验（`cass_common.state_read`；
-     `StateCorrupt` → FAIL）。**不 fadvise**——该文件几十 KB，且本身就是一份
-     「首行覆盖其余全部字节」的完整性头自校验产物，不是需要绕过页缓存内容寻址
-     校验的对象（V14c 断言集合明确只含 blobs+db+manifests+census.tsv+
-     sessions.tsv，state 文件豁免）。
+     `StateCorrupt` → FAIL）。**读前同样先 fadvise(DONTNEED)**——页缓存陈旧性与
+     文件大小无关：⑤ 存在的全部理由就是「验证 NAS 上的字节」，若读到的是本机页
+     缓存里每晚 13e 刚写完的副本，NAS 侧/跨客户端的腐烂被完全遮住，首行自校验
+     形同虚设（review 修复：初版曾以「文件小 + 自带完整性头」豁免，理由不成立）。
 
 `verify_weekly(dest, keep) -> list[str]`：空列表 = PASS，非空 = FAIL（每条一个具体
 问题，人读得懂）。语义与 `cass_chain.verify_chain` 一致：**FAIL 不是 skip**——digest.json
@@ -141,19 +142,25 @@ def verify_backup_self(backup_dir: pathlib.Path) -> list[str]:
       - `census.tsv` / `sessions.tsv` 的 sha256 == `digest.json` 对应字段
 
     `digest.json` 读取失败（含权限损坏，如单文件 `chmod 000`）/ 坏 JSON / 缺失 ⇒
-    该目录直接记一条问题并返回，不再深入——语义是 FAIL，不是静默跳过（呼应
-    `cass_chain` 对同一场景的判定，两者独立、结论一致）。"""
+    记一条问题（FAIL，不是静默跳过，呼应 `cass_chain` 对同一场景的判定），但**不
+    early-return**：db↔db.sha256 与 manifests↔manifests.sha256sum 两组比较不依赖
+    digest.json，照常执行（取证完整性）；只有 digest 派生的三个字段比较随之跳过。"""
     problems: list[str] = []
     name = backup_dir.name
 
+    # digest.json 读取失败（含单文件 chmod 000）/坏 JSON/缺失 ⇒ 记问题但**不
+    # early-return**：db↔db.sha256 与 manifests↔manifests.sha256sum 两组比较不
+    # 依赖 digest.json，照常执行（取证完整性——digest 坏的那份备份，db 本体是否
+    # 也烂了是独立且更要紧的事实，review Minor 修复）。只有 digest 派生的比较
+    # （db_sha256/census_sha256/sessions_tsv_sha256 三个字段）在 digest 不可读时
+    # 跳过——那不是 skip 语义，digest 坏本身已经是一条 FAIL。
+    digest = None
     try:
         digest = cass_common.read_digest(backup_dir)
+        if digest is None:
+            problems.append(f"{name}: 缺 digest.json")
     except (OSError, json.JSONDecodeError) as exc:
-        problems.append(f"{name}: digest.json 读取失败（{type(exc).__name__}: {exc}），自校验无法进行")
-        return problems
-    if digest is None:
-        problems.append(f"{name}: 缺 digest.json，自校验无法进行")
-        return problems
+        problems.append(f"{name}: digest.json 读取失败（{type(exc).__name__}: {exc}）")
 
     # --- db 三方一致：重算（fadvise）== digest.json.db_sha256 == db.sha256 文件内容 ---
     db_path = backup_dir / "db"
@@ -162,12 +169,13 @@ def verify_backup_self(backup_dir: pathlib.Path) -> list[str]:
         problems.append(f"{name}: db 文件缺失")
     else:
         actual_db_sha256 = cass_common.sha256_file(db_path, fadvise=True)
-        if "db_sha256" not in digest:
-            problems.append(f"{name}: digest.json 缺 db_sha256 字段")
-        elif actual_db_sha256 != digest["db_sha256"]:
-            problems.append(
-                f"{name}: db: FAILED（重算={actual_db_sha256}, digest.json.db_sha256={digest['db_sha256']}）"
-            )
+        if digest is not None:
+            if "db_sha256" not in digest:
+                problems.append(f"{name}: digest.json 缺 db_sha256 字段")
+            elif actual_db_sha256 != digest["db_sha256"]:
+                problems.append(
+                    f"{name}: db: FAILED（重算={actual_db_sha256}, digest.json.db_sha256={digest['db_sha256']}）"
+                )
         if not db_sha_path.is_file():
             problems.append(f"{name}: db.sha256 文件缺失")
         else:
@@ -192,32 +200,43 @@ def verify_backup_self(backup_dir: pathlib.Path) -> list[str]:
             problems.extend(f"{name}: {p}" for p in sub_problems)
 
     # --- census.tsv / sessions.tsv 的 sha256 == digest.json 对应字段 ---
-    for field, filename in (
-        ("census_sha256", "census.tsv"),
-        ("sessions_tsv_sha256", "sessions.tsv"),
-    ):
-        path = backup_dir / filename
-        if field not in digest:
-            problems.append(f"{name}: digest.json 缺 {field} 字段")
-            continue
-        if not path.is_file():
-            problems.append(f"{name}: {filename} 缺失")
-            continue
-        actual = cass_common.sha256_file(path, fadvise=True)
-        if actual != digest[field]:
-            problems.append(
-                f"{name}: {filename}: FAILED（重算={actual}, digest.json.{field}={digest[field]}）"
-            )
+    if digest is not None:
+        for field, filename in (
+            ("census_sha256", "census.tsv"),
+            ("sessions_tsv_sha256", "sessions.tsv"),
+        ):
+            path = backup_dir / filename
+            if field not in digest:
+                problems.append(f"{name}: digest.json 缺 {field} 字段")
+                continue
+            if not path.is_file():
+                problems.append(f"{name}: {filename} 缺失")
+                continue
+            actual = cass_common.sha256_file(path, fadvise=True)
+            if actual != digest[field]:
+                problems.append(
+                    f"{name}: {filename}: FAILED（重算={actual}, digest.json.{field}={digest[field]}）"
+                )
 
     return problems
 
 
 def verify_state_header(state_path: pathlib.Path) -> list[str]:
     """⑤ `$DEST/sessions.state.tsv` 首行 `#sha256` 自校验（spec §6.5 第 6 条）。
-    不 fadvise——见模块 docstring 理由。缺失该文件视为 FAIL（它是共享权威状态，
-    spec §6.3.1：state 消失是完整性事件）。"""
+    缺失该文件视为 FAIL（它是共享权威状态，spec §6.3.1：state 消失是完整性事件）。
+
+    读前先 fadvise(DONTNEED)——页缓存陈旧性与文件大小无关（见模块 docstring 第
+    5 条）。`cass_common.state_read` 不带 fadvise 参数（其余调用方都是读本机刚写
+    的文件，语义不同），这里用一个短暂 fd 对同一 inode 丢页缓存（fadvise 作用于
+    页缓存，跨 fd 生效），随后 `state_read` 的独立 open 即回源读，无需改共享签名。
+    """
     if not state_path.is_file():
         return [f"{state_path.name}: sessions.state.tsv 缺失"]
+    fd = os.open(state_path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
     try:
         cass_common.state_read(state_path)
     except cass_common.StateCorrupt as exc:

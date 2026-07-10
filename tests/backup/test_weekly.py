@@ -14,7 +14,9 @@
     manifest 引用，压根不知道这个文件存在）。
   - V14c：monkeypatch `os.posix_fadvise` 计数——健康两晚状态下调用数必须恰好
     等于「blob 池全部 + 每个保留备份的 db/census.tsv/sessions.tsv 各一次 +
-    每份 manifest 一次」（覆盖集断言，逐文件恰一次）。
+    每份 manifest 一次 + sessions.state.tsv 一次」（覆盖集断言，逐文件恰一次）。
+    blob 期望数用 `rglob("*.raw")` 独立推导（不照抄生产 glob），另断言两种口径
+    相等——生产 glob 若静默变窄，等式两边同降的假绿就此被拦。
   - V15m：篡改某保留 `cass-*/db` 一个字节 → `verify_weekly` FAIL 报文含
     `db: FAILED`；反例断言：只调用 `verify_blob_pool`（①）+
     `cass_chain.verify_chain`（③）时两者全过——db 内容不是 blob，也不在链算法
@@ -300,7 +302,7 @@ def test_v14b_orphan_blob_never_referenced_bitrot_caught_only_by_full_pool_scan(
 
 # ---------------------------------------------------------------------------
 # V14c：fadvise 覆盖集——blob 全部 + 每个保留备份 db/manifest*/census.tsv/
-# sessions.tsv 各恰一次；state 文件豁免。
+# sessions.tsv 各恰一次 + sessions.state.tsv 一次。
 # ---------------------------------------------------------------------------
 
 
@@ -330,17 +332,28 @@ def test_v14c_fadvise_called_once_per_covered_nas_file(
     assert problems == [], problems
 
     blobs_root = dest / "raw-mirror" / "v1" / "blobs"
-    n_blobs = len(list(blobs_root.glob("blake3/*/*.raw")))
+    # blob 期望数独立推导（rglob，深度无关）而非照抄生产 glob `blake3/*/*.raw`
+    # ——生产 glob 若静默变窄（漏扫一层目录），等式两边同降会假绿。先断言两种
+    # 口径当下相等：未来不等即报警（要么池布局变了，要么生产 glob 真的漏了）。
+    n_blobs = len(list(blobs_root.rglob("*.raw")))
+    n_blobs_production_glob = len(list(blobs_root.glob("blake3/*/*.raw")))
+    assert n_blobs == n_blobs_production_glob, (
+        f"blob 计数口径分歧：rglob={n_blobs} vs 生产 glob={n_blobs_production_glob}"
+        "——池布局变化或生产 glob 变窄，先查清再改期望"
+    )
+    assert n_blobs > 0, "覆盖集断言至少要有 1 个 blob 才有意义"
     retained = _retained_backup_dirs(dest)
     n_manifests = sum(len(list((b / "manifests").glob("*.json"))) for b in retained)
-    # 每个保留备份各读一次 db + census.tsv + sessions.tsv（state 文件豁免于
-    # fadvise 覆盖集，见 cass_weekly.verify_state_header 的docstring）。
+    # 每个保留备份各读一次 db + census.tsv + sessions.tsv。
     n_per_backup_files = len(retained) * 3
+    # sessions.state.tsv 一次（⑤ 读前同样 fadvise——页缓存陈旧性与文件大小无关）。
+    n_state = 1
 
-    expected = n_blobs + n_manifests + n_per_backup_files
+    expected = n_blobs + n_manifests + n_per_backup_files + n_state
     assert len(calls) == expected, (
         f"fadvise 调用数应恰好等于覆盖集大小（blob={n_blobs} + manifest={n_manifests} + "
-        f"db/census/sessions={n_per_backup_files} => {expected}）：实际={len(calls)}"
+        f"db/census/sessions={n_per_backup_files} + state={n_state} => {expected}）："
+        f"实际={len(calls)}"
     )
 
 
