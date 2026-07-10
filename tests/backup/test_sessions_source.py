@@ -757,6 +757,173 @@ def test_v12b_e2e_prefix_rewrite_blocks_publish_no_complete(
     )
 
 
+# ---------------------------------------------------------------------------
+# review fix — rsync glob 元字符转义（reviewer Important #1：exclude 文件裸写
+# `s[1].jsonl` 时 `[1]` 被 rsync 当字符类，文件照传，排除保证失效）
+# ---------------------------------------------------------------------------
+
+
+def test_escape_rsync_glob_no_metachars_returns_verbatim():
+    """无通配符 regime：rsync 对不含通配符的模式按字面比较（反斜杠也是字面），
+    此时任何转义反而会破坏匹配——必须原样返回。"""
+    assert cass_sessions._escape_rsync_glob("proj/plain.jsonl") == "proj/plain.jsonl"
+    assert cass_sessions._escape_rsync_glob("odd\\name.jsonl") == "odd\\name.jsonl"
+    assert cass_sessions._escape_rsync_glob("lone]bracket.jsonl") == "lone]bracket.jsonl"
+
+
+def test_escape_rsync_glob_metachars_bracket_escaped():
+    assert cass_sessions._escape_rsync_glob("s[1].jsonl") == "s[[]1[]].jsonl"
+    assert cass_sessions._escape_rsync_glob("we?rd*.jsonl") == "we[?]rd[*].jsonl"
+    # 含通配符 regime 下反斜杠必须翻倍（此时 rsync 把 `\` 当转义字符）：
+    assert cass_sessions._escape_rsync_glob("back\\slash[2].jsonl") == "back\\\\slash[[]2[]].jsonl"
+
+
+def test_exclude_file_contains_escaped_form_for_glob_filename(tmp_path):
+    root = tmp_path / "root"
+    (root / "proj").mkdir(parents=True)
+    good = b"good1\ngood2\n"
+    (root / "proj" / "s[1].jsonl").write_bytes(good)
+    state_path = tmp_path / "state.tsv"
+    cass_common.state_write_atomic(state_path, [_rec("a/proj/s[1].jsonl", good)])
+    (root / "proj" / "s[1].jsonl").write_bytes(b"g")  # 截断
+    out_dir = tmp_path / "excl"
+
+    rc = cass_sessions.check_source(str(state_path), f"a={root}", str(out_dir))
+
+    assert rc == 3
+    assert (out_dir / "exclude.a").read_text() == "/proj/s[[]1[]].jsonl\n"
+
+
+def test_reviewer_repro_glob_filename_really_not_transferred_and_raw_form_would_be(tmp_path):
+    """钉住 reviewer 的复现形态：文件真名 `s[1].jsonl`，check-source 判异常后走
+    canonical filter 顺序的真 rsync——文件必须**真的没被传输**；反例对照：exclude
+    文件裸写未转义路径时 `[1]` 被当字符类、文件照传（这正是修掉的 bug）。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    good = b"good1\ngood2\ngood3\n"
+    (root / "s[1].jsonl").write_bytes(good)
+    state_path = tmp_path / "state.tsv"
+    cass_common.state_write_atomic(state_path, [_rec("a/s[1].jsonl", good)])
+    # 前缀改写 + 变长（若 exclude 失效，rsync 一定产生传输）：
+    (root / "s[1].jsonl").write_bytes(b"bad11\nbad22\nbad33\nbad44\n")
+    out_dir = tmp_path / "excl"
+
+    rc = cass_sessions.check_source(str(state_path), f"a={root}", str(out_dir))
+    assert rc == 3
+
+    dst_fixed = tmp_path / "dst-fixed"
+    dst_fixed.mkdir()
+    fixed = subprocess.run(
+        [
+            "rsync", "-ai", "--append", "--prune-empty-dirs",
+            f"--exclude-from={out_dir / 'exclude.a'}",
+            "--include=*/", "--include=*.jsonl", "--exclude=*",
+            f"{root}/", f"{dst_fixed}/",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert fixed.returncode == 0, fixed.stdout + fixed.stderr
+    assert not (dst_fixed / "s[1].jsonl").exists(), (
+        f"转义后的 exclude 必须真的挡住传输: exclude 内容="
+        f"{(out_dir / 'exclude.a').read_text()!r} itemize={fixed.stdout!r}"
+    )
+
+    # 反例：裸写未转义路径（修复前的行为）——`[1]` 被当字符类，文件照传。
+    raw_exclude = tmp_path / "exclude.raw"
+    raw_exclude.write_text("/s[1].jsonl\n")
+    dst_raw = tmp_path / "dst-raw"
+    dst_raw.mkdir()
+    raw = subprocess.run(
+        [
+            "rsync", "-ai", "--append", "--prune-empty-dirs",
+            f"--exclude-from={raw_exclude}",
+            "--include=*/", "--include=*.jsonl", "--exclude=*",
+            f"{root}/", f"{dst_raw}/",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert raw.returncode == 0, raw.stdout + raw.stderr
+    assert (dst_raw / "s[1].jsonl").exists(), (
+        f"反例：未转义的 exclude 理应失效（reviewer 复现）；若这里反而挡住了，"
+        f"说明 rsync 通配符行为已变，需要重新核实转义方案: {raw.stdout!r}"
+    )
+
+
+@requires_cass
+def test_glob_filename_anomaly_blocks_transfer_e2e(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """V12b 形态 + 通配符文件名的 e2e：`s[1].jsonl` 截断后长回不同**更长**内容——
+    若 exclude 因通配符失效，`--append` 会把超出旧长度的尾巴追加到 NAS 副本上
+    （NAS 字节就变了）；转义正确时 NAS 好版本必须逐字节原封不动，且整次不发布。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    root = tmp_path / "root"
+    root.mkdir()
+    session_roots = f"alpha={root}"
+
+    session_file = root / "s[1].jsonl"
+    good = b"good1\ngood2\ngood3\n"
+    session_file.write_bytes(good)
+
+    rc1, out1 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "glob-first", session_roots)
+    assert rc1 == 0, out1
+    nas_copy = dest / "sessions" / "alpha" / "s[1].jsonl"
+    assert nas_copy.read_bytes() == good, out1
+
+    cass_common.state_write_atomic(dest / "sessions.state.tsv", [_rec("alpha/s[1].jsonl", good)])
+    session_file.write_bytes(b"bad11\nbad22\nbad33\nbad44\n")  # 前缀改写 + 变长
+
+    rc2, out2 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "glob-second", session_roots)
+
+    assert rc2 != 0, out2
+    assert (dest / "INCOMPLETE-glob-second").is_dir(), out2
+    assert nas_copy.read_bytes() == good, (
+        "通配符文件名的 exclude 若失效，--append 会把新尾巴追加上来——NAS 好版本"
+        "必须逐字节原封不动"
+    )
+
+
+# ---------------------------------------------------------------------------
+# review fix Minor #5 — 定向 sessions rsync 代码块的 grep 级回归
+# ---------------------------------------------------------------------------
+
+
+def _sessions_rsync_logical_line() -> str:
+    """从 backup-cass.sh 里取出 sessions 那条 rsync 的**逻辑行**（合并反斜杠续行），
+    按「同时含 `rsync` 与 `$DEST/sessions/`」定位——避免全局 grep 误伤 blobs 那条
+    `--ignore-existing` rsync。"""
+    text = BACKUP_SCRIPT.read_text(encoding="utf-8")
+    logical_lines = text.replace("\\\n", " ").splitlines()
+    matches = [
+        line for line in logical_lines
+        if "rsync" in line and "$DEST/sessions/" in line and not line.lstrip().startswith("#")
+    ]
+    assert len(matches) == 1, f"应恰有一条 sessions rsync 逻辑行，得到: {matches!r}"
+    return matches[0]
+
+
+def test_sessions_rsync_block_uses_append_and_never_ignore_existing():
+    line = _sessions_rsync_logical_line()
+    assert "--append" in line, line
+    assert "--ignore-existing" not in line, (
+        f"--ignore-existing 只准用于 blobs/（spec §11）——用在 sessions/ 会永久"
+        f"截断半截会话: {line}"
+    )
+
+
+def test_sessions_rsync_block_exclude_from_precedes_jsonl_include():
+    """脚本文本级钉住 codex R1-P1 的 filter 顺序（运行时行为已由
+    test_r1p1_filter_order_* 与各 e2e 覆盖，这里挡「手滑调序」的回归）。"""
+    line = _sessions_rsync_logical_line()
+    exclude_pos = line.index("--exclude-from=")
+    include_pos = line.index("--include='*.jsonl'")
+    assert exclude_pos < include_pos, (
+        f"--exclude-from 必须排在 --include='*.jsonl' 之前（first-match）: {line}"
+    )
+
+
 @requires_cass
 def test_first_night_state_none_full_sync_still_succeeds_e2e(
     tmp_home, run_backup, synth_dd, cass_stub, tmp_path

@@ -358,6 +358,12 @@ fi
 # 排在 `--include='*.jsonl'` 之前，否则 `.jsonl` 先命中 include，被 check-source
 # 判定异常的文件会绕过 exclude 照常 `--append`（codex R1-P1，沙箱实测：调错顺序
 # 时 exclude 点名的 f.jsonl 仍输出 `>f+++++++++`；调对顺序后正确不传）。
+#
+# SESSION_ROOTS 解析约定（与 cass_sessions.py 的 _parse_roots 同一契约）：冒号
+# 分隔对、等号分隔键值——**路径不得含冒号**（无转义机制，会被错误切分）；alias
+# 禁 `/`（relpath 按首个 `/` 切 alias）、禁 `|`（下方 sed 用它当定界符）、禁 `,`
+# （quarantine 列表按逗号切分）。三个固定 alias（claude-projects /
+# codex-sessions / openclaw-agents）是唯一预期形态。
 # ---------------------------------------------------------------------------
 : > "$STG/transferred.all"
 IFS=':' read -ra SESSION_ROOT_PAIRS <<<"$SESSION_ROOTS"

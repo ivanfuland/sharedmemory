@@ -67,7 +67,11 @@ def _fatal(msg: str) -> None:
 def _parse_roots(spec: str) -> dict[str, pathlib.Path] | None:
     """`alias=path:alias=path...`——冒号分隔对、等号分隔键值。**约定：路径本身不
     得含冒号**（无转义机制，含冒号的路径会被错误切分；这是本 CLI 与 bash 调用方
-    共享的已知边界，不在本 task 范围内解决）。格式非法 ⇒ 返回 None。"""
+    共享的已知边界，不在本 task 范围内解决）。**alias 约定**：禁 `/`（state/
+    quarantine 的 relpath 按首个 `/` 切分 alias）、禁 `|`（bash 侧
+    `sed "s|^|$alias/|"` 用它当定界符）、禁 `,`（quarantine 列表按逗号切分）；
+    生产只用三个固定 alias（claude-projects / codex-sessions / openclaw-agents），
+    其它形态不是预期输入。格式非法 ⇒ 返回 None。"""
     roots: dict[str, pathlib.Path] = {}
     for pair in spec.split(":"):
         if not pair:
@@ -87,6 +91,36 @@ def _split_relpath(relpath: str) -> tuple[str, str] | None:
     if not sep or not alias or not subpath:
         return None
     return alias, subpath
+
+
+# rsync exclude 模式是 glob，不是字面路径——`*`/`?`/`[` 会被当通配符解释。
+# 实测（rsync 3.2.7）：exclude 文件裸写 `/s[1].jsonl` 时 `[1]` 被当字符类，
+# 真名叫 `s[1].jsonl` 的文件**照样被传输**——排除保证（§6.3.1 核心）当场失效。
+# 逐字符 bracket-escape（`[*]`/`[?]`/`[[]`/`[]]`）后 rsync 按字面匹配。
+_RSYNC_GLOB_CHAR_ESCAPE = {"*": "[*]", "?": "[?]", "[": "[[]", "]": "[]]"}
+# 触发转义的判定字符集：`*`/`?`/`[` 任一出现 ⇒ 该模式在 rsync 眼里含通配符。
+# 孤立的 `]`（没有配对 `[`）不是通配符，无需触发。
+_RSYNC_GLOB_TRIGGER = ("*", "?", "[")
+
+
+def _escape_rsync_glob(subpath: str) -> str:
+    """把 exclude 行里的文件路径逐字符转义成「rsync 按字面匹配」的 glob 模式。
+
+    两个 regime（rsync wildmatch 的实测行为，两边都有测试钉住）：
+
+    - 路径不含任何通配符字符（`*`/`?`/`[`）⇒ **原样返回**。rsync 规则：模式里
+      没有通配符时整串按字面比较，反斜杠也是字面——此时任何「转义」反而会引入
+      通配符语义、破坏匹配。
+    - 含通配符 ⇒ 逐字符映射：`*`/`?`/`[`/`]` 换成单字符 bracket 类；`\\` 必须
+      同时翻倍成 `\\\\`——一旦模式含通配符，rsync 就把 `\\` 当转义字符解释，
+      裸 `\\` 会吃掉下一个字符（实测：`back\\slash[[]2[]].jsonl` 不翻倍时排除
+      失效，翻倍后正确排除）。
+    """
+    if not any(ch in subpath for ch in _RSYNC_GLOB_TRIGGER):
+        return subpath
+    return "".join(
+        "\\\\" if ch == "\\" else _RSYNC_GLOB_CHAR_ESCAPE.get(ch, ch) for ch in subpath
+    )
 
 
 def check_source(
@@ -170,7 +204,10 @@ def check_source(
     out_dir.mkdir(parents=True, exist_ok=True)
     for alias in roots:
         exclude_path = out_dir / f"exclude.{alias}"
-        body = "".join(f"/{subpath}\n" for subpath in sorted(exclude[alias]))
+        # 前导 `/` 锚定 root 相对路径；路径本身必须过 glob 转义（见
+        # `_escape_rsync_glob`——裸写含 `[`/`*`/`?` 的文件名会让 rsync 把它当
+        # 通配符，排除保证失效）。
+        body = "".join(f"/{_escape_rsync_glob(subpath)}\n" for subpath in sorted(exclude[alias]))
         exclude_path.write_text(body, encoding="utf-8")
 
     return 3 if has_anomaly else 0
