@@ -505,7 +505,7 @@ def test_five_leg_gate_failure_lands_suspect_with_forensics(
     assert "[leg 4] FAIL" in out, out
 
     digest = json.loads((susp / "digest.json").read_bytes())
-    assert digest["backup_name"] == f"SUSPECT-{susp.name.removeprefix('SUSPECT-')}"
+    assert digest["backup_name"] == susp.name
     assert digest["generation"] == 2, "cass-baseline 已是 generation 1，本次取证应是 2"
     assert digest["prev_backup_name"] == "cass-baseline"
     assert digest["prev_sidecar_sha256"] == cass_common.sha256_file(dest / "cass-baseline" / "digest.json")
