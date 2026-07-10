@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pathlib
+import signal
 from collections import namedtuple
 
 import blake3
@@ -131,8 +132,15 @@ def state_read(path) -> list[SessionRec]:
     return records
 
 
-def state_write_atomic(path, records) -> None:
-    """生成 `#sha256 ...` 首行 + 记录行，写同目录 `.tmp` 后 `os.replace`（单文件原子）。"""
+def state_write_atomic(path, records, *, _kill_before_replace: bool = False) -> None:
+    """生成 `#sha256 ...` 首行 + 记录行，写同目录 `.tmp` 后 `os.replace`（单文件原子）。
+
+    `_kill_before_replace`：Task 12 DEV-7 故障注入专用旋钮（`CASS_BACKUP_FAULT=
+    kill-before-state-publish`）——`.tmp` 落盘后、`os.replace` 前自杀（`SIGKILL`，
+    不可捕获），验证「旧 state 原封不动、下一轮正常运行」的单文件原子性
+    （V12n）。默认 `False`，对本函数其余全部既有调用方（含测试直接构造 fixture）
+    零行为变化。调用方（`cass_sessions.py`）负责读取 `CASS_BACKUP_FAULT` env 并据此
+    决定是否传 `True`——本模块不认识任何 FAULT 名字。"""
     path = pathlib.Path(path)
     body = "".join(
         f"{r.relpath}\t{r.nas_size}\t{r.blake3}\t{r.status}\n" for r in records
@@ -140,4 +148,6 @@ def state_write_atomic(path, records) -> None:
     header = f"#sha256 {hashlib.sha256(body).hexdigest()}\n".encode("ascii")
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_bytes(header + body)
+    if _kill_before_replace:
+        os.kill(os.getpid(), signal.SIGKILL)
     os.replace(tmp_path, path)
