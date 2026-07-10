@@ -233,13 +233,14 @@ elif [ "$GATE_RC" -ne 0 ]; then
   exit 1
 fi
 
-# === STEP 10+ (Task 10 实现到 14b；sessions 通道 / digest.json / COMPLETE 发布 /
-#     keep-N 轮转 / 周校验是 Task 11-13 待办) ===
+# === STEP 10+ (Task 10 实现到 14b；Task 11 补 sessions 通道 A 的 13b-13d；
+#     13a 完整语义/ADOPT/13e-13g、digest.json、COMPLETE 发布、keep-N 轮转、
+#     周校验是 Task 12-13 待办) ===
 
 # ---------------------------------------------------------------------------
 # step 10 — .incomplete-$STAMP 落盘：db / db.sha256 / census.tsv / manifests/ /
 # manifests.sha256sum（spec §6 step 10）。digest.json 此时还不能写——它要含
-# sessions_tsv_sha256，而 sessions.tsv 到 step 13e 才生成（Task 11+）。
+# sessions_tsv_sha256，而 sessions.tsv 要到 step 13g 才生成（Task 12）。
 #
 # 从此刻起半成品对 EXIT trap 可见（TRAP_INCOMPLETE，见上方 cleanup()）：任何没
 # 走 fail_incomplete 就退出的路径（SIGTERM/未预料的 set -e 击杀）都会被自动
@@ -320,6 +321,65 @@ BLOBS_TRANSFERRED="$(sed -n 's/^Number of regular files transferred: \([0-9,]*\)
 echo "[backup] blobs rsync: transferred ${BLOBS_TRANSFERRED:-?} files"
 
 # ---------------------------------------------------------------------------
+# step 13b — sessions 通道 A：源端前缀校验（spec §6.3.1 step 13b）。
+#
+# 13a（读共享权威状态 $DEST/sessions.state.tsv 的完整语义，含首晚缺失时的 ADOPT
+# 通道）本 task 只实现最窄的分支：文件不存在 → 传字面量 NONE（check-source 视作
+# 空清单，全净放行）；存在 → 传真实路径。ADOPT 通道 / 13a 其余语义是 Task 12。
+# ---------------------------------------------------------------------------
+SESSIONS_STATE_PATH="$DEST/sessions.state.tsv"
+if [ -f "$SESSIONS_STATE_PATH" ]; then
+  SESSIONS_STATE_ARG="$SESSIONS_STATE_PATH"
+else
+  SESSIONS_STATE_ARG="NONE"
+fi
+
+SESSIONS_FAIL=0
+SESSIONS_CHECK_RC=0
+"$VENV_PY" "$LIB/cass_sessions.py" check-source \
+    --state "$SESSIONS_STATE_ARG" --roots "$SESSION_ROOTS" \
+    --out-exclude-dir "$STG" 8>&- || SESSIONS_CHECK_RC=$?
+# 9>&- 不再需要——写锁已在 step 8 后释放（exec 9>&- 见上）。exit 语义（本 CLI
+# 契约 + spec §6.3.1）：0=全净 / 3=有异常文件（healthy 部分仍照常同步，但整次
+# 备份最终不发布，判定见 step 13d 之后）/ 其余=内部错误，立即响亮失败。
+if [ "$SESSIONS_CHECK_RC" -eq 3 ]; then
+  echo "[backup] ALERT: session source-check found anomalous file(s) — excluded from" \
+    "this sync, run will not publish (spec §6.3.1)"
+  SESSIONS_FAIL=1
+elif [ "$SESSIONS_CHECK_RC" -ne 0 ]; then
+  fail_incomplete "session check-source failed (rc=$SESSIONS_CHECK_RC)"
+fi
+
+# ---------------------------------------------------------------------------
+# step 13c/13d — sessions 通道 A：jsonl-only include 过滤 + itemize 解析
+# （每个 root 一次 rsync；spec §6.3.1 / 数据流 step 13d）。
+#
+# ⚠ filter 顺序是硬约束：rsync filter 规则 first-match——`--exclude-from` 必须
+# 排在 `--include='*.jsonl'` 之前，否则 `.jsonl` 先命中 include，被 check-source
+# 判定异常的文件会绕过 exclude 照常 `--append`（codex R1-P1，沙箱实测：调错顺序
+# 时 exclude 点名的 f.jsonl 仍输出 `>f+++++++++`；调对顺序后正确不传）。
+# ---------------------------------------------------------------------------
+: > "$STG/transferred.all"
+IFS=':' read -ra SESSION_ROOT_PAIRS <<<"$SESSION_ROOTS"
+for pair in "${SESSION_ROOT_PAIRS[@]}"; do
+  [ -n "$pair" ] || continue
+  session_alias="${pair%%=*}"
+  session_root_path="${pair#*=}"
+  mkdir -p "$DEST/sessions/$session_alias"
+  rsync -ai --append --prune-empty-dirs \
+      --exclude-from="$STG/exclude.$session_alias" \
+      --include='*/' --include='*.jsonl' --exclude='*' \
+      "$session_root_path/" "$DEST/sessions/$session_alias/" 8>&- \
+      > "$STG/itemize.$session_alias" \
+    || fail_incomplete "sessions rsync failed for root $session_alias"
+
+  "$VENV_PY" "$LIB/cass_sessions.py" parse-itemize --in "$STG/itemize.$session_alias" 8>&- \
+      > "$STG/transferred.$session_alias" \
+    || fail_incomplete "session itemize parse failed for root $session_alias (fail-closed on unknown line)"
+  sed "s|^|$session_alias/|" "$STG/transferred.$session_alias" >> "$STG/transferred.all"
+done
+
+# ---------------------------------------------------------------------------
 # step 14a — manifest 快照完整性门（spec §6 step 14a）：对 .incomplete-$STAMP/
 # manifests/ 的每个文件读前 fadvise(DONTNEED) 后核对 manifests.sha256sum。裸
 # `sha256sum -c` 不带 fadvise，绕不过「刚写完立刻读，读到的是本地页缓存」这一类
@@ -364,15 +424,28 @@ fi
   || fail_incomplete "step 14b publish-check (manifest/blob pool closure) failed"
 
 # ---------------------------------------------------------------------------
-# 临时出口（Task 11-13 落地前）：sessions 通道 / digest.json / COMPLETE 发布 /
-# keep-N 轮转 / 周校验尚未实现，`.incomplete-$STAMP/` 有意留在 DEST 上（供后续
-# task 与测试检视本 task 的产出）——故必须先清空 TRAP_INCOMPLETE，否则 EXIT trap
-# 会把这次成功跑出来的东西当半成品删掉（同 fail_incomplete 的清空时机原则）。
+# sessions 通道 A 收尾判定：step 13b 若判定过异常文件（SESSIONS_FAIL=1），
+# 无论 13c/13d 是否顺利同步了健康部分，整次备份都不能发布——落
+# `INCOMPLETE-$STAMP/` + exit 非零（spec §6.3.1「异常文件排除出本次同步，整次
+# 备份 exit 非零、不写 COMPLETE」；codex R4-P1：只断言 exit 非零挡不住「照常
+# 发布再非零退出」的骗绿实现，必须真的不留 `COMPLETE`/`cass-*/`）。必须在这里
+# ——成功出口清空 TRAP_INCOMPLETE 之前——判断，晚了 fail_incomplete 就没有半
+# 成品可回收。
+# ---------------------------------------------------------------------------
+if [ "$SESSIONS_FAIL" = 1 ]; then
+  fail_incomplete "session source-check failed"
+fi
+
+# ---------------------------------------------------------------------------
+# 临时出口（Task 12-13 落地前）：digest.json / COMPLETE 发布 / keep-N 轮转 /
+# 周校验尚未实现，`.incomplete-$STAMP/` 有意留在 DEST 上（供后续 task 与测试
+# 检视本 task 的产出）——故必须先清空 TRAP_INCOMPLETE，否则 EXIT trap 会把这次
+# 成功跑出来的东西当半成品删掉（同 fail_incomplete 的清空时机原则）。
 # ---------------------------------------------------------------------------
 TRAP_INCOMPLETE=""
 if [ "$ALERT_FLAG" = 1 ]; then
   echo "[backup] gate passed but a stale RECOVERABLE-* alert was raised above — exiting non-zero (DEV-6)"
   exit 1
 fi
-echo "[backup] step 12/14 done (13/14c/15 not yet implemented)"
+echo "[backup] step 12/13/14 done (14c/15 not yet implemented)"
 exit 0
