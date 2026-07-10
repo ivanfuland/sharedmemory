@@ -101,14 +101,8 @@ LEG2_SQL = (
     'WHERE NOT EXISTS (SELECT 1 FROM "{table}" AS b WHERE b.rowid = a.rowid)'
 )
 
-# 生产库唯一已知豁免（与腿 3 的豁免一致，§2.6）：`fts_messages_config` 因一次
-# `.recover` 式重建丢了本该有的 `WITHOUT ROWID`，被下面的 classify 误判成普通
-# rowid 表，实测其查询必报 `database disk image is malformed`。健康库里这张表
-# 本身带 `WITHOUT ROWID`，会在 `_leg2_rowid_tables` 就被跳过、根本走不到这条
-# 豁免路径——该豁免只在「被误判为 rowid 表 + 确实 malformed」时生效，换成任何
-# 别的表名报同样的错都必须 FAIL，不得静默放行。
-_LEG2_MALFORMED_EXEMPT_TABLE = "fts_messages_config"
-_LEG2_MALFORMED_MARKER = "malformed"
+# 无豁免：NOT INDEXED + rowid seek 不经过任何二级索引，实测在生产坏 DDL 的
+# fts_messages_config 上正常执行（spec §5.3 无豁免条款是深思熟虑的）。
 
 
 def _leg2_rowid_tables(con) -> list[str]:
@@ -151,8 +145,9 @@ def leg2(con) -> LegResult:
     """对每张 rowid 表跑 scan-vs-seek 分歧查询，且先自证查询计划再信任其数字。
 
     任一表的 EQP 不满足自证条件 ⇒ 该腿 FAIL（不是跳过，spec §5.3 逐字要求）。
-    `fts_messages_config` 若被误判为 rowid 表且查询报 malformed，按已知生产库
-    缺陷豁免（且仅它，§2.6）；其余任何表查询失败一律 FAIL。
+    任一表的 EQP 或主查询抛 `sqlite3.DatabaseError`（真实损坏抛的是这个父类，
+    不只是 `OperationalError`）⇒ 受控 FAIL（detail 带表名 + 异常文本），不裸 crash。
+    无表级豁免（见上方 LEG2_SQL 处注释）。
     """
     checked: list[str] = []
     for table in _leg2_rowid_tables(con):
@@ -160,13 +155,7 @@ def leg2(con) -> LegResult:
 
         try:
             eqp_text = _leg2_eqp_text(con, query)
-        except sqlite3.OperationalError as exc:
-            if (
-                table == _LEG2_MALFORMED_EXEMPT_TABLE
-                and _LEG2_MALFORMED_MARKER in str(exc)
-            ):
-                checked.append(f"{table}=豁免（EQP {exc}）")
-                continue
+        except sqlite3.DatabaseError as exc:
             return LegResult(ok=False, detail=f'"{table}": EXPLAIN QUERY PLAN 失败 — {exc}')
 
         if not _leg2_eqp_self_certifies(eqp_text):
@@ -177,13 +166,7 @@ def leg2(con) -> LegResult:
 
         try:
             diff_count = con.execute(query).fetchone()[0]
-        except sqlite3.OperationalError as exc:
-            if (
-                table == _LEG2_MALFORMED_EXEMPT_TABLE
-                and _LEG2_MALFORMED_MARKER in str(exc)
-            ):
-                checked.append(f"{table}=豁免（主查询 {exc}）")
-                continue
+        except sqlite3.DatabaseError as exc:
             return LegResult(ok=False, detail=f'"{table}": 主查询失败 — {exc}')
 
         if diff_count != 0:

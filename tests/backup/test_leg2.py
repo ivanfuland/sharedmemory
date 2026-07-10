@@ -8,9 +8,11 @@
   - EQP 自证的三个子条件（`SCAN a` / `SEARCH b USING INTEGER PRIMARY KEY` /
     不含 `COVERING INDEX`）各自独立可红——用 `_leg2_eqp_self_certifies` 纯函数
     喂手造的 EQP 行，逐条验证「缺一个条件就必须 False」。
-  - `fts_messages_config` 生产库异常（DDL 缺 `WITHOUT ROWID` → 被误判为普通 rowid
-    表 → 查询报 malformed）的豁免路径：用代理连接模拟，且验证「换成别的表名报同样
-    的 malformed」必须 FAIL，不是静默放行——豁免只认表名，不认错误文本本身。
+  - 受控 FAIL：任何表的 EQP 或主查询抛 `sqlite3.DatabaseError`（真实损坏抛的是
+    这个父类，`except OperationalError` 接不住）→ `LegResult(ok=False)` 且 detail
+    带表名，不裸 crash。两个分支（EQP 就 raise / EQP 成功但主查询 raise）分别覆盖。
+    腿 2 **无任何表级豁免**——`NOT INDEXED` + rowid seek 不经过二级索引，实测在
+    生产坏 DDL 的 `fts_messages_config` 上正常返回 0（spec §5.3 无豁免条款）。
 """
 from __future__ import annotations
 
@@ -157,56 +159,60 @@ def test_eqp_self_certifies_false_when_covering_index_present():
 
 
 # ---------------------------------------------------------------------------
-# fts_messages_config 生产库异常豁免：用代理连接模拟「malformed」，且验证豁免
-# 只认表名、不认错误文本——换个表名报同样的错必须 FAIL。
+# 受控 FAIL：EQP 或主查询抛 sqlite3.DatabaseError → LegResult(ok=False)，不裸 crash。
+# 真实损坏抛的是 DatabaseError 这个父类（reviewer 本机复现 `except OperationalError`
+# 接不住），proxy 必须 raise DatabaseError 才测到位。腿 2 无任何表级豁免。
 # ---------------------------------------------------------------------------
 
 
-class _MalformedTableConnection:
-    """包一层真连接：对指定表名的一切查询都抛 `database disk image is malformed`，
-    模拟 spec §2.6 的生产库异常；其余表原样代理给真连接。"""
+class _RaisingTableConnection:
+    """包一层真连接：对指定表名的查询按阶段抛 `sqlite3.DatabaseError`（真实损坏的
+    异常类），其余查询原样代理给真连接。`stage` 区分两个失败分支：
+      - "eqp"：EQP 调用（SQL 以 `EXPLAIN QUERY PLAN` 开头）就 raise；
+      - "main"：EQP 放行、只在主查询（非 EXPLAIN 前缀）时 raise——这是真实损坏
+        的实际形态（查询计划编译得出来，执行到坏页才炸）。"""
 
-    def __init__(self, real_con, malformed_table: str):
+    def __init__(self, real_con, table: str, stage: str):
+        assert stage in ("eqp", "main")
         self._real = real_con
-        self._malformed_table = malformed_table
+        self._table = table
+        self._stage = stage
 
     def execute(self, sql, *args, **kwargs):
-        if f'"{self._malformed_table}"' in sql and "sqlite_master" not in sql:
-            raise sqlite3.OperationalError("database disk image is malformed (11)")
+        if f'"{self._table}"' in sql and "sqlite_master" not in sql:
+            is_eqp = sql.lstrip().startswith("EXPLAIN QUERY PLAN")
+            if (self._stage == "eqp" and is_eqp) or (self._stage == "main" and not is_eqp):
+                raise sqlite3.DatabaseError("database disk image is malformed")
         return self._real.execute(sql, *args, **kwargs)
 
 
-def _build_malformed_probe_db(path):
-    """`fts_messages_config` 无 `WITHOUT ROWID`（模拟 §2.6 描述的 .recover 式重建
-    缺陷——健康库里这张表本应带 WITHOUT ROWID 而被直接跳过，生产库因缺陷丢了这个
-    标记，才会被误判成普通 rowid 表、一查就 malformed）。"""
-    con = sqlite3.connect(str(path))
-    con.execute('CREATE TABLE "fts_messages_config"(k TEXT PRIMARY KEY, v)')
-    con.execute("INSERT INTO fts_messages_config(k, v) VALUES ('x', 'y')")
+def _build_probe_db_two_tables():
+    con = sqlite3.connect(":memory:")
     con.execute("CREATE TABLE conversations(id INTEGER PRIMARY KEY, title TEXT)")
     con.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)")
     con.commit()
     return con
 
 
-def test_leg2_exempts_fts_messages_config_malformed():
-    con = _build_malformed_probe_db(":memory:")
-    proxy = _MalformedTableConnection(con, "fts_messages_config")
-    try:
-        result = leg2(proxy)
-    finally:
-        con.close()
-    assert result.ok is True
-    assert "fts_messages_config" in result.detail
-
-
-def test_leg2_does_not_exempt_other_tables_reporting_malformed():
-    """豁免只认表名 `fts_messages_config`，换个表名报一模一样的 malformed 必须 FAIL——
-    不能把「捕获到 malformed 异常」本身当豁免条件，否则任何表坏了都会被静默放行。"""
-    con = _build_malformed_probe_db(":memory:")
-    proxy = _MalformedTableConnection(con, "conversations")
+def test_leg2_controlled_fail_when_main_query_raises_database_error():
+    """(a) EQP 成功、主查询 raise（真实损坏的实际形态）→ 受控 FAIL 且 detail 带表名。"""
+    con = _build_probe_db_two_tables()
+    proxy = _RaisingTableConnection(con, "conversations", stage="main")
     try:
         result = leg2(proxy)
     finally:
         con.close()
     assert result.ok is False
+    assert "conversations" in result.detail
+
+
+def test_leg2_controlled_fail_when_eqp_raises_database_error():
+    """(b) EQP 阶段就 raise → 受控 FAIL 且 detail 带表名。"""
+    con = _build_probe_db_two_tables()
+    proxy = _RaisingTableConnection(con, "messages", stage="eqp")
+    try:
+        result = leg2(proxy)
+    finally:
+        con.close()
+    assert result.ok is False
+    assert "messages" in result.detail
