@@ -16,6 +16,11 @@ spec §5.4 / §5.7）。
     指纹比对（新增表必然改变指纹）互相干扰。
   - `ALTER TABLE agents ADD COLUMN x` → schema 指纹 FAIL 且报文含「重设基线」；
     `rebaseline=True` 时同一变更改为 PASS。
+  - READ_FAILED 哨兵双向 fail-closed（review 修复）：非豁免表 COUNT raise →
+    当晚 FAIL 且 census 记 `"READ_FAILED"`（字符串哨兵，绝不用可比较的 int）；
+    prev 侧含 READ_FAILED / 负数 int（毒基线）→ FAIL 且报文提示人工 rebaseline，
+    绝不比较放行——钉死 reviewer 的实验：`{'agents': 0}` vs prev `{'agents': -1}`
+    在旧实现下 `cur >= -1` 恒真会放行整表清空。
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import pytest
 import fixture_factory
 from cass_backup_gate import (
     LEG3_EXEMPT_TABLE,
+    LEG3_READ_FAILED,
     REQUIRED_LEG3_OBJECTS,
     Leg3Result,
     _leg3_compare_census,
@@ -306,6 +312,96 @@ def test_leg3_schema_migration_passes_under_rebaseline(synth_dd):
 
     assert result.ok is True
     assert result.fingerprint != prev_fingerprint, "指纹应确实变了（否则没测到位）"
+
+
+# ---------------------------------------------------------------------------
+# READ_FAILED 哨兵双向 fail-closed（review 修复：-1 int 哨兵会毒化未来基线）
+# ---------------------------------------------------------------------------
+
+
+class _CountRaisingConnection:
+    """包一层真连接：对指定表的 `SELECT COUNT(*)` 抛 `sqlite3.DatabaseError`（真实
+    损坏的异常父类），其余查询原样代理。手法同 test_leg2 的 proxy。"""
+
+    def __init__(self, real_con, table: str):
+        self._real = real_con
+        self._table = table
+
+    def execute(self, sql, *args, **kwargs):
+        if f'"{self._table}"' in sql and "sqlite_master" not in sql:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return self._real.execute(sql, *args, **kwargs)
+
+
+@requires_cass
+def test_leg3_census_read_failure_fails_and_records_string_sentinel(synth_dd):
+    """(a) 非豁免、非必需清单表（tags）COUNT raise → 当晚 FAIL，census 里该表记
+    `"READ_FAILED"` 字符串哨兵——绝不是可比较的 int。"""
+    db = synth_dd / "agent_search.db"
+    con = sqlite3.connect(str(db))
+    proxy = _CountRaisingConnection(con, "tags")
+    try:
+        result = leg3(proxy, prev_census=None, prev_fingerprint=None)
+    finally:
+        con.close()
+
+    assert result.ok is False, "非豁免表读失败必须当晚 FAIL，即使是首晚登记模式"
+    assert "tags" in result.detail
+    assert result.census["tags"] == LEG3_READ_FAILED
+    assert not isinstance(result.census["tags"], int), "哨兵绝不能是可比较的 int"
+
+
+@requires_cass
+def test_leg3_poisoned_prev_read_failed_fails_loud_with_rebaseline_hint(synth_dd):
+    """(b) prev 侧含 READ_FAILED（上一晚哨兵 roundtrip 回来）→ FAIL 且报文提示
+    人工 rebaseline——毒基线必须响亮，绝不比较放行。"""
+    db = synth_dd / "agent_search.db"
+    prev_census, prev_fingerprint = _baseline(db)
+    prev_census["agents"] = LEG3_READ_FAILED
+
+    con = sqlite3.connect(str(db))
+    try:
+        result = leg3(con, prev_census=prev_census, prev_fingerprint=prev_fingerprint)
+    finally:
+        con.close()
+
+    assert result.ok is False
+    assert "agents" in result.detail
+    assert "rebaseline" in result.detail
+
+
+def test_compare_census_prev_read_failed_sentinel_fails():
+    """(b) 纯函数级：prev 含 READ_FAILED → FAIL + rebaseline 提示。"""
+    ok, detail = _leg3_compare_census({"agents": 5}, {"agents": LEG3_READ_FAILED})
+    assert ok is False
+    assert "agents" in detail
+    assert "rebaseline" in detail
+
+
+def test_compare_census_prev_negative_int_fails():
+    """(c) 回归钉死 reviewer 的实验：prev 含 -1 这类越界 int（旧版哨兵残留 / 手改
+    sidecar），`cur >= -1` 恒真的旧实现会放行整表清空——现在必须 FAIL（合法 COUNT
+    不可能为负，视同毒基线）。"""
+    ok, detail = _leg3_compare_census({"agents": 0}, {"agents": -1})
+    assert ok is False
+    assert "agents" in detail
+    assert "rebaseline" in detail
+
+
+def test_compare_census_cur_read_failed_sentinel_fails():
+    """cur 侧非 int（本晚 READ_FAILED）→ FAIL，无法比对（双向 fail-closed 的另一半）。"""
+    ok, detail = _leg3_compare_census({"agents": LEG3_READ_FAILED}, {"agents": 5})
+    assert ok is False
+    assert "agents" in detail
+
+
+def test_compare_census_exempt_table_skipped_both_sides_regardless_of_value():
+    """EXEMPT 表两侧都按名字跳过——即使两侧的值是任意哨兵 / 非法值。"""
+    ok, _detail = _leg3_compare_census(
+        {LEG3_EXEMPT_TABLE: LEG3_READ_FAILED, "agents": 3},
+        {LEG3_EXEMPT_TABLE: -1, "agents": 3},
+    )
+    assert ok is True
 
 
 # ---------------------------------------------------------------------------

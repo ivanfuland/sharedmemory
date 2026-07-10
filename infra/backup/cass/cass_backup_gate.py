@@ -200,6 +200,11 @@ REQUIRED_LEG3_OBJECTS: tuple[str, ...] = (
 # "EXEMPT"——行为确定性优先于「顺便多验一次」。
 LEG3_EXEMPT_TABLE = "fts_messages_config"
 
+# 非豁免表 COUNT 失败时 census 里记的哨兵。**必须是字符串**（与 "EXEMPT" 同类），
+# 绝不用可比较的 int：census 会整份 roundtrip 成下一晚的 prev，若哨兵是 -1 这类
+# int，`cur >= -1` 恒真——被毒化的基线会放行一切，包括整表清空。
+LEG3_READ_FAILED = "READ_FAILED"
+
 
 @dataclass
 class Leg3Result:
@@ -238,8 +243,9 @@ def _leg3_all_table_names(con) -> list[str]:
 def _leg3_census(con) -> tuple[dict[str, int | str], list[str]]:
     """part 2 的普查本体：对每张表跑 `COUNT(*)`。`LEG3_EXEMPT_TABLE` 无条件记
     `"EXEMPT"`，不尝试 COUNT。其余表若 COUNT 抛 `sqlite3.DatabaseError`（非豁免表
-    却读不动，超出 spec 已知范围）记 `-1` 并计入 `read_failures`，不裸 crash——与
-    腿 2 对损坏的受控处理同一套哲学。"""
+    却读不动，超出 spec 已知范围）记 `LEG3_READ_FAILED` 哨兵并计入
+    `read_failures`（当晚必 FAIL），不裸 crash——与腿 2 对损坏的受控处理同一套
+    哲学。哨兵是字符串不是 int，理由见 `LEG3_READ_FAILED` 处注释。"""
     census: dict[str, int | str] = {}
     read_failures: list[str] = []
     for name in _leg3_all_table_names(con):
@@ -249,7 +255,7 @@ def _leg3_census(con) -> tuple[dict[str, int | str], list[str]]:
         try:
             census[name] = con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
         except sqlite3.DatabaseError as exc:
-            census[name] = -1
+            census[name] = LEG3_READ_FAILED
             read_failures.append(f'"{name}"（{exc}）')
     return census, read_failures
 
@@ -258,18 +264,40 @@ def _leg3_compare_census(
     census: dict[str, int | str], prev_census: dict[str, int | str]
 ) -> tuple[bool, str]:
     """part 2 的比对：一律严格不减（`cur >= prev`），上次存在本次不得消失。
-    `LEG3_EXEMPT_TABLE` 按名字跳过（与存储的值无关）。新表（`prev_census` 里没有）
-    合法，不参与比较——只遍历 `prev_census` 的键。"""
+    `LEG3_EXEMPT_TABLE` 两侧都按名字跳过（与存储的值无关）。新表（`prev_census`
+    里没有）合法，不参与比较——只遍历 `prev_census` 的键。
+
+    **双向 fail-closed，哨兵值绝不参与大小比较**：
+
+    - prev 侧非 int、或负数 int（合法 COUNT 不可能为负）→ FAIL。基线已被毒化
+      （如上一晚的 `READ_FAILED` 哨兵 roundtrip 回来、或旧版 -1 哨兵残留），
+      必须响亮报「需人工 rebaseline」——绝不带着毒基线比较放行。
+    - cur 侧非 int（本晚 `READ_FAILED`）→ FAIL，无法比对。
+    """
+    poisoned = []
     problems = []
     for name, prev_value in prev_census.items():
         if name == LEG3_EXEMPT_TABLE:
+            continue
+        if not isinstance(prev_value, int) or prev_value < 0:
+            poisoned.append(f'"{name}"={prev_value!r}')
             continue
         if name not in census:
             problems.append(f'"{name}" 消失（上次存在，本次不存在）')
             continue
         cur_value = census[name]
+        if not isinstance(cur_value, int):
+            problems.append(f'"{name}" 本次读取失败（{cur_value!r}），无法比对')
+            continue
         if cur_value < prev_value:
             problems.append(f'"{name}" 行数减少：{prev_value} → {cur_value}')
+    if poisoned:
+        problems.insert(
+            0,
+            "基线含 READ_FAILED/非法值（"
+            + "; ".join(poisoned)
+            + "），需人工 rebaseline",
+        )
     if problems:
         return False, "全表普查 FAIL: " + "; ".join(problems)
     return True, "全表普查 PASS（严格不减，无表消失）"
@@ -287,7 +315,7 @@ def _leg3_fingerprint(con) -> str:
 
 def leg3(
     con,
-    prev_census: dict[str, int] | None,
+    prev_census: dict[str, int | str] | None,
     prev_fingerprint: str | None,
     rebaseline: bool = False,
 ) -> Leg3Result:
