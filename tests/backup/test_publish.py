@@ -519,6 +519,55 @@ def test_rebaseline_success_sends_tg_with_reason_and_baseline_name(
 
 
 @requires_cass
+def test_rebaseline_success_tg_default_env_path_reachable(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """回归钉死（review Important）：**不设** `CASS_BACKUP_TG_ENV` 时，脚本必须
+    source 的是脚本开头算好的默认路径 `$HOME/.claude/channels/telegram/.env`
+    ——这正是 §5.7 的主用例（人工 rebaseline 通常不会带这个 env）。修复前 TG
+    子 shell source 的是裸 `$CASS_BACKUP_TG_ENV`（空串 no-op）→ token/chat_id
+    展开为空 → curl 打 404 → 假 TG_ALERT，默认路径的审计消息永远送不出。上下
+    两个 TG 测试都显式传 env，遮蔽了这条回归线。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+
+    rc1, out1 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "rb3-baseline")
+    assert rc1 == 0, out1
+
+    _migrate_agents_schema_text(synth_dd / "agent_search.db")
+
+    # env 文件放在 tmp HOME 的**默认**路径（不传 CASS_BACKUP_TG_ENV）。
+    default_tg_env = tmp_home / ".claude" / "channels" / "telegram" / ".env"
+    default_tg_env.parent.mkdir(parents=True, exist_ok=True)
+    default_tg_env.write_text(
+        'TELEGRAM_BOT_TOKEN="fake-token"\nTELEGRAM_CHAT_ID="12345"\n', encoding="utf-8"
+    )
+    curl_calls = tmp_path / "curl_calls.log"
+    curl_stub_dir = tmp_path / "curl-stub-bin"
+    _write_curl_stub(curl_stub_dir, curl_calls)
+
+    reason = "default TG env path regression test"
+    rc2, out2 = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "rb3-migrated",
+        extra_env={
+            "CASS_BACKUP_REBASELINE": "cass-rb3-baseline",
+            "CASS_BACKUP_REBASELINE_REASON": reason,
+            # 故意不传 CASS_BACKUP_TG_ENV——走默认路径
+            "PATH": f"{curl_stub_dir}{os.pathsep}{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+        },
+    )
+    assert rc2 == 0, out2
+    assert (dest / "cass-rb3-migrated" / "COMPLETE").is_file(), out2
+
+    assert curl_calls.is_file(), f"默认路径的 TG env 必须可达（curl stub 必须被调用）: {out2}"
+    call_text = curl_calls.read_text(encoding="utf-8")
+    assert "fake-token" in call_text, "token 必须来自默认路径的 env 文件"
+    assert "cass-rb3-baseline" in call_text, call_text
+    assert reason in call_text, call_text
+
+
+@requires_cass
 def test_rebaseline_success_but_tg_env_missing_still_published_but_nonzero(
     tmp_home, run_backup, synth_dd, cass_stub, tmp_path
 ):

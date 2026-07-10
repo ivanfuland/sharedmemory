@@ -739,9 +739,10 @@ TRAP_INCOMPLETE=""   # 发布成功，trap 不再碰它
 # ---------------------------------------------------------------------------
 # rebaseline / retention_reset 成功 TG（DEV-2/DEV-3，spec §5.7「rebaseline 的
 # 运行即使成功也发 TG」）：这两个都是人工审计事件——脚本自身 curl
-# `$CASS_BACKUP_TG_ENV` 的 token/chat_id（source 进子 shell，仓内零密钥）。
-# env 文件缺失或 curl 失败 ⇒ 备份已发布、不回滚，但必须 exit 非零提醒人工去
-# 查（这条消息没有自动重投机制，漏发等于没人知道）。
+# `$TG_ENV`（step 1 前算好的默认值：`CASS_BACKUP_TG_ENV` 或
+# `$HOME/.claude/channels/telegram/.env`）的 token/chat_id（source 进子 shell，
+# 仓内零密钥）。env 文件缺失或 curl 失败 ⇒ 备份已发布、不回滚，但必须 exit
+# 非零提醒人工去查（这条消息没有自动重投机制，漏发等于没人知道）。
 # ---------------------------------------------------------------------------
 TG_ALERT=0
 TG_TEXT="$(DIGEST_PATH="$PUBLISHED_DIR/digest.json" "$VENV_PY" 8>&- - <<'PYEOF'
@@ -765,7 +766,7 @@ PYEOF
 )"
 
 if [ -n "$TG_TEXT" ]; then
-  if ! ( set +u; source "$CASS_BACKUP_TG_ENV" 2>/dev/null; curl -sf -m 10 \
+  if ! ( set +u; source "$TG_ENV" 2>/dev/null; curl -sf -m 10 \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TG_TEXT" >/dev/null ) 9>&- 8>&-
   then
