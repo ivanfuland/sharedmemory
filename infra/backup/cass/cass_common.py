@@ -76,26 +76,37 @@ def read_digest(backup_dir) -> dict | None:
 
 def _iter_published(dest) -> list[tuple[int, str, dict]]:
     """扫 `dest` 下含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json，返回
-    `(generation, 目录名, digest dict)` 列表（未排序）。不看 mtime；读不到
-    digest/generation 的目录（无 digest.json / 坏 JSON / 缺键 / 目录本身不可读，
-    如轮转失败留下的 `chmod 000` 半成品）一律跳过，既不参与 `latest_published`
-    的 tip 判定，也不参与 `rotation_victims` 的轮转。`is_dir()`/`COMPLETE`
-    存在性探针与 digest 读取包在同一个 try 里——Python 3.12 起 `Path.exists()`
-    不再吞 `PermissionError`（只吞 `FileNotFoundError`/`NotADirectoryError`），
-    单条目不可读不该让整个扫描崩掉。`latest_published`/`rotation_victims`
-    共用这份扫描逻辑（同族）。"""
+    `(generation, 目录名, digest dict)` 列表（未排序）。不看 mtime。
+    `latest_published`/`rotation_victims` 共用这份扫描逻辑（同族），两个消费者
+    的失败语义分两层，不可混：
+
+    - **目录探测层（is_dir / COMPLETE 存在性）刻意不包 try**：OS 级错误（如
+      `chmod 000` 导致的 `PermissionError`，Python 3.12 起 `Path.exists()` 不再
+      吞它）**照常上抛 = 响亮失败**。`latest_published` 是基线/链 tip 解析——
+      DEST 子目录整体权限坏属于完整性事件，若静默跳过会把它变成「首晚模式」
+      （无前驱），绕过 generation 链比对发布假绿；上抛则五腿门 CLI 当场崩、
+      备份当晚 FATAL，人必须来看。
+    - **digest 内容层的 skip 语义**（spec「读不到 `generation` 的目录不参与
+      轮转也不被删」的本意）只覆盖：无 digest.json / digest.json 读失败 /
+      坏 JSON / 缺 `generation` 键 / `generation` 非 int——这类目录既不参与
+      `latest_published` 的 tip 判定，也不参与 `rotation_victims` 的轮转。"""
     dest = pathlib.Path(dest)
     out: list[tuple[int, str, dict]] = []
     for entry in sorted(dest.glob("cass-*")):
+        if not entry.is_dir():
+            continue
+        if not (entry / "COMPLETE").exists():
+            continue
         try:
-            if not entry.is_dir():
-                continue
-            if not (entry / "COMPLETE").exists():
-                continue
             digest = read_digest(entry)
         except (OSError, json.JSONDecodeError):
             continue
         if not digest or "generation" not in digest:
+            continue
+        if type(digest["generation"]) is not int:
+            # 脏数据（如手编 digest 把 generation 写成字符串 "7"）归入「读不到
+            # generation」的 skip 语义——不 crash（下游 sorted/max 混型比较会
+            # TypeError），也绝不据此删目录。type() 精确匹配顺带排除 bool。
             continue
         out.append((digest["generation"], entry.name, digest))
     return out
@@ -116,8 +127,10 @@ def rotation_victims(dest, keep: int) -> list[str]:
     """keep-N 轮转选点（spec §6 step 16/17、§7、§11）：在 `dest` 下扫含 `COMPLETE`
     的 `cass-*/` 目录，按各自 digest.json 的 `generation` 升序排序，返回超出
     `keep` 个之后、最旧的那些目录名（待删）。不看 mtime——`touch`/`cp -a`/restore
-    演练都会改写它。读不到 `generation` 的目录（无 digest.json / 坏 JSON / 缺键）
-    不参与排序也不出现在返回值里（`_iter_published` 已经把它们筛掉）。候选总数
+    演练都会改写它。读不到 `generation` 的目录（无 digest.json / 坏 JSON / 缺键 /
+    非 int）不参与排序也不出现在返回值里（`_iter_published` 已经把它们筛掉）；
+    目录探测层的 OS 级错误照常上抛（见 `_iter_published` 的两层语义），调用方
+    （backup-cass.sh 的选点段）以 rc 非零接住并置 `ROTATE_FAIL`。候选总数
     未超过 `keep` 时返回空列表。"""
     published = sorted(_iter_published(dest), key=lambda t: t[0])
     if len(published) <= keep:

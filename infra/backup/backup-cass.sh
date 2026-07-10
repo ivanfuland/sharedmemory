@@ -780,16 +780,26 @@ fi
 # step 16 — keep-N 轮转（spec §6 step 16 / §7 / §11 逐字）：只匹配含 `COMPLETE`
 # 的 `cass-*/` 目录，按各自 digest.json 的 `generation` 升序删除最旧的若干个，
 # 只留 KEEP 个。不按 mtime（`touch`/`cp -a`/restore 演练都会改写它）。读不到
-# `generation` 的目录（无 digest.json / 坏 JSON / 缺键）不参与轮转也不被删。
-# 选点逻辑全部委托给 `cass_common.rotation_victims`（`$VENV_PY` 胶水，不裸
-# grep/sed 解析 JSON）——它只扫 `cass-*` 前缀且含 `COMPLETE` 的目录，`SUSPECT-*`/
-# `INCOMPLETE-*`/`RECOVERABLE-*`/`raw-mirror/`/`sessions/`/`sessions.state.tsv`/
-# 既有 `agent_search.db.pre-franken-*`/无 `COMPLETE` 的 `cass-*/` 天然不在候选
-# 集里，无需额外排除逻辑。禁裸 glob for 循环——victim 列表读进 bash 数组
-# （nullglob 已开，数组展开安全），删除动作仍在 shell 里逐个做。
+# `generation` 的目录（无 digest.json / 坏 JSON / 缺键 / 非 int）不参与轮转也
+# 不被删。选点逻辑全部委托给 `cass_common.rotation_victims`（`$VENV_PY` 胶水，
+# 不裸 grep/sed 解析 JSON）——它只扫 `cass-*` 前缀且含 `COMPLETE` 的目录，
+# `SUSPECT-*`/`INCOMPLETE-*`/`RECOVERABLE-*`/`raw-mirror/`/`sessions/`/
+# `sessions.state.tsv`/既有 `agent_search.db.pre-franken-*`/无 `COMPLETE` 的
+# `cass-*/` 天然不在候选集里，无需额外排除逻辑。禁裸 glob for 循环——victim
+# 列表读进 bash 数组（nullglob 已开，数组展开安全），删除动作仍在 shell 里
+# 逐个做。
+#
+# 选点两段式（不用 `mapfile < <(...)`——进程替换会吞掉 python 的 exit code）：
+# 先落 `$STG/rotate.victims` 并检查 rc；python 崩溃（如 DEST 某 cass-*/ 目录
+# OS 级不可读——`_iter_published` 的目录探测层刻意上抛，见其两层语义注释）→
+# ROTATE_FAIL=1、本轮一个都不删——与脚本内其他 heredoc 的 rc 纪律一致。备份
+# 本身已发布，不回滚。（注：该 rc 分支目前没有可从进程外构造的 e2e 触发器——
+# 同一目录不可读会先让 step 9 五腿门的 latest_published 崩掉、当晚根本走不到
+# 这里，见 test_rotation.py 的说明；分支正确性由构型一致性 + 单测覆盖。）
 # ---------------------------------------------------------------------------
 ROTATE_FAIL=0
-mapfile -t ROTATE_VICTIMS < <(LIB="$LIB" DEST="$DEST" KEEP="$KEEP" "$VENV_PY" 8>&- - <<'PYEOF'
+ROTATE_VICTIMS=()
+if ! LIB="$LIB" DEST="$DEST" KEEP="$KEEP" "$VENV_PY" 8>&- - > "$STG/rotate.victims" <<'PYEOF'
 import os
 import pathlib
 import sys
@@ -800,7 +810,12 @@ import cass_common  # noqa: E402
 for name in cass_common.rotation_victims(pathlib.Path(os.environ["DEST"]), int(os.environ["KEEP"])):
     print(name)
 PYEOF
-)
+then
+  echo "[backup] WARN: rotation victim selection failed — skipping rotation this run" >&2
+  ROTATE_FAIL=1
+else
+  mapfile -t ROTATE_VICTIMS < "$STG/rotate.victims"
+fi
 for victim in "${ROTATE_VICTIMS[@]}"; do
   [ -n "$victim" ] || continue
   if rm -rf "$DEST/$victim"; then

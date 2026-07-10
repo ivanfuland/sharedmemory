@@ -12,11 +12,25 @@
     generation 被删（轮转排序不看 mtime）。
   - 读不到 generation 的 `cass-*/`（含 `COMPLETE` 但 `digest.json` 是坏 JSON）
     → 不参与轮转也不被删。
-  - 轮转失败路径：`chmod 000` 某个待删目录 → 备份 exit 非零，但新发布的
+  - 轮转失败路径：`chmod 0o555` 某个待删目录 → 备份 exit 非零，但新发布的
     `cass-*/` 已完好（`ROTATE_FAIL` 构型，同 `backup-gbrain.sh`）。
   - 发布失败的晚上轮转不执行：用既有 `CASS_BACKUP_FAULT` 故障注入
     （`kill-after-db-backup`，在 step 15 发布之前就终止）验证轮转代码段
     根本没跑到——`DEST` 的 `cass-*/` 计数与名字逐一原封不动。
+
+外加 `_iter_published` 两层失败语义的钉子（codex review Task 14 修正轮）：
+
+  - 目录探测层 loud：某 `cass-*/` 整体 `chmod 000` → `latest_published` 上抛
+    `PermissionError`（单测）；其消费方五腿门 CLI exit 非零而非「首晚模式」
+    假绿（e2e）。
+  - digest 内容层 skip：`generation` 非 int（脏数据）→ 不参与轮转、不被删、
+    不计入 keep 名额、也不让 `latest_published` 崩（单测）。
+  - bash 侧「选点 python 崩 → ROTATE_FAIL」的 rc 分支**没有可从进程外构造的
+    e2e 触发器**：能让选点崩的构造（目录 OS 级不可读）会先让 step 9 五腿门的
+    `latest_published` 崩掉，当晚发布失败、根本走不到轮转段（正是上面 e2e 钉
+    住的 loud 路径）；脏 generation 又落在 skip 语义内不会崩。该分支的正确性
+    由「与脚本内其他 heredoc 相同的 rc 检查构型」+ 上述单测推理覆盖，
+    诚实登记于 task-14-report.md。
 
 只有当前「链 tip」需要真实自洽的内容（`census.tsv` + `schema_fingerprint` /
 `tables` / `meta_watermarks`）——本文件跑的那一晚真实 `backup-cass.sh` 会经
@@ -348,10 +362,12 @@ def test_rotation_delete_failure_is_loud_but_backup_stays_published(
     _publish_real_tip(dest, "cass-rf-7", db, generation=7, scratch_dir=scratch)
 
     # 0o555（r-x，无 w）而非 0o000：轮转选点仍需先*读到*这个目录的 generation
-    # 才能正确把它选进待删名单——0o000 会让 digest.json 读取本身失败，那样它会
-    # 被 `cass_common._iter_published` 当成「读不到 generation」直接跳过（既不
-    # 参与也不被删），根本走不到 `rm -rf` 这一步。0o555 允许读、只挡写，精确
-    # 复现「选中了、但删不掉」这一条 `ROTATE_FAIL` 路径。
+    # 才能正确把它选进待删名单——0o000 会让目录探测（`COMPLETE` stat）直接
+    # `PermissionError` 上抛，step 9 五腿门的 `latest_published` 当场崩、当晚
+    # 发布失败，根本走不到轮转段（那条 loud 路径由
+    # `test_unreadable_cass_dir_makes_gate_cli_loud_not_first_night` 钉住）。
+    # 0o555 允许读、只挡写，精确复现「选中了、但删不掉」这一条 `ROTATE_FAIL`
+    # 删除失败路径。
     gen1.chmod(0o555)
     try:
         rc, out = _run(
@@ -407,3 +423,74 @@ def test_rotation_does_not_run_when_publish_fails(
         "发布失败时轮转代码段不应执行，DEST 的 cass-*/ 计数与名字必须逐一原封不动："
         f"before={before} after={after}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _iter_published 两层失败语义的钉子（codex review Task 14 修正轮）
+# ---------------------------------------------------------------------------
+
+
+def test_latest_published_raises_on_unreadable_cass_dir_unit(tmp_path):
+    """目录探测层 loud（单测）：某 `cass-*/` 整体 `chmod 000` → `latest_published`
+    必须上抛 `PermissionError`，不得静默跳过——静默跳过会把「DEST 子目录权限坏」
+    变成「首晚模式」（无前驱），绕过 generation 链比对。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    locked = _make_fake_published(dest, "cass-locked", generation=1)
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            cass_common.latest_published(dest)
+        with pytest.raises(PermissionError):
+            cass_common.rotation_victims(dest, 7)
+    finally:
+        locked.chmod(0o700)
+
+
+@requires_cass
+def test_unreadable_cass_dir_makes_gate_cli_loud_not_first_night(synth_dd, tmp_path):
+    """目录探测层 loud（消费方 e2e）：`latest_published` 的基线解析消费方——五腿门
+    CLI——遇到整体不可读的 `cass-*/` 必须 exit 非零（崩在基线解析），**而不是**
+    把它当「首晚/无前驱」跑 first-backup 模式全腿 PASS、exit 0 发布假绿。
+    （放宽版扫描（把探测层包进 except）在本场景下正是后者——reviewer 实测证伪，
+    本测试钉死回退。）"""
+    db = synth_dd / "agent_search.db"
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    locked = _make_fake_published(dest, "cass-locked", generation=1)
+    locked.chmod(0o000)
+    try:
+        rc, out, err = _run_gate_cli(
+            db, dest, tmp_path / "census.tsv", tmp_path / "gate.json"
+        )
+    finally:
+        locked.chmod(0o700)
+
+    assert rc != 0, f"必须响亮失败而非首晚假绿：stdout={out}\nstderr={err}"
+    assert "PermissionError" in err or "Permission denied" in err, (
+        f"失败原因必须是权限（loud 路径），不是别的环境错：stderr={err}"
+    )
+
+
+def test_rotation_victims_skips_non_int_generation_unit(tmp_path):
+    """digest 内容层 skip（单测）：`generation` 非 int（脏数据，如手编 digest 把
+    数字写成字符串）归入「读不到 generation」语义——不参与轮转、不被删、不计入
+    keep 名额，也不让共享扫描在 sorted/max 的混型比较上 TypeError 崩掉。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    for g in range(1, 4):
+        _make_fake_published(dest, f"cass-g{g}", generation=g)
+    dirty = dest / "cass-dirty"
+    dirty.mkdir()
+    (dirty / "COMPLETE").touch()
+    dirty_digest_bytes = cass_common.dumps_canonical({"generation": "2"})
+    (dirty / "digest.json").write_bytes(dirty_digest_bytes)
+
+    victims = cass_common.rotation_victims(dest, 2)
+    assert victims == ["cass-g1"], (
+        f"3 个合法候选、keep=2 → 只删 generation 1；脏 generation 不计入名额也不被选: {victims}"
+    )
+
+    tip = cass_common.latest_published(dest)
+    assert tip is not None and tip[0] == "cass-g3", f"脏 generation 不得干扰 tip 判定: {tip}"
+    assert (dirty / "digest.json").read_bytes() == dirty_digest_bytes, "脏目录原封不动"
