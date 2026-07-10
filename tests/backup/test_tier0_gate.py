@@ -187,7 +187,7 @@ def test_missing_blob_file_triggers_stat_fail(tmp_home, synth_dd, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 普查自身 fail-loud：坏 JSON / 缺 blob_blake3 / 假 hex，各一例
+# 普查自身 fail-loud：坏 JSON / 缺 blob_blake3 / 假 hex / 尾随换行 hex，各一例
 # ---------------------------------------------------------------------------
 
 
@@ -209,6 +209,17 @@ def test_missing_blob_file_triggers_stat_fail(tmp_home, synth_dd, tmp_path):
             "blob_blake3 缺失或不匹配",
             id="fake-hex",
         ),
+        pytest.param(
+            # 64 合法 hex + 尾随 \n（65 字节）：Python 的 `$` 匹配 trailing newline
+            # **之前**，`.match()` + `^...$` 会过匹配放行，错位报成「blob 文件缺失」
+            # 而 stdout 的 `unparseable=0` 误导取证——必须 `.fullmatch()` 才进
+            # unparseable 桶（review Important #1 回归夹具）。
+            lambda p: p.write_text(
+                json.dumps({"blob_blake3": "a" * 64 + "\n"}), encoding="utf-8"
+            ),
+            "blob_blake3 缺失或不匹配",
+            id="trailing-newline-hex",
+        ),
     ],
 )
 def test_unparseable_manifest_variants_fail_loud(
@@ -227,6 +238,9 @@ def test_unparseable_manifest_variants_fail_loud(
     assert rc == 1, f"stdout={out}\nstderr={err}"
     assert "unparseable=1" in out
     assert expected_substr in out
+    # 失败原因必须指认 unparseable，不得错位成下游的 blob 存在性检查（坏记录贡献
+    # 0 个引用，未损坏 manifest 引用的真 blob 仍在盘上）：
+    assert "blob 文件缺失" not in out
 
 
 # ---------------------------------------------------------------------------

@@ -77,7 +77,11 @@ def parse_manifests(manifests_dir: pathlib.Path) -> list[ManifestRecord]:
             continue
 
         blob_blake3 = raw.get("blob_blake3") if isinstance(raw, dict) else None
-        if not isinstance(blob_blake3, str) or not _BLAKE3_HEX_RE.match(blob_blake3):
+        # `.fullmatch()` 而非 `.match()`：Python 的 `$` 会匹配到 trailing newline
+        # **之前**，`.match()` + `^...$` 对「64 hex + 尾随 \n」过匹配——65 字节的
+        # 坏 hash 会溜过 unparseable 桶，错位报成下游的「blob 文件缺失」且 stdout
+        # 的 `unparseable=0` 误导取证（review 修复）。
+        if not isinstance(blob_blake3, str) or not _BLAKE3_HEX_RE.fullmatch(blob_blake3):
             records.append(
                 ManifestRecord(
                     path, False, None, raw if isinstance(raw, dict) else None,
@@ -114,9 +118,7 @@ def census_manifests(manifests_dir: pathlib.Path) -> tuple[CensusResult, list[Ma
     ok_records = [r for r in records if r.ok]
     bad_records = [r for r in records if not r.ok]
 
-    seen: dict[str, int] = {}
-    for r in ok_records:
-        seen[r.blob_blake3] = seen.get(r.blob_blake3, 0) + 1
+    seen: set[str] = {r.blob_blake3 for r in ok_records}
     unique_blobs = len(seen)
     duplicate_refs = len(ok_records) - unique_blobs
 
