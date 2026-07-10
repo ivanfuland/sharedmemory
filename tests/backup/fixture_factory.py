@@ -42,6 +42,11 @@ def _iso_ts(offset_seconds: int) -> str:
     return ts.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _epoch_ms(offset_seconds: int) -> int:
+    ts = _BASE_TS + datetime.timedelta(seconds=offset_seconds)
+    return int(ts.timestamp() * 1000)
+
+
 def _run_cass(args: list[str], home: pathlib.Path, timeout: int = 180) -> subprocess.CompletedProcess:
     """subprocess env 白名单只给 {PATH, HOME}——不让宿主的其它 env（XDG_DATA_HOME 等）
     渗进隔离 HOME 的语义。"""
@@ -88,7 +93,10 @@ def make_session_jsonl(path: pathlib.Path, n_msgs: int = 6, salt: str = "") -> p
 def build_data_dir(home: pathlib.Path) -> pathlib.Path:
     """隔离 HOME 下用真 `cass index` 自建完整 data_dir（真 schema 23 表 + raw-mirror
     manifests/blobs + 水位），再 INSERT 补齐 spec §5.5(a) 必需水位键中 cass 未产出的
-    连接器水位 + `last_embedded_message_id`。"""
+    连接器水位 + `last_embedded_message_id`；补一条 `sources` 行（腿 3 §5.4 part 2 的
+    「2→1 丢一半」测试需要 ≥2 行，真 cass 只自动登记 1 条本机 source）；补一张
+    legacy `fts_messages` FTS5 表（生产库带着它，腿 3 §5.4 part 1 必需清单硬编码
+    含它，合成库须对齐形态）。"""
     proj_dir = home / ".claude" / "projects" / "synthproj"
     make_session_jsonl(proj_dir / "session1.jsonl", n_msgs=6, salt="factory")
 
@@ -115,6 +123,13 @@ def build_data_dir(home: pathlib.Path) -> pathlib.Path:
         con.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_embedded_message_id', '0')"
         )
+        con.execute(
+            "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json,"
+            " created_at, updated_at) VALUES (?, 'synthetic', 'synth-host', 'synth-machine',"
+            " 'synthetic', NULL, ?, ?)",
+            ("synth-second-source", _epoch_ms(0), _epoch_ms(0)),
+        )
+        con.execute("CREATE VIRTUAL TABLE fts_messages USING fts5(content)")
         con.commit()
     finally:
         con.close()

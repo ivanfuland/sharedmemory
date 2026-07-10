@@ -99,7 +99,14 @@ def test_build_data_dir_produces_full_schema_raw_mirror_and_watermarks(tmp_path)
         table_count = con.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
         ).fetchone()[0]
-        assert table_count == 23, f"真 cass schema 应有 23 张表，实测 {table_count}"
+        # 真 cass schema 23 张 + build_data_dir 补造的 legacy fts_messages FTS5 表
+        # 及其 5 张 shadow 表（fts_messages_config/_content/_data/_docsize/_idx）= 29。
+        assert table_count == 29, f"真 cass schema + 合成 FTS5 表应有 29 张表，实测 {table_count}"
+
+        sources_count = con.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        assert sources_count == 2, (
+            f"腿 3 §5.4 part 2「2→1 丢一半」测试需要 sources ≥ 2 行，实测 {sources_count}"
+        )
 
         keys = {row[0] for row in con.execute("SELECT key FROM meta")}
         missing = [k for k in fixture_factory.REQUIRED_META_KEYS if k not in keys]
