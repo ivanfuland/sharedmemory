@@ -260,17 +260,17 @@ def test_v13_first_backup_manifest_snapshot_immutable_after_source_mutation(
     assert rc1 == 0, out1
 
     target_name = sorted(manifests_dir.glob("*.json"))[0].name
-    first_snapshot = (dest / ".incomplete-v13-first" / "manifests" / target_name).read_bytes()
+    first_snapshot = (dest / "cass-v13-first" / "manifests" / target_name).read_bytes()
 
     _mutate_manifest_db_links(manifests_dir / target_name)
 
     rc2, out2 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v13-second")
     assert rc2 == 0, out2
 
-    assert (dest / ".incomplete-v13-first" / "manifests" / target_name).read_bytes() == (
+    assert (dest / "cass-v13-first" / "manifests" / target_name).read_bytes() == (
         first_snapshot
     ), "第一份备份目录里的 manifest 内容必须原封不动（历史恢复点不可变）"
-    second_snapshot = (dest / ".incomplete-v13-second" / "manifests" / target_name).read_bytes()
+    second_snapshot = (dest / "cass-v13-second" / "manifests" / target_name).read_bytes()
     assert second_snapshot != first_snapshot, "第二份应反映源端的合法改写"
 
 
@@ -278,7 +278,7 @@ def test_v13_first_backup_manifest_snapshot_immutable_after_source_mutation(
 def test_v13a_sha256sum_dash_c_passes_and_catches_same_size_mtime_tamper(
     tmp_home, run_backup, synth_dd, cass_stub, tmp_path
 ):
-    """`sha256sum -c manifests.sha256sum` 在 `.incomplete-*/` 内对健康快照全过；
+    """`sha256sum -c manifests.sha256sum` 在已发布的 `cass-*/` 内对健康快照全过；
     把某 manifest 篡改成同 size 同 mtime、不同内容 → 会被检出。对照演示：同一份
     篡改若走 `rsync -a`（quick-check 只看 size+mtime）会被当「没变」而跳过——
     这正是 manifests 用 `cp -a` 而非 `rsync -a` 的理由（R3-P2）。"""
@@ -290,7 +290,7 @@ def test_v13a_sha256sum_dash_c_passes_and_catches_same_size_mtime_tamper(
     rc, out = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, stamp)
     assert rc == 0, out
 
-    incomplete = dest / f".incomplete-{stamp}"
+    incomplete = dest / f"cass-{stamp}"
     good = subprocess.run(
         ["sha256sum", "-c", "manifests.sha256sum"],
         cwd=incomplete, capture_output=True, text=True, timeout=30,

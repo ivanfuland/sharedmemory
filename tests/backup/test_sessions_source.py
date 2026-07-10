@@ -759,11 +759,18 @@ def test_v12b_e2e_prefix_rewrite_blocks_publish_no_complete(
     cass_common.state_write_atomic(dest / "sessions.state.tsv", [_rec("alpha/s.jsonl", good)])
     session_file.write_bytes(b"bad11\nbad22\nbad33\nbad44\n")  # 截断后长回不同内容
 
+    # v12b-first 在 Task 13 之后是真发布（cass-v12b-first/COMPLETE 合法存在）——
+    # 用「本轮之前已存在的 cass-*/ 快照」而不是全局 rglob 来断言「本轮没有新增
+    # 任何发布」，同 v12a 的写法（同文件上方）。
+    cass_before = sorted(p.name for p in dest.glob("cass-*"))
     rc2, out2 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v12b-second", session_roots)
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-v12b-second").is_dir(), out2
-    assert not list(dest.rglob("COMPLETE")), out2
+    assert not (dest / ".incomplete-v12b-second").exists(), out2
+    assert sorted(p.name for p in dest.glob("cass-*")) == cass_before, (
+        f"不能发布出任何新的 cass-*/: {out2}"
+    )
     assert (dest / "sessions" / "alpha" / "s.jsonl").read_bytes() == good, (
         "--append + exclude 双保险：NAS 前缀必须原封不动"
     )

@@ -189,6 +189,11 @@ timeout "$DOCTOR_TIMEOUT" cass doctor --json --data-dir "$CASS_DATA_DIR" > "$STG
 #   → exit 1 —— 这一判据由紧随其后的 cass_manifest_census.py 一并做出，见下方调用）
 timeout "$DB_TIMEOUT" sqlite3 "$CASS_DATA_DIR/agent_search.db" ".backup '$STG/db'" 9>&- 8>&- \
   || { echo "[backup] FATAL: .backup failed/timeout"; exit 1; }
+# DEV-7 故障注入：`.backup` 刚完成、`.incomplete-$STAMP` 尚未创建——此刻 NAS 上
+# 还没有任何本轮产物，验证「崩在这里 = NAS 零产物」（V7 两个注入点之一）。
+if [ "$FAULT" = "kill-after-db-backup" ]; then
+  kill -9 $$
+fi
 cp -a "$CASS_DATA_DIR/raw-mirror/v1/manifests" "$STG/manifests" 9>&- 8>&-
 # Tier 0 门收尾【仍在锁内，codex R2-P1】：独立普查与 doctor 必须看同一个锁内状态（spec
 # §5.6），且普查的 blob stat 打的是源端 —— 锁内跑（~1-2 s，doctor 5.4 min 面前可忽略）：
@@ -223,9 +228,59 @@ if [ "$GATE_RC" -eq 1 ]; then
   cp -a "$STG/db" "$SUSPECT_DIR/db"
   cp -a "$STG/census.tsv" "$SUSPECT_DIR/census.tsv"
   cp -a "$STG/gate.json" "$SUSPECT_DIR/gate.json"
-  # digest.json 版取证（完整 sidecar：backup_name/generation/prev_* 等，供人 diff 新旧
-  # sidecar 判断这是迁移还是事故，spec §5.7 原文）是 Task 13 的升级点；本 task 先落
-  # db + census.tsv + gate.json（进度 ledger 已记「Task 13 待办注入」）。无 COMPLETE 不入链。
+  # digest.json 版取证（Task 13 升级点，spec §5.7「人可以直接 diff 新旧 sidecar
+  # 判断这是迁移还是事故」）：五腿门失败发生在 step 10+ 之前，sessions.tsv 与
+  # manifests.sha256sum 这两个字段的源文件此刻根本不存在——用「当晚可得字段」
+  # 组装，缺的两个 sha 字段留空串，其余字段（含 rebaseline 留痕）照常算。
+  # 最佳努力：这份 digest.json 是取证辅助，不是发布契约的一部分（无 COMPLETE
+  # 不入链），写失败不应该掩盖下面真正的 FATAL 消息与 exit 1。
+  LIB="$LIB" DEST="$DEST" STG="$STG" SUSPECT_DIR="$SUSPECT_DIR" STAMP="$STAMP" \
+    "$VENV_PY" 8>&- - <<'PYEOF' || true
+import json
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["LIB"])
+import cass_common  # noqa: E402
+
+dest = pathlib.Path(os.environ["DEST"])
+stg = pathlib.Path(os.environ["STG"])
+suspect_dir = pathlib.Path(os.environ["SUSPECT_DIR"])
+stamp = os.environ["STAMP"]
+
+gate = json.loads((stg / "gate.json").read_bytes())
+
+prev = cass_common.latest_published(dest)
+if prev is None:
+    generation = 1
+    prev_backup_name = ""
+    prev_sidecar_sha256 = ""
+else:
+    prev_name, prev_digest = prev
+    generation = prev_digest["generation"] + 1
+    prev_backup_name = prev_name
+    prev_sidecar_sha256 = cass_common.sha256_file(dest / prev_name / "digest.json")
+
+digest: dict = {
+    "backup_name": f"SUSPECT-{stamp}",
+    "generation": generation,
+    "prev_backup_name": prev_backup_name,
+    "prev_sidecar_sha256": prev_sidecar_sha256,
+    "db_sha256": cass_common.sha256_file(stg / "db"),
+    "census_sha256": gate["census_sha256"],
+    "sessions_tsv_sha256": "",
+    "manifests_sha256sum_sha256": "",
+    "schema_fingerprint": gate["schema_fingerprint"],
+    "tables": gate["tables"],
+    "meta_watermarks": gate["meta_watermarks"],
+}
+if "rebaselined_from" in gate:
+    digest["rebaselined_from"] = gate["rebaselined_from"]
+    digest["reason"] = gate["reason"]
+
+(suspect_dir / "digest.json").write_bytes(cass_common.dumps_canonical(digest))
+PYEOF
   echo "[backup] FATAL: five-leg gate failed — forensics landed at $SUSPECT_DIR"
   exit 1
 elif [ "$GATE_RC" -ne 0 ]; then
@@ -264,6 +319,12 @@ mkdir "$INCOMPLETE_DIR"
 TRAP_INCOMPLETE="$INCOMPLETE_DIR"
 
 cp -a "$STG/db" "$INCOMPLETE_DIR/db"
+# DEV-7 故障注入：db 刚拷进 `.incomplete-$STAMP`、其余产物（db.sha256/census.tsv/
+# manifests/manifests.sha256sum）还没落地——下一轮跑时该目录 mtime 未满 1 天不清、
+# `touch -d '2 days ago'` 老化后按「无 COMPLETE 半成品」被清掉（V7 两个注入点之一）。
+if [ "$FAULT" = "kill-after-incomplete-db-copy" ]; then
+  kill -9 $$
+fi
 (cd "$STG" && sha256sum db > db.sha256) 8>&-
 LOCAL_SHA="$(cut -d' ' -f1 <"$STG/db.sha256")"
 cp -a "$STG/db.sha256" "$INCOMPLETE_DIR/db.sha256"
@@ -284,6 +345,15 @@ case "$FAULT" in
     ;;
   unlink-nas-db-before-readback)
     rm -f "$INCOMPLETE_DIR/db"
+    ;;
+  corrupt-manifest-after-snapshot)
+    # Task 10 carry-forward（14a e2e）：manifests 快照刚落 NAS，翻转第一个 manifest
+    # 文件一个字节——`manifests.sha256sum` 是在同一时刻用未被破坏的字节算出来的，
+    # 故 step 14a 的完整性门必须能抓到这处调包（14a FAIL e2e 路径，此前一直不可达）。
+    first_manifest="$(find "$INCOMPLETE_DIR/manifests" -maxdepth 1 -type f | sort | head -n1)"
+    if [ -n "$first_manifest" ]; then
+      printf '\xFF' | dd of="$first_manifest" bs=1 count=1 seek=0 conv=notrunc status=none 8>&-
+    fi
     ;;
   *)
     : # 无操作——生产默认（空值）与尚未消费的未来枚举值（Task 12/13 复用并扩充）
@@ -535,16 +605,187 @@ if [ "$SESSIONS_FAIL" = 1 ]; then
   fail_incomplete "session source-check failed"
 fi
 
+# DEV-7 故障注入：sessions.tsv（13g）与 manifests.sha256sum（10）都已落地、
+# digest.json 还没写——验证「顺序契约」（spec §6 step 14c）：崩在这里必须留下
+# 一个没有 digest.json 也没有 COMPLETE 的 `.incomplete-$STAMP/`（V15e）。
+if [ "$FAULT" = "kill-before-digest" ]; then
+  kill -9 $$
+fi
+
 # ---------------------------------------------------------------------------
-# 临时出口（Task 12-13 落地前）：digest.json / COMPLETE 发布 / keep-N 轮转 /
-# 周校验尚未实现，`.incomplete-$STAMP/` 有意留在 DEST 上（供后续 task 与测试
-# 检视本 task 的产出）——故必须先清空 TRAP_INCOMPLETE，否则 EXIT trap 会把这次
-# 成功跑出来的东西当半成品删掉（同 fail_incomplete 的清空时机原则）。
+# step 14c — 组装 digest.json（spec §6 step 14c / plan「关键接口」字段全集）。
+#
+# backup_name/generation/prev_backup_name/prev_sidecar_sha256 由本轮 STAMP +
+# `cass_common.latest_published(DEST)` 推导（首晚 prev 全部记空串、generation=1）；
+# db_sha256/census_sha256/schema_fingerprint/tables/meta_watermarks 复用 step
+# 7-9 已经算出的产物（`$STG/gate.json` 与 step 10 的 `$LOCAL_SHA`），不重算；
+# sessions_tsv_sha256/manifests_sha256sum_sha256 现算（两个源文件此刻已落
+# `$INCOMPLETE_DIR`）。人工通道留痕：rebaseline 直接抄 `gate.json` 里已有的
+# `rebaselined_from`/`reason`（`cass_backup_gate.py` 写的，键名同构，spec
+# §5.7/§8.3-C2 原文，链校验按它判）；adopt/quarantine/retention_reset 从本轮
+# env 读（成对性已在 step 1 校验过，这里只管有没有实际触发）。
+#
+# **顺序契约**：必须在 `sessions.tsv`（13g）与 `manifests.sha256sum`（10）之后、
+# `COMPLETE`（step 15）之前落盘——本段落点正是那个位置。
 # ---------------------------------------------------------------------------
-TRAP_INCOMPLETE=""
+if ! LIB="$LIB" DEST="$DEST" STG="$STG" INCOMPLETE_DIR="$INCOMPLETE_DIR" STAMP="$STAMP" \
+    DB_SHA256="$LOCAL_SHA" \
+    ADOPT_SESSIONS="$ADOPT_SESSIONS" ADOPT_REASON="$ADOPT_REASON" \
+    QUARANTINE_SESSIONS="$QUARANTINE_SESSIONS" QUARANTINE_REASON="$QUARANTINE_REASON" \
+    RETENTION_RESET="$RETENTION_RESET" RETENTION_RESET_REASON="$RETENTION_RESET_REASON" \
+    "$VENV_PY" 8>&- - <<'PYEOF'
+import json
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["LIB"])
+import cass_common  # noqa: E402
+
+dest = pathlib.Path(os.environ["DEST"])
+stg = pathlib.Path(os.environ["STG"])
+incomplete_dir = pathlib.Path(os.environ["INCOMPLETE_DIR"])
+stamp = os.environ["STAMP"]
+
+gate = json.loads((stg / "gate.json").read_bytes())
+
+prev = cass_common.latest_published(dest)
+if prev is None:
+    generation = 1
+    prev_backup_name = ""
+    prev_sidecar_sha256 = ""
+else:
+    prev_name, prev_digest = prev
+    generation = prev_digest["generation"] + 1
+    prev_backup_name = prev_name
+    prev_sidecar_sha256 = cass_common.sha256_file(dest / prev_name / "digest.json")
+
+digest: dict = {
+    "backup_name": f"cass-{stamp}",
+    "generation": generation,
+    "prev_backup_name": prev_backup_name,
+    "prev_sidecar_sha256": prev_sidecar_sha256,
+    "db_sha256": os.environ["DB_SHA256"],
+    "census_sha256": gate["census_sha256"],
+    "sessions_tsv_sha256": cass_common.sha256_file(incomplete_dir / "sessions.tsv"),
+    "manifests_sha256sum_sha256": cass_common.sha256_file(incomplete_dir / "manifests.sha256sum"),
+    "schema_fingerprint": gate["schema_fingerprint"],
+    "tables": gate["tables"],
+    "meta_watermarks": gate["meta_watermarks"],
+}
+
+# rebaseline 留痕：gate.json 的键名已经同构（cass_backup_gate.py 写的），直接抄。
+if "rebaselined_from" in gate:
+    digest["rebaselined_from"] = gate["rebaselined_from"]
+    digest["reason"] = gate["reason"]
+
+if os.environ.get("ADOPT_SESSIONS"):
+    digest["adopt_reason"] = os.environ["ADOPT_REASON"]
+
+quarantine_sessions = os.environ.get("QUARANTINE_SESSIONS", "")
+if quarantine_sessions:
+    digest["quarantined_sessions"] = [
+        s.strip() for s in quarantine_sessions.split(",") if s.strip()
+    ]
+    digest["quarantine_reason"] = os.environ["QUARANTINE_REASON"]
+
+if os.environ.get("RETENTION_RESET"):
+    digest["retention_reset"] = True
+    digest["retention_reset_reason"] = os.environ["RETENTION_RESET_REASON"]
+
+(incomplete_dir / "digest.json").write_bytes(cass_common.dumps_canonical(digest))
+print(f"[step14c] digest.json written: generation={generation} prev={prev_backup_name or '(none)'}")
+PYEOF
+then
+  fail_incomplete "step 14c digest.json assembly failed"
+fi
+
+# ---------------------------------------------------------------------------
+# step 15 — 发布序列（spec §6 step 15 逐字）：mountpoint 重验 → touch COMPLETE →
+# 断言目标不存在 → `mv -T` → 最终断言。任一失败即 `fail_incomplete`/`exit 1`，
+# 成功后清空 `TRAP_INCOMPLETE`（发布成功，trap 不再碰它）。
+# ---------------------------------------------------------------------------
+if [[ "$DEST" == "$NAS_PREFIX"* ]]; then
+  mountpoint -q "$SHARE_ROOT" 2>/dev/null \
+    || fail_incomplete "NAS mountpoint re-verify failed before publish (step 15)"
+fi
+sync
+
+touch "$INCOMPLETE_DIR/COMPLETE"
+sync
+
+# DEV-7 故障注入：`touch COMPLETE` 已完成、`mv -T` 尚未执行（V15l）——下一轮
+# step 4 必须把它当 RECOVERABLE 救援，不能当垃圾清掉（它是完整且已全部校验
+# 通过的备份载荷）；同时反例断言朴素「删超 1 天 .incomplete-*」的 glob 会命中它。
+if [ "$FAULT" = "kill-after-complete-marker" ]; then
+  kill -9 $$
+fi
+
+PUBLISHED_DIR="$DEST/cass-$STAMP"
+test ! -e "$PUBLISHED_DIR" || fail_incomplete "publish target already exists: $PUBLISHED_DIR"
+mv -T "$INCOMPLETE_DIR" "$PUBLISHED_DIR"
+
+# DEV-7 故障注入：`mv -T` 已完成、`sync`/最终断言尚未执行（V15k）——此刻已发布
+# 的 `cass-$STAMP/` 必须完好；下一轮 `.incomplete-*` 清理不会误删它（它已经不
+# 叫这个名字了，glob 匹配不到）。
+if [ "$FAULT" = "kill-after-publish-mv" ]; then
+  kill -9 $$
+fi
+
+sync
+test -f "$PUBLISHED_DIR/COMPLETE" && test ! -e "$INCOMPLETE_DIR" || exit 1
+TRAP_INCOMPLETE=""   # 发布成功，trap 不再碰它
+
+# ---------------------------------------------------------------------------
+# rebaseline / retention_reset 成功 TG（DEV-2/DEV-3，spec §5.7「rebaseline 的
+# 运行即使成功也发 TG」）：这两个都是人工审计事件——脚本自身 curl
+# `$CASS_BACKUP_TG_ENV` 的 token/chat_id（source 进子 shell，仓内零密钥）。
+# env 文件缺失或 curl 失败 ⇒ 备份已发布、不回滚，但必须 exit 非零提醒人工去
+# 查（这条消息没有自动重投机制，漏发等于没人知道）。
+# ---------------------------------------------------------------------------
+TG_ALERT=0
+TG_TEXT="$(DIGEST_PATH="$PUBLISHED_DIR/digest.json" "$VENV_PY" 8>&- - <<'PYEOF'
+import json
+import os
+
+with open(os.environ["DIGEST_PATH"], "rb") as f:
+    d = json.load(f)
+
+lines = []
+if "rebaselined_from" in d:
+    lines.append(f"rebaseline: replaced {d['rebaselined_from']} — reason: {d.get('reason', '')}")
+if d.get("retention_reset"):
+    lines.append(f"retention_reset — reason: {d.get('retention_reset_reason', '')}")
+
+if lines:
+    print(f"CASS backup {d.get('backup_name', '')}")
+    for line in lines:
+        print(line)
+PYEOF
+)"
+
+if [ -n "$TG_TEXT" ]; then
+  if ! ( set +u; source "$CASS_BACKUP_TG_ENV" 2>/dev/null; curl -sf -m 10 \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TG_TEXT" >/dev/null ) 9>&- 8>&-
+  then
+    echo "[backup] ALERT: rebaseline/retention_reset TG notification failed" \
+      "(TG env file missing or curl error) — needs manual follow-up. message was: $TG_TEXT"
+    TG_ALERT=1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 最终 exit 语义：备份本身已发布成功（cass-$STAMP/ 完好），但两类人工告警
+# 若发生仍要 exit 非零（DEV-6 的 RECOVERABLE 救援 / 上面的 TG 发送失败）——
+# 告警不能因为「主线成功」就被吞掉。keep-N 轮转（step 16-17）与周校验
+# （step 18）是 Task 14/16 的范围，尚未实现。
+# ---------------------------------------------------------------------------
 if [ "$ALERT_FLAG" = 1 ]; then
   echo "[backup] gate passed but a stale RECOVERABLE-* alert was raised above — exiting non-zero (DEV-6)"
+fi
+if [ "$ALERT_FLAG" = 1 ] || [ "$TG_ALERT" = 1 ]; then
   exit 1
 fi
-echo "[backup] step 12/13/14 done (14c/15 not yet implemented)"
+echo "[backup] published: $PUBLISHED_DIR (keep-N rotation / weekly verify not yet implemented — Task 14/16)"
 exit 0

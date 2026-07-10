@@ -461,8 +461,10 @@ def test_five_leg_gate_failure_lands_suspect_with_forensics(
     tmp_home, run_backup, synth_dd, cass_stub, tmp_path
 ):
     """攻击②（清空 messages.content）相对既有基线 → leg4 前缀摘要不符 → 五腿门 FAIL
-    → `$DEST/SUSPECT-<stamp>/` 落 db+census.tsv+gate.json，无 COMPLETE（spec §5.7/§6
-    step 9 取证路径；digest.json 版取证是 Task 13 的升级点，本 task 到 gate.json 为止）。"""
+    → `$DEST/SUSPECT-<stamp>/` 落 db+census.tsv+gate.json+digest.json，无 COMPLETE
+    （spec §5.7/§6 step 9 取证路径；digest.json 版取证是 Task 13 升级——五腿门失败
+    发生在 sessions.tsv/manifests.sha256sum 生成之前，那两个 sha 字段留空串，其余
+    字段照常算，供人 diff 新旧 sidecar 判断是迁移还是事故）。"""
     dest = tmp_path / "dest"
     dest.mkdir()
 
@@ -501,6 +503,18 @@ def test_five_leg_gate_failure_lands_suspect_with_forensics(
     assert (susp / "gate.json").is_file()
     assert not (susp / "COMPLETE").exists()
     assert "[leg 4] FAIL" in out, out
+
+    digest = json.loads((susp / "digest.json").read_bytes())
+    assert digest["backup_name"] == f"SUSPECT-{susp.name.removeprefix('SUSPECT-')}"
+    assert digest["generation"] == 2, "cass-baseline 已是 generation 1，本次取证应是 2"
+    assert digest["prev_backup_name"] == "cass-baseline"
+    assert digest["prev_sidecar_sha256"] == cass_common.sha256_file(dest / "cass-baseline" / "digest.json")
+    assert digest["db_sha256"] == cass_common.sha256_file(susp / "db")
+    assert digest["census_sha256"] == json.loads((susp / "gate.json").read_bytes())["census_sha256"]
+    # 五腿门失败发生在 sessions.tsv/manifests.sha256sum 生成之前——「当晚可得
+    # 字段」组装，这两个字段留空串，不是缺失也不是伪造的假值。
+    assert digest["sessions_tsv_sha256"] == ""
+    assert digest["manifests_sha256sum_sha256"] == ""
 
 
 @requires_cass

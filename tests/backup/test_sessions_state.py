@@ -1153,8 +1153,9 @@ def test_first_night_adopt_bootstrap_state_generated_and_self_verifies_e2e(
     records = cass_common.state_read(state_path)  # 自校验：内部会做 sha256 头比对，不符会 raise
     assert records == [_rec("alpha/s.jsonl", good)]
     incomplete_dirs = list(dest.glob(".incomplete-bootstrap")) + list(dest.glob("INCOMPLETE-bootstrap"))
-    # 临时出口（Task 13 前）：本 task 阶段 .incomplete-<stamp>/ 有意留在 DEST 上。
-    assert (dest / ".incomplete-bootstrap" / "sessions.tsv").read_bytes() == state_path.read_bytes()
+    # Task 13 起 backup-cass.sh 真发布：`.incomplete-bootstrap/` 已 `mv -T` 成
+    # `cass-bootstrap/`，不再留在 DEST 上。
+    assert (dest / "cass-bootstrap" / "sessions.tsv").read_bytes() == state_path.read_bytes()
 
 
 @requires_cass
