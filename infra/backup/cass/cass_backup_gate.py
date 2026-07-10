@@ -1,4 +1,4 @@
-"""CASS 备份 PR1 DB 五腿门（本文件逐 task 累加：本次新增腿 4，已含腿 0 + 腿 1 + 腿 2 + 腿 3）。
+"""CASS 备份 PR1 DB 五腿门（本文件逐 task 累加：本次新增 CLI `main()`，已含腿 0-4）。
 
 跑在本地 staging 副本（`.backup` 产物）上，spec §5 全五腿合计 < 6 秒。任一腿失败 →
 不写 `COMPLETE` → exit 非零 → TG 告警（调用方职责，不在本模块）。
@@ -10,13 +10,20 @@ PUBLIC 仓纪律：本文件禁止出现任何真实路径 / 偏好 / 基建拓�
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
+import os
+import pathlib
 import re
 import sqlite3
 import struct
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Literal
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cass_common  # noqa: E402 — 同目录 import 约定见模块 docstring
 
 # ---------------------------------------------------------------------------
 # 共享形态：五腿门每一腿的判定结果，后续腿（2/3/4）复用同一形态。
@@ -455,15 +462,24 @@ def _leg4_watermarks(
 ) -> tuple[list[str], dict[str, str]]:
     """meta 水位两部分：(a) 必需键存在（硬编码清单，缺任一 FAIL，rebaseline 也不
     豁免）；(b) 单调不减（先 `^[0-9]+$` 校验再按无符号整数比较，解析失败即 FAIL）。
-    `rebaseline=True` 或 `prev_watermarks is None`（首晚）时跳过 (b)。"""
+    `rebaseline=True` 或 `prev_watermarks is None`（首晚）时跳过 (b)。
+
+    `meta` 表本身整体不可读（如攻击①用 `writable_schema` 删掉其 schema 条目）时
+    `SELECT` 会抛 `sqlite3.DatabaseError`——与腿 3 对缺表的受控处理同一套哲学：
+    不裸 crash，按「一个键都读不到」处理，走既有的必需键缺失 FAIL 路径（Task 7
+    CLI 首次五腿串联跑通攻击①时发现：`meta` 整表消失不只是腿 3 的事）。"""
     placeholders = ",".join("?" * len(REQUIRED_LEG4_WATERMARK_KEYS))
-    rows = con.execute(
-        f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
-        REQUIRED_LEG4_WATERMARK_KEYS,
-    ).fetchall()
+    problems: list[str] = []
+    try:
+        rows = con.execute(
+            f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
+            REQUIRED_LEG4_WATERMARK_KEYS,
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        problems.append(f'"meta" 不可读（{exc}），必需水位键视为全部缺失')
+        rows = []
     current = dict(rows)
 
-    problems: list[str] = []
     missing = [key for key in REQUIRED_LEG4_WATERMARK_KEYS if key not in current]
     if missing:
         problems.append("必需水位键缺失: " + ", ".join(missing))
@@ -571,3 +587,155 @@ def leg4(
     return Leg4Result(
         ok=ok, detail="; ".join(detail_parts), tables=tables, meta_watermarks=meta_watermarks
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI —— 五腿门组装 + rebaseline 校验（Task 7，spec §5.7）
+# ---------------------------------------------------------------------------
+
+
+def _read_census_tsv(path) -> dict[str, int | str]:
+    """读 `census.tsv`（每行 `表名\\t值`）。数值型解析为 int；`EXEMPT`/
+    `LEG3_READ_FAILED` 等哨兵字符串解析失败原样保留为字符串——与 `_leg3_census`
+    写出的类型形态（`int | str`）逐一对应，不需要在这里硬编码哨兵字面量。"""
+    census: dict[str, int | str] = {}
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        name, value = line.split("\t", 1)
+        try:
+            census[name] = int(value)
+        except ValueError:
+            census[name] = value
+    return census
+
+
+def _census_tsv_bytes(census: dict[str, int | str]) -> bytes:
+    """按表名排序写 `表名\\t值` 行，确定性字节（同一份 census 任何时候序列化结果
+    逐字节相等——`census_sha256` 参与链哈希，必须确定性）。"""
+    lines = [f"{name}\t{census[name]}\n" for name in sorted(census)]
+    return "".join(lines).encode("utf-8")
+
+
+def _validate_rebaseline_target(
+    dest: pathlib.Path, target_name: str, tip_name: str | None
+) -> str | None:
+    """spec §5.7 三项校验：① 目录存在；② 含 `COMPLETE`；③ 是链 tip（`generation`
+    最大者，由调用方传入的 `latest_published` 结果判定，**不看 mtime**）。
+
+    全部满足返回 `None`；任一不满足返回人读得懂的错误信息（调用方据此 exit 2）。
+    """
+    target_dir = dest / target_name
+    if not target_dir.is_dir():
+        return f"rebaseline 目标不存在: {target_dir}"
+    if not (target_dir / "COMPLETE").exists():
+        return f"rebaseline 目标缺少 COMPLETE marker（未发布完成）: {target_dir}"
+    if tip_name is None or target_name != tip_name:
+        return (
+            f"rebaseline 目标不是链 tip（不看 mtime，只看 generation）："
+            f"指名={target_name!r}，当前 tip={tip_name!r}"
+        )
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """五腿门 CLI：跑腿 0→1→2→3→4（顺序固定，不短路），产出 `census.tsv` +
+    `gate.json`（无论 PASS/FAIL 都写——SUSPECT 取证需要完整画像），返回
+    0=PASS / 1=FAIL(任一腿) / 2=用法或环境错误（含 rebaseline 目标校验失败）。
+    """
+    parser = argparse.ArgumentParser(prog="cass_backup_gate.py")
+    parser.add_argument("--db", required=True, help="staging 副本 db 路径")
+    parser.add_argument("--dest", required=True, help="已发布备份的 DEST 根目录")
+    parser.add_argument("--out-census", required=True, dest="out_census")
+    parser.add_argument("--out-gate-json", required=True, dest="out_gate_json")
+    parser.add_argument("--rebaseline", default=None)
+    parser.add_argument("--rebaseline-reason", default=None, dest="rebaseline_reason")
+    args = parser.parse_args(argv)
+
+    # 人工通道成对性校验（CLI 双保险；bash 层的成对校验见 Task 9）：缺一即拒绝运行。
+    if bool(args.rebaseline) != bool(args.rebaseline_reason):
+        print(
+            "错误: --rebaseline 与 --rebaseline-reason 必须成对提供，缺一即拒绝运行",
+            file=sys.stderr,
+        )
+        return 2
+
+    rebaseline = bool(args.rebaseline)
+    dest = pathlib.Path(args.dest)
+
+    baseline = cass_common.latest_published(dest)
+    if baseline is None:
+        prev_name, prev_digest = None, None
+    else:
+        prev_name, prev_digest = baseline
+
+    if rebaseline:
+        error = _validate_rebaseline_target(dest, args.rebaseline, prev_name)
+        if error is not None:
+            print(f"错误: {error}", file=sys.stderr)
+            return 2
+
+    if prev_name is None:
+        prev_census: dict[str, int | str] | None = None
+        prev_fingerprint: str | None = None
+        prev_tables: dict[str, dict] | None = None
+        prev_watermarks: dict[str, str] | None = None
+    else:
+        prev_census = _read_census_tsv(dest / prev_name / "census.tsv")
+        prev_fingerprint = prev_digest.get("schema_fingerprint")
+        prev_tables = prev_digest.get("tables")
+        prev_watermarks = prev_digest.get("meta_watermarks")
+
+    db_path = pathlib.Path(args.db)
+    if not db_path.is_file():
+        # 显式存在性检查——`immutable=1` URI 对不存在的文件不会在 connect() 时
+        # 报错，而是静默打开一个空 schema（首条 `SELECT` 才会报 "no such table"，
+        # 且不受下面 try/except 保护），会让 CLI 以裸 traceback 崩溃而不是走干净
+        # 的 exit 2 环境错误路径。
+        print(f"错误: --db 路径不存在或不是文件: {db_path}", file=sys.stderr)
+        return 2
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+    except sqlite3.Error as exc:
+        print(f"错误: 无法打开 db（{db_path}）: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        r0 = leg0(con)
+
+        stdout, stderr, exit_code = run_integrity_check(args.db)
+        sig = classify_integrity(stdout, stderr, exit_code)
+        r1 = LegResult(ok=sig in ("A", "B"), detail=f"integrity_check signature={sig}")
+
+        r2 = leg2(con)
+        r3 = leg3(con, prev_census, prev_fingerprint, rebaseline=rebaseline)
+        r4 = leg4(con, prev_tables, prev_watermarks, rebaseline=rebaseline)
+    finally:
+        con.close()
+
+    leg_results = [r0, r1, r2, r3, r4]
+    for i, r in enumerate(leg_results):
+        print(f"[leg {i}] {'PASS' if r.ok else 'FAIL'}: {r.detail}")
+
+    census_bytes = _census_tsv_bytes(r3.census)
+    pathlib.Path(args.out_census).write_bytes(census_bytes)
+    census_sha256 = hashlib.sha256(census_bytes).hexdigest()
+
+    gate: dict = {
+        "schema_fingerprint": r3.fingerprint,
+        "tables": r4.tables,
+        "meta_watermarks": r4.meta_watermarks,
+        "census_sha256": census_sha256,
+    }
+    if rebaseline:
+        gate["rebaselined_from"] = args.rebaseline
+        gate["reason"] = args.rebaseline_reason
+
+    pathlib.Path(args.out_gate_json).write_bytes(cass_common.dumps_canonical(gate))
+
+    return 0 if all(r.ok for r in leg_results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
