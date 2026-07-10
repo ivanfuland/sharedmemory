@@ -617,8 +617,11 @@ def test_dev1_jsonl_only_filter_and_empty_dirs_pruned_e2e(
     (nested / "s.jsonl").write_text('{"ok":true}\n')
     (root / "empty-dir").mkdir()
 
+    # Task 12 起：首晚（sessions.state.tsv 缺失）必须显式 ADOPT（spec §6.3.1 step
+    # 13a）——这个测试的重点是 jsonl-only 过滤，不是 ADOPT 语义本身，故直接给。
     rc, out = _run(
         tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "dev1", f"onlyroot={root}",
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
     )
 
     assert rc == 0, out
@@ -700,7 +703,12 @@ def test_v12a_e2e_truncated_session_blocks_publish_but_syncs_healthy_files(
     session_file.parent.mkdir(parents=True)
     session_file.write_bytes(good)
 
-    rc1, out1 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v12a-first", session_roots)
+    # Task 12 起：首晚（sessions.state.tsv 缺失）必须显式 ADOPT（spec §6.3.1 step
+    # 13a）——这个测试的重点是「排除 + 不发布」，不是 ADOPT 语义本身，故直接给。
+    rc1, out1 = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v12a-first", session_roots,
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
+    )
     assert rc1 == 0, out1
     nas_copy = dest / "sessions" / "alpha" / "proj" / "s.jsonl"
     assert nas_copy.read_bytes() == good, out1
@@ -741,7 +749,11 @@ def test_v12b_e2e_prefix_rewrite_blocks_publish_no_complete(
     good = b"good1\ngood2\ngood3\n"
     session_file.write_bytes(good)
 
-    rc1, out1 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v12b-first", session_roots)
+    # Task 12 起：首晚（sessions.state.tsv 缺失）必须显式 ADOPT（spec §6.3.1 step 13a）。
+    rc1, out1 = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v12b-first", session_roots,
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
+    )
     assert rc1 == 0, out1
 
     cass_common.state_write_atomic(dest / "sessions.state.tsv", [_rec("alpha/s.jsonl", good)])
@@ -867,7 +879,11 @@ def test_glob_filename_anomaly_blocks_transfer_e2e(
     good = b"good1\ngood2\ngood3\n"
     session_file.write_bytes(good)
 
-    rc1, out1 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "glob-first", session_roots)
+    # Task 12 起：首晚（sessions.state.tsv 缺失）必须显式 ADOPT（spec §6.3.1 step 13a）。
+    rc1, out1 = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "glob-first", session_roots,
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
+    )
     assert rc1 == 0, out1
     nas_copy = dest / "sessions" / "alpha" / "s[1].jsonl"
     assert nas_copy.read_bytes() == good, out1
@@ -925,12 +941,15 @@ def test_sessions_rsync_block_exclude_from_precedes_jsonl_include():
 
 
 @requires_cass
-def test_first_night_state_none_full_sync_still_succeeds_e2e(
+def test_first_night_state_none_requires_adopt_then_succeeds_e2e(
     tmp_home, run_backup, synth_dd, cass_stub, tmp_path
 ):
-    """首晚（`$DEST/sessions.state.tsv` 不存在）⇒ check-source 传 NONE ⇒ 全净、
-    整次备份走到临时出口正常 exit 0（本 task 阶段还没有 13a 的完整 ADOPT 语义，
-    也不需要——state 不存在时同步照走）。"""
+    """首晚（`$DEST/sessions.state.tsv` 不存在）：Task 12 起 13a 门要求显式
+    `CASS_BACKUP_ADOPT_SESSIONS`（spec §6.3.1 step 13a——「state 消失是完整性事
+    件，只有显式 adopt 能重建，含首晚」）。没给 ⇒ 立即非零退出，且不做任何 rsync
+    / 状态改动（`sessions.state.tsv` 依旧不存在）；给了 ⇒ check-source 传 NONE
+    ⇒ 全净，13e/13f 把首晚同步的文件写进新生成的 `sessions.state.tsv`，整次备份
+    走到临时出口正常 exit 0。"""
     dest = tmp_path / "dest"
     dest.mkdir()
     staging = tmp_path / "staging"
@@ -940,7 +959,22 @@ def test_first_night_state_none_full_sync_still_succeeds_e2e(
 
     assert not (dest / "sessions.state.tsv").exists()
 
-    rc, out = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "first-night", f"a={root}")
+    rc_no_adopt, out_no_adopt = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "first-night-no-adopt", f"a={root}",
+    )
+    assert rc_no_adopt != 0, out_no_adopt
+    assert not (dest / "sessions.state.tsv").exists(), (
+        f"无 ADOPT 时不该产生任何 state 文件: {out_no_adopt}"
+    )
+    assert not (dest / "sessions").exists() or not list((dest / "sessions").rglob("*.jsonl")), (
+        f"无 ADOPT 时不该做任何 sessions rsync: {out_no_adopt}"
+    )
+
+    rc, out = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "first-night", f"a={root}",
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
+    )
 
     assert rc == 0, out
+    assert (dest / "sessions.state.tsv").is_file(), out
     assert (dest / "sessions" / "a" / "s.jsonl").read_bytes() == b'{"a":1}\n', out

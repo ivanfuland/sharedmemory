@@ -638,6 +638,10 @@ def test_stale_incomplete_with_complete_becomes_recoverable_and_alerts(
             "CASS_DATA_DIR": str(synth_dd),
             "CASS_BACKUP_DEST": str(dest),
             "CASS_BACKUP_STAGING": str(tmp_path / "staging"),
+            # Task 12 起首晚需要显式 ADOPT（spec §6.3.1 step 13a）——本测试关注
+            # DEV-6 的 RECOVERABLE 救援 + ALERT_FLAG，与 sessions 通道正交。
+            "CASS_BACKUP_ADOPT_SESSIONS": "1",
+            "CASS_BACKUP_ADOPT_REASON": "test fixture — sessions channel not under test here",
             "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
         }
     )
@@ -667,6 +671,10 @@ def test_stale_incomplete_without_complete_removed_and_backup_succeeds(
             "CASS_DATA_DIR": str(synth_dd),
             "CASS_BACKUP_DEST": str(dest),
             "CASS_BACKUP_STAGING": str(tmp_path / "staging"),
+            # Task 12 起首晚需要显式 ADOPT（spec §6.3.1 step 13a）——本测试关注陈旧
+            # `.incomplete-*` 清理，与 sessions 通道正交。
+            "CASS_BACKUP_ADOPT_SESSIONS": "1",
+            "CASS_BACKUP_ADOPT_REASON": "test fixture — sessions channel not under test here",
             "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
         }
     )

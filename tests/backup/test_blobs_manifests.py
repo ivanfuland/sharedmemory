@@ -66,13 +66,20 @@ def _write_verified_doctor_stub(home: pathlib.Path, manifests_dir: pathlib.Path)
 
 
 def _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, stamp, extra_env=None):
-    """跑一次 backup-cass.sh，固定 stamp 供测试按名字定位产物目录。"""
+    """跑一次 backup-cass.sh，固定 stamp 供测试按名字定位产物目录。
+
+    Task 12 起，首晚（`sessions.state.tsv` 缺失）需要显式 ADOPT（spec §6.3.1 step
+    13a）——本文件的测试全部关注 db/blob/manifest 通道，与 sessions 通道正交，
+    默认给一份 ADOPT env 让它们不必逐个关心这道无关的门（同 `_write_verified_
+    doctor_stub` 替这些测试挡掉 Tier 0 门的思路一致）。`extra_env` 仍可覆盖。"""
     _write_verified_doctor_stub(tmp_home, synth_dd / "raw-mirror" / "v1" / "manifests")
     env = {
         "CASS_DATA_DIR": str(synth_dd),
         "CASS_BACKUP_DEST": str(dest),
         "CASS_BACKUP_STAGING": str(staging),
         "CASS_BACKUP_STAMP": stamp,
+        "CASS_BACKUP_ADOPT_SESSIONS": "1",
+        "CASS_BACKUP_ADOPT_REASON": "test fixture — sessions channel not under test here",
         "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
     }
     if extra_env:

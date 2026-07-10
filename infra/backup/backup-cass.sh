@@ -321,24 +321,37 @@ BLOBS_TRANSFERRED="$(sed -n 's/^Number of regular files transferred: \([0-9,]*\)
 echo "[backup] blobs rsync: transferred ${BLOBS_TRANSFERRED:-?} files"
 
 # ---------------------------------------------------------------------------
-# step 13b — sessions 通道 A：源端前缀校验（spec §6.3.1 step 13b）。
-#
-# 13a（读共享权威状态 $DEST/sessions.state.tsv 的完整语义，含首晚缺失时的 ADOPT
-# 通道）本 task 只实现最窄的分支：文件不存在 → 传字面量 NONE（check-source 视作
-# 空清单，全净放行）；存在 → 传真实路径。ADOPT 通道 / 13a 其余语义是 Task 12。
+# step 13a — 共享权威状态 $DEST/sessions.state.tsv 的存在性门（spec §6.3.1 step
+# 13a）：**state 消失是完整性事件，只有显式 ADOPT 能重建**——含首晚（部署程序见
+# Task 18）。用 `fail_incomplete` 而非裸 `exit 1`：这一判据发生在 `INCOMPLETE_DIR`
+# 已落地 db/manifests 之后（step 10-14b 都在它前面），裸退会被 EXIT trap 直接
+# `rm -rf` 掉本可取证的半成品；`fail_incomplete` 改名成 `INCOMPLETE-$STAMP` 保留
+# 现场，且同样以 exit 1 收尾（满足 spec 字面「state 缺失且未给 ADOPT → exit 1」）。
+# 存在但首行校验不符的情形不在此处判断——它由下游 check-source/update-state/
+# publish-gate 对 `state_read` 的 `StateCorrupt` 异常自然产生非零 exit 覆盖。
 # ---------------------------------------------------------------------------
 SESSIONS_STATE_PATH="$DEST/sessions.state.tsv"
+if [ ! -f "$SESSIONS_STATE_PATH" ] && [ -z "$ADOPT_SESSIONS" ]; then
+  fail_incomplete "sessions.state.tsv missing and CASS_BACKUP_ADOPT_SESSIONS not set — state loss requires explicit ADOPT, even on first run (spec §6.3.1 step 13a)"
+fi
 if [ -f "$SESSIONS_STATE_PATH" ]; then
   SESSIONS_STATE_ARG="$SESSIONS_STATE_PATH"
 else
   SESSIONS_STATE_ARG="NONE"
 fi
 
+# ---------------------------------------------------------------------------
+# step 13b — sessions 通道 A：源端前缀校验（spec §6.3.1 step 13b）。
+# ---------------------------------------------------------------------------
+CHECK_SOURCE_ARGS=(
+  check-source --state "$SESSIONS_STATE_ARG" --roots "$SESSION_ROOTS" --out-exclude-dir "$STG"
+)
+if [ -n "$QUARANTINE_SESSIONS" ]; then
+  CHECK_SOURCE_ARGS+=(--quarantine "$QUARANTINE_SESSIONS" --quarantine-reason "$QUARANTINE_REASON")
+fi
 SESSIONS_FAIL=0
 SESSIONS_CHECK_RC=0
-"$VENV_PY" "$LIB/cass_sessions.py" check-source \
-    --state "$SESSIONS_STATE_ARG" --roots "$SESSION_ROOTS" \
-    --out-exclude-dir "$STG" 8>&- || SESSIONS_CHECK_RC=$?
+"$VENV_PY" "$LIB/cass_sessions.py" "${CHECK_SOURCE_ARGS[@]}" 8>&- || SESSIONS_CHECK_RC=$?
 # 9>&- 不再需要——写锁已在 step 8 后释放（exec 9>&- 见上）。exit 语义（本 CLI
 # 契约 + spec §6.3.1）：0=全净 / 3=有异常文件（healthy 部分仍照常同步，但整次
 # 备份最终不发布，判定见 step 13d 之后）/ 其余=内部错误，立即响亮失败。
@@ -372,7 +385,36 @@ for pair in "${SESSION_ROOT_PAIRS[@]}"; do
   session_alias="${pair%%=*}"
   session_root_path="${pair#*=}"
   mkdir -p "$DEST/sessions/$session_alias"
-  rsync -ai --append --prune-empty-dirs \
+
+  # 整根源目录消失（不是单个文件缺失——单个文件缺失由 13b 的「此刻源端也没有，
+  # 跳过比对」处理，见 cass_sessions.check_source）：`rsync ... "$path/" ...`
+  # 对不存在的源目录会硬失败（"change_dir ... failed: No such file or
+  # directory"），但这不是事故——这个 alias 这一轮压根没有源可同步，NAS 上已有
+  # 的内容原样不动即可。13f 的全量回读会把该 alias 下所有 present 记录结转成
+  # absent_at_source（Task 11 reviewer 留的验证项）。
+  if [ ! -d "$session_root_path" ]; then
+    echo "[backup] session root vanished for alias $session_alias — skipping rsync" \
+      "(publish-gate will reconcile affected records to absent_at_source)"
+    : > "$STG/itemize.$session_alias"
+    : > "$STG/transferred.$session_alias"
+    continue
+  fi
+
+  # DEV-7 故障注入（V12j）：`CASS_BACKUP_FAULT=rewrite-src-mid-rsync` 在这个 root
+  # 的 rsync 启动**前**后台起一个延迟 0.2s 的改写子进程，抢在源端第一个 jsonl 文
+  # 件的前缀上；配合下面的 `--bwlimit=1` 把这次 rsync 拖慢，让改写真的落在传输
+  # 窗口内（真实 TOCTOU，不是测试里事后伪造的数字）。找不到 jsonl 文件（该 root
+  # 为空）则什么也不做——不能对不存在的路径 `dd`，那会凭空造出一个坏文件。
+  RSYNC_EXTRA_ARGS=()
+  if [ "$FAULT" = "rewrite-src-mid-rsync" ]; then
+    fault_target="$(find "$session_root_path" -name '*.jsonl' -type f 2>/dev/null | sort | head -n1)"
+    if [ -n "$fault_target" ]; then
+      (sleep 0.2; printf 'BAD' | dd of="$fault_target" conv=notrunc bs=1 count=3 2>/dev/null) &
+      RSYNC_EXTRA_ARGS+=(--bwlimit=1)
+    fi
+  fi
+
+  rsync -ai --append --prune-empty-dirs "${RSYNC_EXTRA_ARGS[@]}" \
       --exclude-from="$STG/exclude.$session_alias" \
       --include='*/' --include='*.jsonl' --exclude='*' \
       "$session_root_path/" "$DEST/sessions/$session_alias/" 8>&- \
@@ -384,6 +426,57 @@ for pair in "${SESSION_ROOT_PAIRS[@]}"; do
     || fail_incomplete "session itemize parse failed for root $session_alias (fail-closed on unknown line)"
   sed "s|^|$session_alias/|" "$STG/transferred.$session_alias" >> "$STG/transferred.all"
 done
+
+# ---------------------------------------------------------------------------
+# step 13e — sessions 通道 B：rsync 一返回就更新共享状态（spec §6.3.1 step 13e）
+# ——**不等本次备份后续是否成功**：SESSIONS_FAIL=1（13b 判过异常）时健康部分的
+# 进度也要落地，最终是否发布由本文件末尾的 SESSIONS_FAIL 判定收口，不在这里。
+#
+# 两个 DEV-7 故障注入点都发生在 update-state 调用**之前**（brief 逐字约束）：
+#   kill-after-sessions-rsync —— 13d 完成、13e 还没跑就 SIGKILL 整个脚本，模拟
+#     「NAS 已经变大、清单还没来得及记」的崩溃窗口（V12m 的构造前提）。
+#   drop-one-itemize —— 模拟 update-state **自己的**记录漏了一个已传输文件（这
+#     是 13e 内部的失败模式，不是「rsync 到底传没传」这件事本身出错）。故障只
+#     能作用于 update-state 消费的那份拷贝（`UPDATE_STATE_TRANSFERRED`）——
+#     publish-gate 仍必须拿到 `$STG/transferred.all` **未删减的原始版本**当「本
+#     轮真传输了什么」的 ground truth，否则 13f 没法把「13e 漏记的已传输文件」
+#     （V12k2，该自愈）与「本轮根本没传输、凭空冒出来的陌生文件」（V12f，该
+#     --adopt）区分开——这正是 codex R3-P1 binding 的字面要求。
+# ---------------------------------------------------------------------------
+UPDATE_STATE_TRANSFERRED="$STG/transferred.all"
+case "$FAULT" in
+  kill-after-sessions-rsync)
+    kill -9 $$
+    ;;
+  drop-one-itemize)
+    cp "$STG/transferred.all" "$STG/transferred.for-update-state"
+    sed -i '1d' "$STG/transferred.for-update-state"
+    UPDATE_STATE_TRANSFERRED="$STG/transferred.for-update-state"
+    ;;
+esac
+
+"$VENV_PY" "$LIB/cass_sessions.py" update-state \
+    --state "$SESSIONS_STATE_PATH" --sessions-root "$DEST/sessions" \
+    --transferred "$UPDATE_STATE_TRANSFERRED" 8>&- \
+  || fail_incomplete "session update-state (13e) failed"
+
+# ---------------------------------------------------------------------------
+# step 13f/13g — sessions 通道 B：发布门全量回读（spec §6.3.1 step 13f/13g）。
+# `--transferred` 在这里必须传未删减的 `$STG/transferred.all`（见上方注释）。
+# `--adopt`/`--adopt-reason` 只在 `CASS_BACKUP_ADOPT_SESSIONS` 非空时传——cron
+# 的 clean allowlist env 传不进它，只有人在 shell 里能触发（同 §5.7 rebaseline
+# 的安全属性）。产出的 `.incomplete-$STAMP/sessions.tsv` 供 step 14c 的
+# digest.json 取 sha256（Task 13）。
+# ---------------------------------------------------------------------------
+PUBLISH_GATE_ARGS=(
+  --state "$SESSIONS_STATE_PATH" --sessions-root "$DEST/sessions" --roots "$SESSION_ROOTS"
+  --transferred "$STG/transferred.all" --out-tsv "$INCOMPLETE_DIR/sessions.tsv"
+)
+if [ -n "$ADOPT_SESSIONS" ]; then
+  PUBLISH_GATE_ARGS+=(--adopt --adopt-reason "$ADOPT_REASON")
+fi
+"$VENV_PY" "$LIB/cass_sessions.py" publish-gate "${PUBLISH_GATE_ARGS[@]}" 8>&- \
+  || fail_incomplete "session publish-gate (13f/13g full-readback) failed"
 
 # ---------------------------------------------------------------------------
 # step 14a — manifest 快照完整性门（spec §6 step 14a）：对 .incomplete-$STAMP/
