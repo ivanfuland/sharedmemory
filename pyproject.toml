@@ -20,3 +20,8 @@ dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: long-running acceptance tests (real doctor / full NAS readback)",
+    "realcass: requires the real cass binary on PATH",
+    "nas: writes to a real NAS scratch dir (CASS_ACCEPT_NAS=1)",
+]
