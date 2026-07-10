@@ -231,3 +231,27 @@ def attack7(db: pathlib.Path) -> None:
         con.commit()
     finally:
         con.close()
+
+
+def inject_separator_bytes(db: pathlib.Path) -> None:
+    """腿 4 V5d3③ Tier A：往 `messages` 插一行 `extra_bin` 含 `0x1F`/`0x1E`/`0x1D`
+    字节的 blob，验证编码器对「真实数据里就会出现的分隔符字节」的处置（spec §5.5：
+    这些字节在生产 `extra_bin`——msgpack 二进制——里天然存在，不是理论问题）。
+
+    用 `MAX(id)+1` 追加而非改写已有行，保持 gap=0（id 连续，见 spec §2.13）。
+    """
+    con = sqlite3.connect(str(db))
+    try:
+        max_id, first_conv = con.execute(
+            "SELECT MAX(id), (SELECT id FROM conversations ORDER BY id LIMIT 1) FROM messages"
+        ).fetchone()
+        new_id = max_id + 1
+        con.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, author, created_at,"
+            " content, extra_json, extra_bin) VALUES (?, ?, ?, 'assistant', 'synth-injector',"
+            " 0, 'separator-bytes-probe', NULL, ?)",
+            (new_id, first_conv, new_id, b"\x1f\x1e\x1d"),
+        )
+        con.commit()
+    finally:
+        con.close()
