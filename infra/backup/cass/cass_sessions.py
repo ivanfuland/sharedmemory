@@ -480,12 +480,15 @@ def publish_gate(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(state_path.read_bytes())
 
+    # 留痕前缀机器可解析（Task 13：`PROV <动作> <relpath>`），人读注释保留在行尾
+    # （下游 sidecar/告警消费方可以 `line.split()` 精确取动作与路径，不必按散文
+    # 子串猜测）。
     for relpath in self_healed:
-        print(f"{_PREFIX} self-healed (13e 漏记，全量回读收编): {relpath}")
+        print(f"{_PREFIX} PROV self-heal {relpath}  # 13e 漏记，全量回读收编")
     for relpath in adopted:
-        print(f"{_PREFIX} adopted (reason: {adopt_reason}): {relpath}")
+        print(f"{_PREFIX} PROV adopt {relpath}  # reason: {adopt_reason}")
     for relpath in drift_corrected:
-        print(f"{_PREFIX} drift-corrected (向前漂移，记录已修正): {relpath}")
+        print(f"{_PREFIX} PROV drift-fix {relpath}  # 向前漂移，记录已修正")
 
     return 0
 

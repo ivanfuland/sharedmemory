@@ -342,7 +342,7 @@ def test_v12f_orphan_adopted_with_adopt_flag_and_stdout_provenance(tmp_path, cap
     assert rc == 0
     assert cass_common.state_read(state_path) == [_rec("alpha/stray.jsonl", content)]
     captured = capsys.readouterr()
-    assert "adopted" in captured.out
+    assert "PROV adopt" in captured.out
     assert "alpha/stray.jsonl" in captured.out
     assert "manual recovery" in captured.out
 
@@ -351,8 +351,8 @@ def test_v12f_x_v12k2_same_run_self_heal_and_adopt_required_fail_dont_mix(tmp_pa
     """R3-P1 binding 的直接断言：同一轮里一个漏记的已传输文件（应自愈,不需要
     --adopt）+ 一个塞进来的陌生文件（不在 transferred 里,需要 --adopt）——分流
     必须精确，不能用同一条规则打包处理。先验证「无 --adopt 时两个都成孤儿,整体
-    FAIL」，再验证「有 --adopt 时全过,且 stdout 分别标注 self-healed 与
-    adopted」。"""
+    FAIL」，再验证「有 --adopt 时全过,且 stdout 分别标注 PROV self-heal 与
+    PROV adopt」。"""
     sessions_root = tmp_path / "sessions"
     (sessions_root / "alpha").mkdir(parents=True)
     healed_content = b"was-really-transferred-this-round\n"
@@ -389,13 +389,13 @@ def test_v12f_x_v12k2_same_run_self_heal_and_adopt_required_fail_dont_mix(tmp_pa
         _rec("alpha/healed.jsonl", healed_content),
         _rec("alpha/stray.jsonl", stray_content),
     }
-    assert "self-healed" in result.stdout and "alpha/healed.jsonl" in result.stdout
-    assert "adopted" in result.stdout and "alpha/stray.jsonl" in result.stdout
-    # 分流必须精确——不能把自愈的那条也标成 adopted，反之亦然。
+    assert "PROV self-heal" in result.stdout and "alpha/healed.jsonl" in result.stdout
+    assert "PROV adopt" in result.stdout and "alpha/stray.jsonl" in result.stdout
+    # 分流必须精确——不能把自愈的那条也标成 adopt，反之亦然。
     self_heal_line = next(l for l in result.stdout.splitlines() if "healed.jsonl" in l)
     adopt_line = next(l for l in result.stdout.splitlines() if "stray.jsonl" in l)
-    assert "self-healed" in self_heal_line and "adopted" not in self_heal_line
-    assert "adopted" in adopt_line and "self-healed" not in adopt_line
+    assert "PROV self-heal" in self_heal_line and "PROV adopt" not in self_heal_line
+    assert "PROV adopt" in adopt_line and "PROV self-heal" not in adopt_line
 
 
 def test_forward_drift_nas_longer_and_old_record_is_prefix_gets_corrected(tmp_path):
@@ -1055,7 +1055,7 @@ def test_v12k2_drop_one_itemize_fault_self_healed_without_adopt_e2e(
 
     # 首晚（state 缺失）本身需要 13a 的 ADOPT 门——与「自愈是否需要 --adopt」是
     # 两件独立的事：publish_gate 的分流逻辑先查 transferred 集合再查 --adopt，
-    # 真正在本轮 transferred 里的文件永远走 self-healed 分支，不受 --adopt 是否
+    # 真正在本轮 transferred 里的文件永远走 self-heal 分支，不受 --adopt 是否
     # 传入影响（见下方断言）。
     rc, out = _run(
         tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "v12k2", session_roots,
@@ -1063,8 +1063,8 @@ def test_v12k2_drop_one_itemize_fault_self_healed_without_adopt_e2e(
     )
 
     assert rc == 0, out
-    assert "self-healed" in out, f"publish-gate 必须在 stdout 留痕这是自愈: {out}"
-    assert "adopted" not in out, f"自愈不该被误标成 adopted，即便本轮 --adopt 也传了: {out}"
+    assert "PROV self-heal" in out, f"publish-gate 必须在 stdout 留痕这是自愈: {out}"
+    assert "PROV adopt" not in out, f"自愈不该被误标成 adopt，即便本轮 --adopt 也传了: {out}"
 
     for name, content in (("a.jsonl", b"content-a\n"), ("b.jsonl", b"content-b\n")):
         nas_file = dest / "sessions" / "alpha" / name
