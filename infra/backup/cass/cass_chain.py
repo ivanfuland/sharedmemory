@@ -144,6 +144,21 @@ def verify_chain(dest, keep: int) -> list[str]:
                 problems.append(
                     f"{cur}: 带 retention_reset 但不是链头（R 中最老者应为 {head_name}）"
                 )
+            # 与 B 终止的孤儿检查同族（spec §8.3「无分叉、无缺环」的 C1 侧）：
+            # C1 合法终止时「早于 r 的允许不在 R」，但 gen >= r 的成员必须全部
+            # 在 tip→重置点的走查路径上——post-reset 孤儿可让 |R|==n 恰好成立
+            # 而逃逸（如 g5(reset)←g6 孤儿 + g8→g7→g5 主链绕过 g6：n=4==|R|，
+            # 计数下界放行）。gen < r 的成员若存在则不在此指认：|R| > n 让计数
+            # 下界必 FAIL，且 reset 不再是最老者、上面的链头检查也已触发。
+            r_cur = digest["generation"]
+            orphans = sorted(
+                m for m in set(valid) - visited if valid[m]["generation"] >= r_cur
+            )
+            if orphans:
+                problems.append(
+                    f"孤儿/分叉：成员 {orphans} 的 generation >= 重置点 {r_cur}，"
+                    f"却不在 tip({tip_name})→重置点({cur}) 的走查路径上"
+                )
             break
 
         if "rebaselined_from" in digest:

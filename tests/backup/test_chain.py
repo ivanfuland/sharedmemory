@@ -535,6 +535,35 @@ def test_orphan_fork_off_main_path_fails(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Review 修复轮钉子 #3：C1 终止的对称孤儿逃逸（与 #2 同族，spec §8.3「无分叉/
+# 无缺环」的 C1 侧——首轮 report 遗留观察，控制器确认为真缺口）
+# ---------------------------------------------------------------------------
+
+
+def test_c1_termination_post_reset_orphan_fails(tmp_path):
+    """g5(reset,链头)←g6（孤儿，prev=g5 sha 正确）与 g5←g7←g8 主链（g7.prev
+    直指 g5 绕过 g6）：走查 g8→A→g7→A→g5 经 C1 合法终止（reset 在链头、
+    reason 非空、r_name==head），g6 从不被任何一跳校验触及；n = 8-5+1 = 4 ==
+    |R|，计数下界也放行。修复前假 PASS；修复后 C1 终止时必须断言 gen >= r 的
+    成员全部在走查路径上 → FAIL 指认 post-reset 孤儿 g6。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    b5 = make_fake_backup(
+        dest, "cass-c5", gen=5,
+        retention_reset=True, retention_reset_reason="合法 reset，但重置点之后链分叉了",
+    )
+    sha5 = cass_common.sha256_file(b5 / "digest.json")
+    make_fake_backup(dest, "cass-c6", gen=6, prev_name="cass-c5", prev_sha=sha5)  # 孤儿
+    b7 = make_fake_backup(dest, "cass-c7", gen=7, prev_name="cass-c5", prev_sha=sha5)
+    sha7 = cass_common.sha256_file(b7 / "digest.json")
+    make_fake_backup(dest, "cass-c8", gen=8, prev_name="cass-c7", prev_sha=sha7)
+
+    problems = cass_chain.verify_chain(dest, keep=7)
+    assert problems != [], "post-reset 孤儿在 C1 终止时必须被指认"
+    assert any("cass-c6" in p and ("孤儿" in p or "分叉" in p) for p in problems), problems
+
+
+# ---------------------------------------------------------------------------
 # generation 重复 → FAIL（spec「generation 重复/非正 int → FAIL」）
 # ---------------------------------------------------------------------------
 
