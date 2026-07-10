@@ -10,6 +10,7 @@ PUBLIC 仓纪律：本文件禁止出现任何真实路径 / 偏好 / 基建拓�
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -175,3 +176,164 @@ def leg2(con) -> LegResult:
         checked.append(f"{table}=0")
 
     return LegResult(ok=True, detail="; ".join(checked))
+
+
+# ---------------------------------------------------------------------------
+# 腿 3 — schema 与行数普查（spec §5.4）；rebaseline 出口见 spec §5.7
+# ---------------------------------------------------------------------------
+
+# 硬编码必需清单，逐字照抄 spec §5.4 part 1——不依赖 sqlite_master 的自述。
+# `fts_messages` 是虚表，COUNT 走 FTS5 正常。
+REQUIRED_LEG3_OBJECTS: tuple[str, ...] = (
+    "agents",
+    "conversations",
+    "messages",
+    "meta",
+    "sources",
+    "workspaces",
+    "conversation_tail_state",
+    "fts_messages",
+)
+
+# 无条件豁免且只豁免这一张：生产上它的 COUNT(*) 必报 malformed（§2.6，缺
+# autoindex 的既有缺陷）。健康合成库上它其实能 COUNT 成功，但仍无条件记
+# "EXEMPT"——行为确定性优先于「顺便多验一次」。
+LEG3_EXEMPT_TABLE = "fts_messages_config"
+
+
+@dataclass
+class Leg3Result:
+    """腿 3 结果。`census`/`fingerprint` 无论 `ok` 为何都会被算出，供 sidecar 落盘
+    （含失败当晚的 SUSPECT 快照，人工 diff 新旧 sidecar 判断是迁移还是事故）。"""
+
+    ok: bool
+    detail: str
+    census: dict[str, int | str]
+    fingerprint: str
+
+
+def _leg3_required_objects_check(con) -> LegResult:
+    """part 1：硬编码必需清单，每张都要 `SELECT COUNT(*)` 成功。缺表 / schema 损坏
+    抛的 `sqlite3.DatabaseError`（含其子类 `OperationalError`）都算缺失，不裸 crash。"""
+    missing = []
+    for name in REQUIRED_LEG3_OBJECTS:
+        try:
+            con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()
+        except sqlite3.DatabaseError as exc:
+            missing.append(f'"{name}"（{exc}）')
+    if missing:
+        return LegResult(ok=False, detail="必需对象缺失或不可读: " + "; ".join(missing))
+    return LegResult(
+        ok=True, detail="必需对象清单全部可读: " + ", ".join(REQUIRED_LEG3_OBJECTS)
+    )
+
+
+def _leg3_all_table_names(con) -> list[str]:
+    rows = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def _leg3_census(con) -> tuple[dict[str, int | str], list[str]]:
+    """part 2 的普查本体：对每张表跑 `COUNT(*)`。`LEG3_EXEMPT_TABLE` 无条件记
+    `"EXEMPT"`，不尝试 COUNT。其余表若 COUNT 抛 `sqlite3.DatabaseError`（非豁免表
+    却读不动，超出 spec 已知范围）记 `-1` 并计入 `read_failures`，不裸 crash——与
+    腿 2 对损坏的受控处理同一套哲学。"""
+    census: dict[str, int | str] = {}
+    read_failures: list[str] = []
+    for name in _leg3_all_table_names(con):
+        if name == LEG3_EXEMPT_TABLE:
+            census[name] = "EXEMPT"
+            continue
+        try:
+            census[name] = con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+        except sqlite3.DatabaseError as exc:
+            census[name] = -1
+            read_failures.append(f'"{name}"（{exc}）')
+    return census, read_failures
+
+
+def _leg3_compare_census(
+    census: dict[str, int | str], prev_census: dict[str, int | str]
+) -> tuple[bool, str]:
+    """part 2 的比对：一律严格不减（`cur >= prev`），上次存在本次不得消失。
+    `LEG3_EXEMPT_TABLE` 按名字跳过（与存储的值无关）。新表（`prev_census` 里没有）
+    合法，不参与比较——只遍历 `prev_census` 的键。"""
+    problems = []
+    for name, prev_value in prev_census.items():
+        if name == LEG3_EXEMPT_TABLE:
+            continue
+        if name not in census:
+            problems.append(f'"{name}" 消失（上次存在，本次不存在）')
+            continue
+        cur_value = census[name]
+        if cur_value < prev_value:
+            problems.append(f'"{name}" 行数减少：{prev_value} → {cur_value}')
+    if problems:
+        return False, "全表普查 FAIL: " + "; ".join(problems)
+    return True, "全表普查 PASS（严格不减，无表消失）"
+
+
+def _leg3_fingerprint(con) -> str:
+    """part 3：`sha256(type|name|COALESCE(sql,'') ORDER BY type,name)`，行间用
+    `\\n` 分隔（spec §5.4 逐字构造）。"""
+    rows = con.execute(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name"
+    ).fetchall()
+    lines = [f"{type_}|{name}|{sql}" for type_, name, sql in rows]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def leg3(
+    con,
+    prev_census: dict[str, int] | None,
+    prev_fingerprint: str | None,
+    rebaseline: bool = False,
+) -> Leg3Result:
+    """腿 3 — schema 与行数普查（spec §5.4），三部分全过才 PASS：
+
+    1. 必需对象清单（硬编码，rebaseline 也不豁免——spec §5.7「与硬编码不变式的比对
+       永不可关」）。
+    2. 全表行数普查，与 `prev_census` 比对：严格不减 + 不得消失，豁免
+       `LEG3_EXEMPT_TABLE`。
+    3. schema 指纹与 `prev_fingerprint` 比对。
+
+    `prev_census is None`（首晚）：登记模式，不做 2/3 比对，`ok` 只取决于第 1 部分。
+    `rebaseline=True`：跳过 2/3 与 prev 的比对（但第 1 部分照跑）。
+    `census`/`fingerprint` 无论结果如何都会被算出，供 sidecar 落盘。
+    """
+    required_result = _leg3_required_objects_check(con)
+    census, census_read_failures = _leg3_census(con)
+    fingerprint = _leg3_fingerprint(con)
+
+    detail_parts = [required_result.detail]
+    ok = required_result.ok
+
+    if census_read_failures:
+        detail_parts.append("普查读取失败: " + "; ".join(census_read_failures))
+        ok = False
+
+    if rebaseline:
+        detail_parts.append(
+            "rebaseline=True：跳过与 prev 基线的普查/指纹比对（必需对象清单不受影响）"
+        )
+    elif prev_census is None:
+        detail_parts.append("首晚登记：无历史基线，census/fingerprint 已记录")
+    else:
+        census_ok, census_detail = _leg3_compare_census(census, prev_census)
+        detail_parts.append(census_detail)
+        ok = ok and census_ok
+
+        fingerprint_ok = fingerprint == prev_fingerprint
+        if fingerprint_ok:
+            detail_parts.append("schema 指纹一致")
+        else:
+            detail_parts.append(
+                "schema 指纹不一致（若为 CASS 的合法迁移，人工确认后重设基线）"
+            )
+        ok = ok and fingerprint_ok
+
+    return Leg3Result(
+        ok=ok, detail="; ".join(detail_parts), census=census, fingerprint=fingerprint
+    )
