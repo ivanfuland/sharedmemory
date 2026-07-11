@@ -101,7 +101,10 @@ def _iter_published(dest) -> list[tuple[int, str, dict]]:
             digest = read_digest(entry)
         except (OSError, json.JSONDecodeError):
             continue
-        if not digest or "generation" not in digest:
+        if not isinstance(digest, dict) or "generation" not in digest:
+            # 非 dict（合法 JSON 但裸标量，如 digest.json 内容是 `5`/`true`）同样归
+            # 入「读不到 generation」的 skip 语义——不然 `"generation" not in digest`
+            # 对 int/bool 会 TypeError（`in` 要求可迭代）。
             continue
         if type(digest["generation"]) is not int:
             # 脏数据（如手编 digest 把 generation 写成字符串 "7"）归入「读不到

@@ -70,6 +70,11 @@ def _scan_r(dest: pathlib.Path) -> tuple[dict[str, dict], list[str], list[str]]:
         if digest is None:
             problems.append(f"{entry.name}: 缺 digest.json")
             continue
+        if not isinstance(digest, dict):
+            # 合法 JSON 但裸标量（如 `5`/`true`）——归入 FAIL 语义，与坏 JSON 同
+            # （不能像 cass_common 的轮转扫描那样宽容 skip，见模块 docstring）。
+            problems.append(f"{entry.name}: digest.json 内容不是对象（非 dict）")
+            continue
         if "generation" not in digest:
             problems.append(f"{entry.name}: digest.json 缺 generation 字段")
             continue

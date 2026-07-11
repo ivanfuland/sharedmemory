@@ -480,6 +480,24 @@ def test_missing_digest_json_in_complete_dir_fails_not_skipped(tmp_path):
     assert any("cass-nodigest" in p for p in problems), problems
 
 
+def test_non_dict_digest_in_r_fails_not_skipped(tmp_path):
+    """whole-branch review 修复项：`digest.json` 是合法 JSON 但裸标量（如 `5`）
+    ——`"generation" not in digest` 对 int 会 TypeError。归入 FAIL 语义（与坏
+    JSON 同，见 `_scan_r` docstring），不是 `cass_common` 轮转扫描那种宽容 skip。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    make_fake_backup(dest, "cass-good", gen=1)
+
+    scalar = dest / "cass-scalardigest"
+    scalar.mkdir()
+    (scalar / "COMPLETE").touch()
+    (scalar / "digest.json").write_bytes(cass_common.dumps_canonical(5))
+
+    problems = cass_chain.verify_chain(dest, keep=7)
+    assert problems != []
+    assert any("cass-scalardigest" in p for p in problems), problems
+
+
 # ---------------------------------------------------------------------------
 # Review 修复轮钉子 #1：离路 retention_reset 不得降低计数下界（reviewer 构造 A2）
 # ---------------------------------------------------------------------------

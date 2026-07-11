@@ -382,7 +382,8 @@ set -e -o pipefail
 # 半截会话）。`raw-mirror/v1/tmp/` 排除出备份。
 # ---------------------------------------------------------------------------
 mkdir -p "$DEST/raw-mirror/v1/blobs"
-rsync -a --ignore-existing --exclude='v1/tmp/' --stats \
+# v1/tmp/ 的排除由源根收窄到 blobs/ 天然达成（spec §3.2 的排除要求）
+rsync -a --ignore-existing --stats \
     "$CASS_DATA_DIR/raw-mirror/v1/blobs/" "$DEST/raw-mirror/v1/blobs/" 8>&- > "$STG/blobs.stats" \
   || fail_incomplete "blobs rsync failed"
 # 供 V11 断言复用：STG 在脚本退出时被 cleanup() 清掉，测试拿不到 $STG/blobs.stats，

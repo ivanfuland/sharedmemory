@@ -469,6 +469,30 @@ def test_digest_chmod_000_on_retained_backup_fails_not_skip(
     assert backup_self_problems, "④ 自校验独立遇到同一损坏也必须报问题，不依赖只靠链校验兜底"
 
 
+@requires_cass
+def test_digest_non_dict_scalar_on_retained_backup_fails(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """whole-branch review 修复项：`digest.json` 是合法 JSON 但裸标量（如 `5`）
+    ——`read_digest` 原样返回它，后续 `"db_sha256" not in digest`/`field not in
+    digest` 对 int 会 TypeError。必须干净 FAIL（不是 crash），语义与坏 JSON 同。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+
+    rc, out = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "digest-scalar")
+    assert rc == 0, out
+
+    digest_path = dest / "cass-digest-scalar" / "digest.json"
+    digest_path.write_bytes(b"5")
+
+    problems = cass_weekly.verify_weekly(dest, keep=7)
+    assert problems, "非 dict digest.json（裸标量）必须让周校验 FAIL，不是 crash 或静默跳过"
+
+    backup_self_problems = cass_weekly.verify_backup_self(dest / "cass-digest-scalar")
+    assert backup_self_problems, "④ 自校验独立遇到同一损坏也必须干净报问题，不 TypeError"
+
+
 # ---------------------------------------------------------------------------
 # ⑤ sessions.state.tsv 首行篡改 → FAIL
 # ---------------------------------------------------------------------------

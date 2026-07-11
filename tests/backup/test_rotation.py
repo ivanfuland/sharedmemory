@@ -494,3 +494,28 @@ def test_rotation_victims_skips_non_int_generation_unit(tmp_path):
     tip = cass_common.latest_published(dest)
     assert tip is not None and tip[0] == "cass-g3", f"脏 generation 不得干扰 tip 判定: {tip}"
     assert (dirty / "digest.json").read_bytes() == dirty_digest_bytes, "脏目录原封不动"
+
+
+def test_rotation_victims_skips_non_dict_digest_unit(tmp_path):
+    """digest 内容层 skip（单测，whole-branch review 修复项）：`digest.json` 是
+    合法 JSON 但裸标量（如 `5`）——`read_digest` 原样返回它，`"generation" not in
+    digest` 对 int 会 TypeError。归入「读不到 generation」语义：不参与轮转、不
+    被删、不计入 keep 名额，也不让共享扫描崩掉。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    for g in range(1, 4):
+        _make_fake_published(dest, f"cass-g{g}", generation=g)
+    dirty = dest / "cass-scalar"
+    dirty.mkdir()
+    (dirty / "COMPLETE").touch()
+    dirty_digest_bytes = cass_common.dumps_canonical(5)
+    (dirty / "digest.json").write_bytes(dirty_digest_bytes)
+
+    victims = cass_common.rotation_victims(dest, 2)
+    assert victims == ["cass-g1"], (
+        f"3 个合法候选、keep=2 → 只删 generation 1；非 dict digest 不计入名额也不被选: {victims}"
+    )
+
+    tip = cass_common.latest_published(dest)
+    assert tip is not None and tip[0] == "cass-g3", f"非 dict digest 不得干扰 tip 判定: {tip}"
+    assert (dirty / "digest.json").read_bytes() == dirty_digest_bytes, "脏目录原封不动"

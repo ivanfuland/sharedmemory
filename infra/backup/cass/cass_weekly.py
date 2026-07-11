@@ -159,6 +159,13 @@ def verify_backup_self(backup_dir: pathlib.Path) -> list[str]:
         digest = cass_common.read_digest(backup_dir)
         if digest is None:
             problems.append(f"{name}: 缺 digest.json")
+        elif not isinstance(digest, dict):
+            # 合法 JSON 但裸标量（如 `5`/`true`）——归入 FAIL 语义，与坏 JSON 同。
+            # 重置回 None，让下游两处 `if digest is not None:` 守卫按「digest 不
+            # 可用」统一跳过派生字段比较，不因 `"x" not in digest` 对非容器类型
+            # TypeError 崩掉。
+            problems.append(f"{name}: digest.json 内容不是对象（非 dict）")
+            digest = None
     except (OSError, json.JSONDecodeError) as exc:
         problems.append(f"{name}: digest.json 读取失败（{type(exc).__name__}: {exc}）")
 
