@@ -58,9 +58,15 @@ def transcript_filename(meta):
     return f"{_date(meta.get('started_at'))}-cass-{_safe(meta.get('agent'))}-{session_key(meta)}.md"
 
 
+# 覆盖 str.splitlines() 认作行边界的全部分隔符：LF CR VT FF FS-RS NEL LS PS。
+# parser（export._parse_frontmatter_identity）用 splitlines() 切行，_clean 必须清同一集合，
+# 否则 U+2028 等分隔符能绕过净化、在 splitlines 下拆出伪 frontmatter 行（codex 实现审 R1 P2#2）。
+_FM_BREAK = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
 def _clean(v):
-    """净化拼入 frontmatter 的值：换行 → 空格，防止值内换行注入伪 frontmatter 行（codex R1 P1-3）。"""
-    return (v or "").replace("\n", " ").replace("\r", " ")
+    """净化拼入 frontmatter 的值：任何行分隔符 → 空格，防止值内分隔符注入伪 frontmatter 行（codex R1 P1-3 + R2 P2#2）。"""
+    return _FM_BREAK.sub(" ", v or "")
 
 
 def _frontmatter(meta):

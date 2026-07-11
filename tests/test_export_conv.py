@@ -295,6 +295,39 @@ def test_identity_of_file_huge_unclosed_is_foreign(tmp_path):
     assert _export._identity_of_file(str(p)) == "FOREIGN"
 
 
+def test_read_frontmatter_head_uses_bounded_read_not_iteration(monkeypatch):
+    """杀"退回 for line in f"变异（codex 实现审 R2 P2#3）：huge-unclosed 断言只看结果=FOREIGN，
+    退回逐行迭代仍会绿（只是多读内存）。这里用只支持 read(n)、__iter__ 会 assert 失败的假 file
+    钉住"必须走 bounded read(cap)、绝不迭代"，不依赖 128MB 真文件。"""
+    import builtins
+
+    class BoundedOnly:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n=-1):
+            assert n == 262144, f"必须 bounded read(cap)，实际 n={n}"
+            return "---\n" + ("x" * (n - 4))
+
+        def __iter__(self):
+            raise AssertionError("必须 bounded read(cap)，不得 `for line in f` 迭代")
+
+    monkeypatch.setattr(builtins, "open", lambda *a, **k: BoundedOnly())
+    assert len(_export._read_frontmatter_head("ignored.md")) == 262144
+    assert _export._identity_of_file("ignored.md") == "FOREIGN"
+
+
+def test_clean_neutralizes_all_splitlines_separators():
+    """_clean 必须清 str.splitlines() 认作行边界的每一个分隔符（codex 实现审 R2 P2#2）：
+    只清 \\n\\r 时 U+2028 等能绕过净化、在 parser 的 splitlines() 下拆出伪 frontmatter 行。"""
+    for sep in ["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]:
+        cleaned = render._clean(f"/p{sep}external_id: evil")
+        assert len(cleaned.splitlines()) == 1, f"分隔符 {sep!r} 未被净化，仍会拆行"
+
+
 def test_validate_text_identity_whitespace_canonical():
     """身份值前后空格：parser 的 .strip() 与 _identity_of_meta 的 strip 对称 → 不误 fail-loud（codex R2 P2#3）。"""
     meta = {"external_id": " ext-a ", "source_id": "local", "agent": "codex"}
