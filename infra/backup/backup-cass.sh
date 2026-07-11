@@ -385,7 +385,7 @@ case "$FAULT" in
     # Task 10 carry-forward（14a e2e）：manifests 快照刚落 NAS，翻转第一个 manifest
     # 文件一个字节——`manifests.sha256sum` 是在同一时刻用未被破坏的字节算出来的，
     # 故 step 14a 的完整性门必须能抓到这处调包（14a FAIL e2e 路径，此前一直不可达）。
-    first_manifest="$(find "$INCOMPLETE_DIR/manifests" -maxdepth 1 -type f | sort | head -n1)"
+    first_manifest="$(command find "$INCOMPLETE_DIR/manifests" -maxdepth 1 -type f | sort | head -n1)"
     if [ -n "$first_manifest" ]; then
       printf '\xFF' | dd of="$first_manifest" bs=1 count=1 seek=0 conv=notrunc status=none 8>&-
     fi
@@ -513,7 +513,7 @@ for pair in "${SESSION_ROOT_PAIRS[@]}"; do
   # 为空）则什么也不做——不能对不存在的路径 `dd`，那会凭空造出一个坏文件。
   RSYNC_EXTRA_ARGS=()
   if [ "$FAULT" = "rewrite-src-mid-rsync" ]; then
-    fault_target="$(find "$session_root_path" -name '*.jsonl' -type f 2>/dev/null | sort | head -n1)"
+    fault_target="$(command find "$session_root_path" -name '*.jsonl' -type f 2>/dev/null | sort | head -n1)"
     if [ -n "$fault_target" ]; then
       (sleep 0.2; printf 'BAD' | dd of="$fault_target" conv=notrunc bs=1 count=3 2>/dev/null) &
       RSYNC_EXTRA_ARGS+=(--bwlimit=1)
@@ -824,29 +824,36 @@ if [ -n "$TG_TEXT" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# step 16 — keep-N 轮转（spec §6 step 16 / §7 / §11 逐字）：只匹配含 `COMPLETE`
-# 的 `cass-*/` 目录，按各自 digest.json 的 `generation` 升序删除最旧的若干个，
-# 只留 KEEP 个。不按 mtime（`touch`/`cp -a`/restore 演练都会改写它）。读不到
-# `generation` 的目录（无 digest.json / 坏 JSON / 缺键 / 非 int）不参与轮转也
-# 不被删。选点逻辑全部委托给 `cass_common.rotation_victims`（`$VENV_PY` 胶水，
-# 不裸 grep/sed 解析 JSON）——它只扫 `cass-*` 前缀且含 `COMPLETE` 的目录，
-# `SUSPECT-*`/`INCOMPLETE-*`/`RECOVERABLE-*`/`raw-mirror/`/`sessions/`/
-# `sessions.state.tsv`/既有 `agent_search.db.pre-franken-*`/无 `COMPLETE` 的
-# `cass-*/` 天然不在候选集里，无需额外排除逻辑。禁裸 glob for 循环——victim
-# 列表读进 bash 数组（nullglob 已开，数组展开安全），删除动作仍在 shell 里
-# 逐个做。
+# step 16 — 轮转（spec §6 step 16 / §7 / §11 逐字）：只匹配含 `COMPLETE` 的
+# `cass-*/` 目录，按各自 digest.json 的 `generation` 排序删除。不按 mtime
+# （`touch`/`cp -a`/restore 演练都会改写它）。读不到 `generation` 的目录（无
+# digest.json / 坏 JSON / 缺键 / 非 int）不参与轮转也不被删。选点逻辑全部委托给
+# `cass_common`（`$VENV_PY` 胶水，不裸 grep/sed 解析 JSON）——它只扫 `cass-*`
+# 前缀且含 `COMPLETE` 的目录，`SUSPECT-*`/`INCOMPLETE-*`/`RECOVERABLE-*`/
+# `raw-mirror/`/`sessions/`/`sessions.state.tsv`/既有 `agent_search.db.pre-franken-*`/
+# 无 `COMPLETE` 的 `cass-*/` 天然不在候选集里，无需额外排除逻辑。禁裸 glob for
+# 循环——victim 列表读进 bash 数组（nullglob 已开，数组展开安全），删除动作仍在
+# shell 里逐个做。
+#
+# 两种轮转语义按本次是否 retention_reset 分流（codex R5-P1，spec §8.3）：
+#   - **常规**：`rotation_victims`——keep-N，只留 KEEP 个最新。
+#   - **retention_reset**：`pre_reset_victims`——本次是重置点，清掉所有 generation
+#     < 本次的含 COMPLETE 的 cass-*，使重置点成为 R 中链头（spec §8.3「带它的那份
+#     必须是链头」+「早于 r 的备份允许不在 R」）。默认 KEEP=7 且 DEST 有旧 cass-*
+#     时，若仍按 keep-N 只删超额，旧份留在 R → 新份不是链头 → verify_chain 必 FAIL；
+#     不清前，就会静默发布一个周校验/restore 前置会拒绝的链状态。
 #
 # 选点两段式（不用 `mapfile < <(...)`——进程替换会吞掉 python 的 exit code）：
 # 先落 `$STG/rotate.victims` 并检查 rc；python 崩溃（如 DEST 某 cass-*/ 目录
 # OS 级不可读——`_iter_published` 的目录探测层刻意上抛，见其两层语义注释）→
 # ROTATE_FAIL=1、本轮一个都不删——与脚本内其他 heredoc 的 rc 纪律一致。备份
-# 本身已发布，不回滚。（注：该 rc 分支目前没有可从进程外构造的 e2e 触发器——
-# 同一目录不可读会先让 step 9 五腿门的 latest_published 崩掉、当晚根本走不到
-# 这里，见 test_rotation.py 的说明；分支正确性由构型一致性 + 单测覆盖。）
+# 本身已发布，不回滚。
 # ---------------------------------------------------------------------------
 ROTATE_FAIL=0
 ROTATE_VICTIMS=()
-if ! LIB="$LIB" DEST="$DEST" KEEP="$KEEP" "$VENV_PY" 8>&- - > "$STG/rotate.victims" <<'PYEOF'
+if ! LIB="$LIB" DEST="$DEST" KEEP="$KEEP" PUBLISHED_DIR="$PUBLISHED_DIR" \
+    RETENTION_RESET="$RETENTION_RESET" "$VENV_PY" 8>&- - > "$STG/rotate.victims" <<'PYEOF'
+import json
 import os
 import pathlib
 import sys
@@ -854,7 +861,17 @@ import sys
 sys.path.insert(0, os.environ["LIB"])
 import cass_common  # noqa: E402
 
-for name in cass_common.rotation_victims(pathlib.Path(os.environ["DEST"]), int(os.environ["KEEP"])):
+dest = pathlib.Path(os.environ["DEST"])
+if os.environ.get("RETENTION_RESET"):
+    # 重置点：清掉所有 generation < 本次的份（spec §8.3）。本次 generation 从
+    # 已发布 digest.json 读——它自身 gen == reset_generation 不 < ，绝不被选。
+    published_digest = json.loads(
+        (pathlib.Path(os.environ["PUBLISHED_DIR"]) / "digest.json").read_bytes()
+    )
+    victims = cass_common.pre_reset_victims(dest, published_digest["generation"])
+else:
+    victims = cass_common.rotation_victims(dest, int(os.environ["KEEP"]))
+for name in victims:
     print(name)
 PYEOF
 then
@@ -872,6 +889,26 @@ for victim in "${ROTATE_VICTIMS[@]}"; do
     ROTATE_FAIL=1
   fi
 done
+
+# ---------------------------------------------------------------------------
+# step 16b — retention_reset 链自检 preflight（codex R5-P1）：重置点发布 + 前清
+# 之后，立刻在同一次运行里跑一次 verify_chain——「发布出链非法状态」这条从结构上
+# 堵死，不依赖恰好是 VERIFY_DOW（否则非校验日会走成功出口，静默发布一个周校验/
+# restore 前置会拒绝的链状态）。失败 ⇒ 把已发布的重置点改名 RECOVERABLE-*（
+# TRAP_INCOMPLETE 早已在发布成功时清空，这里显式 mv）+ exit 非零告警，绝不静默。
+# 只对 retention_reset 跑（它是唯一会主动改动 R 组成、可能自造非法链头的路径）。
+# ---------------------------------------------------------------------------
+RESET_PREFLIGHT_FAIL=0
+if [ -n "$RETENTION_RESET" ]; then
+  if "$VENV_PY" "$LIB/cass_chain.py" --dest "$DEST" --keep "$KEEP" 8>&-; then
+    echo "[backup] retention_reset chain preflight: PASS"
+  else
+    RESET_PREFLIGHT_FAIL=1
+    echo "[backup] ALERT: retention_reset published but verify_chain preflight FAILED" \
+      "— moving to RECOVERABLE-$STAMP (needs human review; do not trust as published tip)"
+    mv -T "$PUBLISHED_DIR" "$DEST/RECOVERABLE-$STAMP" 2>/dev/null || true
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # step 17 — 轮转失败 → loud：删除失败不回滚已发布的备份（它已经安全），但必须
@@ -899,17 +936,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 最终 exit 语义：备份本身已发布成功（cass-$STAMP/ 完好），但四类人工告警
+# 最终 exit 语义：备份本身已发布成功（cass-$STAMP/ 完好），但五类人工告警
 # 若发生仍要 exit 非零（DEV-6 的 RECOVERABLE 救援 / TG 发送失败 / 轮转删除
-# 失败 / 周校验 FAIL）——告警不能因为「主线成功」就被吞掉。
+# 失败 / retention_reset 链自检失败 / 周校验 FAIL）——告警不能因为「主线成功」
+# 就被吞掉。
 # ---------------------------------------------------------------------------
 if [ "$ALERT_FLAG" = 1 ]; then
   echo "[backup] gate passed but a stale RECOVERABLE-* alert was raised above — exiting non-zero (DEV-6)"
 fi
+if [ "$RESET_PREFLIGHT_FAIL" = 1 ]; then
+  echo "[backup] retention_reset chain preflight FAILED above — exiting non-zero (codex R5-P1)"
+fi
 if [ "$WEEKLY_FAIL" = 1 ]; then
   echo "[backup] gate passed but weekly deep verify (step 18) FAILED above — exiting non-zero"
 fi
-if [ "$ALERT_FLAG" = 1 ] || [ "$TG_ALERT" = 1 ] || [ "$ROTATE_FAIL" = 1 ] || [ "$WEEKLY_FAIL" = 1 ]; then
+if [ "$ALERT_FLAG" = 1 ] || [ "$TG_ALERT" = 1 ] || [ "$ROTATE_FAIL" = 1 ] \
+    || [ "$RESET_PREFLIGHT_FAIL" = 1 ] || [ "$WEEKLY_FAIL" = 1 ]; then
   exit 1
 fi
 echo "[backup] published: $PUBLISHED_DIR"

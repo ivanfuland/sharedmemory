@@ -318,6 +318,49 @@ def test_rotation_victims_still_lenient_skips_bad_generation(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# codex R5-P1：pre_reset_victims —— retention_reset 清掉所有 generation < 重置点的份
+# ---------------------------------------------------------------------------
+
+
+def test_pre_reset_victims_selects_all_older_than_reset_point(tmp_path):
+    """重置点 generation=4：gen1/2/3 全部选为待删，重置点自身（gen4）不 < 4，绝不
+    被选。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    for i in range(1, 4):
+        _make_published_backup(dest, f"cass-{i}", generation=i)
+    _make_published_backup(dest, "cass-reset", generation=4)
+
+    victims = cass_common.pre_reset_victims(dest, reset_generation=4)
+    assert set(victims) == {"cass-1", "cass-2", "cass-3"}
+    assert "cass-reset" not in victims
+
+
+def test_pre_reset_victims_lenient_skips_bad_generation(tmp_path):
+    """同族：读不到 generation 的目录不参与、不被删（宽容 skip，同 rotation_victims）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _make_published_backup(dest, "cass-1", generation=1)
+    _make_published_backup(dest, "cass-reset", generation=5)
+    bad = dest / "cass-badgen"
+    bad.mkdir()
+    (bad / "digest.json").write_bytes(cass_common.dumps_canonical({"generation": "x"}))
+    (bad / "COMPLETE").write_bytes(b"")
+
+    victims = cass_common.pre_reset_victims(dest, reset_generation=5)
+    assert victims == ["cass-1"]
+    assert "cass-badgen" not in victims
+
+
+def test_pre_reset_victims_empty_when_reset_is_only_backup(tmp_path):
+    """重置点是唯一一份（首次即 retention_reset）→ 无更旧的份，待删列表为空。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _make_published_backup(dest, "cass-reset", generation=1)
+    assert cass_common.pre_reset_victims(dest, reset_generation=1) == []
+
+
+# ---------------------------------------------------------------------------
 # state_read / state_write_atomic
 # ---------------------------------------------------------------------------
 

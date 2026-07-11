@@ -178,6 +178,24 @@ def rotation_victims(dest, keep: int) -> list[str]:
     return [name for _generation, name, _digest in published[:n_victims]]
 
 
+def pre_reset_victims(dest, reset_generation: int) -> list[str]:
+    """retention_reset 轮转选点（spec §8.3，codex R5-P1）：返回所有 `generation <
+    reset_generation` 的含 `COMPLETE` 的 `cass-*/` 目录名——retention_reset 是重置
+    点，其**前**的备份全部轮转掉，使重置点成为 R 中链头（spec §8.3「带它的那份必须
+    是链头」+「早于 r 的备份允许不在 R——它们就是被重置掉的」）。这与 keep-N 常规
+    轮转不同：不留 keep 个，重置点之前一律清空。
+
+    宽容 skip 语义同 `rotation_victims`（读不到 `generation` 的目录不参与、不被删，
+    `_iter_published` 已筛掉）；目录探测层 OS 级错误照常上抛。保护集
+    （SUSPECT-*/INCOMPLETE-*/RECOVERABLE-*/raw-mirror/sessions/state/pre-franken）
+    天然不匹配「含 COMPLETE 的 cass-*/」，不在候选集里。`reset_generation` 是本次
+    发布（重置点）的 generation——它自身 `gen == reset_generation` 不 `< `，绝不
+    被选为 victim。"""
+    return [
+        name for gen, name, _digest in _iter_published(dest) if gen < reset_generation
+    ]
+
+
 def state_read(path) -> list[SessionRec]:
     """校验首行 `#sha256 <其余全部字节的 sha256 十六进制>`；不符则 raise StateCorrupt。"""
     path = pathlib.Path(path)

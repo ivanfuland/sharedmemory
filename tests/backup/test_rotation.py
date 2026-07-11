@@ -58,6 +58,7 @@ import time
 
 import pytest
 
+import cass_chain
 import cass_common
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -91,6 +92,16 @@ def _write_verified_doctor_stub(home: pathlib.Path, manifests_dir: pathlib.Path)
     }
     doc = {"raw_mirror": {"status": "verified", "summary": summary}}
     (home / ".cass-stub-doctor.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _write_curl_stub(stub_dir: pathlib.Path) -> None:
+    """PATH 上插一个永远 exit 0 的 curl stub——retention_reset/rebaseline 是审计
+    事件，必须成功发 TG 才不置 TG_ALERT；测试环境没有真 TG，给个吞掉一切的 stub
+    （同 test_publish.py 的写法）。"""
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    stub = stub_dir / "curl"
+    stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
 
 
 def _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, stamp, extra_env=None):
@@ -354,6 +365,100 @@ def test_corrupt_published_member_fails_gate_before_rotation_runs(
     assert bad.is_dir(), "坏 digest 目录原封"
     assert (bad / "COMPLETE").is_file()
     assert (bad / "digest.json").read_bytes() == bad_digest_bytes, "坏 digest.json 内容应原封不动"
+
+
+# ---------------------------------------------------------------------------
+# codex R5-P1：retention_reset 轮转特殊语义（清掉所有 gen < 重置点的份，使重置点
+# 成为链头）+ 同一次运行内 verify_chain preflight（不依赖 VERIFY_DOW）。
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_retention_reset_prunes_all_pre_reset_backups_and_chain_verifies(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """DEST 预置 3 份旧 cass-*（gen1-3，gen3 是真 tip 供 gate 做 leg3/4 比对 +
+    R2/R4 基线校验）→ 带 retention_reset=1+reason 跑一晚 → 只剩新发布那份（旧 3
+    份全被清，不是 keep-7 留超额），digest 含 retention_reset+reason，脚本内
+    verify_chain preflight PASS（不依赖 VERIFY_DOW），独立再断言一次链 PASS。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    db = synth_dd / "agent_search.db"
+    scratch = tmp_path / "gate-scratch"
+
+    _make_fake_published(dest, "cass-old-1", generation=1)
+    _make_fake_published(dest, "cass-old-2", generation=2)
+    _publish_real_tip(dest, "cass-old-3", db, generation=3, scratch_dir=scratch)
+
+    # retention_reset 是审计事件，成功也发 TG——给 curl stub + TG env，否则
+    # TG_ALERT 会让脚本 exit 非零（那条分支由 test_publish.py 覆盖，这里聚焦轮转）。
+    tg_env = tmp_path / "tg.env"
+    tg_env.write_text(
+        'TELEGRAM_BOT_TOKEN="fake-token"\nTELEGRAM_CHAT_ID="12345"\n', encoding="utf-8"
+    )
+    curl_stub_dir = tmp_path / "curl-stub-bin"
+    _write_curl_stub(curl_stub_dir)
+
+    reason = "manual retention window reset e2e"
+    rc, out = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "reset-new",
+        extra_env={
+            "CASS_BACKUP_RETENTION_RESET": "1",
+            "CASS_BACKUP_RETENTION_RESET_REASON": reason,
+            "CASS_BACKUP_KEEP": "7",
+            "CASS_BACKUP_TG_ENV": str(tg_env),
+            "PATH": f"{curl_stub_dir}{os.pathsep}{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+        },
+    )
+    assert rc == 0, out
+
+    new_dir = dest / "cass-reset-new"
+    assert new_dir.is_dir(), out
+    assert (new_dir / "COMPLETE").is_file()
+
+    # 重置点之前一律清空（不是 keep-7 只删超额——4 份 < 7，keep-N 一个都不会删）：
+    remaining = sorted(p.name for p in dest.glob("cass-*") if (p / "COMPLETE").is_file())
+    assert remaining == ["cass-reset-new"], f"retention_reset 应清掉所有旧份：{remaining}\n{out}"
+    for g in (1, 2, 3):
+        assert not (dest / f"cass-old-{g}").exists(), f"cass-old-{g} 应被重置清掉"
+
+    digest = json.loads((new_dir / "digest.json").read_bytes())
+    assert digest["retention_reset"] is True
+    assert digest["retention_reset_reason"] == reason
+
+    # 脚本内 preflight 跑过且 PASS；这里独立再断言一次（R = {重置点}，合法链头）。
+    assert "retention_reset chain preflight: PASS" in out, out
+    assert cass_chain.verify_chain(dest, keep=7) == [], out
+
+
+@requires_cass
+def test_normal_night_keeps_pre_existing_backups_contrast(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """对照：同样预置 3 份旧 cass-*，但**不带** retention_reset 的普通晚 → keep-7
+    下 4 份（旧 3 + 新 1）全部保留（旧份按 keep 保留，不被清），且不跑 preflight。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    db = synth_dd / "agent_search.db"
+    scratch = tmp_path / "gate-scratch"
+
+    _make_fake_published(dest, "cass-old-1", generation=1)
+    _make_fake_published(dest, "cass-old-2", generation=2)
+    _publish_real_tip(dest, "cass-old-3", db, generation=3, scratch_dir=scratch)
+
+    rc, out = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "normal-new",
+        extra_env={"CASS_BACKUP_KEEP": "7"},
+    )
+    assert rc == 0, out
+
+    remaining = sorted(p.name for p in dest.glob("cass-*") if (p / "COMPLETE").is_file())
+    assert remaining == ["cass-normal-new", "cass-old-1", "cass-old-2", "cass-old-3"], (
+        f"普通晚 keep-7 下旧份应全部保留：{remaining}\n{out}"
+    )
+    assert "retention_reset chain preflight" not in out, "普通晚不该跑 retention_reset preflight"
 
 
 # ---------------------------------------------------------------------------
