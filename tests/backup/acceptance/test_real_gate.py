@@ -373,6 +373,46 @@ def test_v5d4_attack7_last_scan_ts_row_deleted(fixtures_dir, probe_baseline_dest
     assert "last_scan_ts" in leg4_line
 
 
+def test_v5d2_watermark_trailing_newline_real_db_fails_leg4_r7(
+    fixtures_dir, probe_baseline_dest, tmp_path
+):
+    """codex R7-P0 真库钉子：probe-snapshot baseline + `last_scan_ts` 改成「同数字
+    + 尾随 \\n」（数值上未回退，只有整数门的严格性能拦）。修复前 `^[0-9]+$` +
+    `.match()` 把它当合法整数放行（`int("...\\n")` 成功）→ 完整跑 gate rc=0 五腿全
+    PASS，spec-invalid 水位当好备份放行（codex 真库实测复现）。fullmatch 后：gate
+    exit 1、腿 4 FAIL 指认水位解析失败；只动 meta 一个值，腿 3 普查/指纹不受影响。
+    可写副本用完即删（2.3G 级，磁盘保护）。"""
+    probe_db = fixtures_dir / "probe-snapshot.db"
+    generated = tmp_path / "watermark-newline.db"
+    shutil.copyfile(probe_db, generated)
+    try:
+        con = sqlite3.connect(str(generated))
+        try:
+            cur_val = con.execute(
+                "SELECT value FROM meta WHERE key='last_scan_ts'"
+            ).fetchone()[0]
+            con.execute(
+                "UPDATE meta SET value=? WHERE key='last_scan_ts'", (f"{cur_val}\n",)
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        census = tmp_path / "census.tsv"
+        gate_json = tmp_path / "gate.json"
+        rc, out, err = _run_gate_cli(generated, probe_baseline_dest, census, gate_json, timeout=60)
+    finally:
+        generated.unlink(missing_ok=True)
+
+    assert rc == 1, f"含尾随 \\n 的水位必须整体 FAIL：\nSTDOUT={out}\nSTDERR={err}"
+    verdicts = _leg_verdicts(out)
+    assert verdicts[4] == "FAIL", out
+    assert verdicts[3] == "PASS", "只动了 meta 一个值，腿3 普查/指纹应不受影响"
+    leg4_line = next(line for line in out.splitlines() if line.startswith("[leg 4]"))
+    assert "last_scan_ts" in leg4_line
+    assert "解析失败" in leg4_line
+
+
 # ---------------------------------------------------------------------------
 # Step 2 —— 生成器对拍：fixture_factory.attack1..7 应用到 probe-snapshot.db 的
 # 可写副本，与保险副本 attack*.db 跑同一个五腿门，比较逐腿 verdict（不比字节）。

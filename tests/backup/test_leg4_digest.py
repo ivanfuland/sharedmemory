@@ -484,6 +484,34 @@ def test_schema_version_non_numeric_value_fails_v5d2(synth_dd):
     assert "解析失败" in result.detail
 
 
+@requires_cass
+def test_watermark_trailing_newline_fails_full_leg4_v5d2_r7(synth_dd):
+    """codex R7-P0 全腿层：`last_scan_ts` 改成「同数字 + 尾随 \\n」——旧 `.match()`
+    会把它当合法整数放行（`int("...\\n")` 成功），fullmatch 后 leg4 必须 FAIL 且
+    detail 指认水位解析失败。这是真库复现（probe-snapshot baseline + last_scan_ts
+    改 `数字\\n` → gate rc=0）的单元层钉子。"""
+    db = synth_dd / "agent_search.db"
+    con = sqlite3.connect(str(db))
+    try:
+        baseline = leg4(con, prev_tables=None, prev_watermarks=None)
+        cur_val = con.execute("SELECT value FROM meta WHERE key='last_scan_ts'").fetchone()[0]
+        # 同数字 + 尾随换行：数值上「未回退」，只有整数门的严格性能拦它。
+        con.execute("UPDATE meta SET value=? WHERE key='last_scan_ts'", (f"{cur_val}\n",))
+        con.commit()
+    finally:
+        con.close()
+
+    con = sqlite3.connect(str(db))
+    try:
+        result = leg4(con, baseline.tables, baseline.meta_watermarks)
+    finally:
+        con.close()
+
+    assert result.ok is False, f"含尾随 \\n 的水位必须 FAIL: {result.detail}"
+    assert "last_scan_ts" in result.detail
+    assert "解析失败" in result.detail
+
+
 # ---------------------------------------------------------------------------
 # 攻击⑦：删 last_scan_ts 整行——必需清单拦，99% 阈值式检查本会放行（V5d4）
 # ---------------------------------------------------------------------------
@@ -632,6 +660,22 @@ def test_leg4_parse_uint_valid_and_invalid():
     assert _leg4_parse_uint("-1") is None
     assert _leg4_parse_uint(None) is None
     assert _leg4_parse_uint(123) is None
+
+
+def test_leg4_parse_uint_rejects_dollar_anchor_edge_cases_v5d2():
+    """codex R7-P0：`^[0-9]+$` + `.match()` 的 `$` 会匹配到 trailing newline **之前**，
+    让 `"数字\\n"` 过匹配、`int()` 还能成功 → spec-invalid 水位当好备份放行。fullmatch
+    整串锚定后，尾随 \\n / 前导 \\n / 内嵌空格 / 前后空白 一律 FAIL（返回 None）。"""
+    assert _leg4_parse_uint("1783605600227\n") is None, "尾随 \\n 必须拒（P0 真库复现的核心）"
+    assert _leg4_parse_uint("\n10") is None, "前导 \\n 必须拒"
+    assert _leg4_parse_uint("10\n20") is None, "内嵌 \\n 必须拒"
+    assert _leg4_parse_uint("1 0") is None, "内嵌空格必须拒"
+    assert _leg4_parse_uint(" 10") is None, "前导空格必须拒"
+    assert _leg4_parse_uint("10 ") is None, "尾随空格必须拒"
+    assert _leg4_parse_uint("10\t") is None, "尾随制表符必须拒"
+    assert _leg4_parse_uint("+10") is None, "前导正号必须拒"
+    # 干净整数仍照常解析（不误伤）：
+    assert _leg4_parse_uint("1783605600227") == 1783605600227
 
 
 def test_required_watermark_keys_matches_fixture_factory_list():

@@ -423,6 +423,31 @@ def test_baseline_meta_watermarks_missing_last_scan_ts_fails(gate_baseline, tmp_
 
 
 @requires_cass
+def test_baseline_prefix_digest_trailing_newline_fails_r7(gate_baseline, tmp_path):
+    """codex R7 同族硬化（`_HEX64_RE.match()`→`.fullmatch()`）：基线 digest.json 的
+    `tables.messages.prefix_digest` 尾随一个 \\n（65 字节）。旧 `^[0-9a-f]{64}$` +
+    `.match()` 会放它过结构门（`$` 匹配到 \\n 之前）→ 结构校验假通过，只在腿 4 才
+    以「前缀摘要不符」间接暴露；fullmatch 后 `_validate_baseline` 直接在结构门指认
+    `prefix_digest 非法`，响亮报「需人工 rebaseline」。"""
+    db, dest = gate_baseline
+    digest_path = dest / "cass-baseline" / "digest.json"
+    digest = json.loads(digest_path.read_bytes())
+    digest["tables"]["messages"]["prefix_digest"] = (
+        digest["tables"]["messages"]["prefix_digest"] + "\n"
+    )
+    digest_path.write_bytes(cass_common.dumps_canonical(digest))
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"stdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" in out, out
+    assert "prefix_digest" in out and "非法" in out, out
+    assert "需人工 rebaseline" in out, out
+
+
+@requires_cass
 def test_baseline_rebaseline_escape_hatch_bypasses_validation(gate_baseline, tmp_path):
     """逃生门回归：同一份毒基线（挖掉 `meta_watermarks.last_scan_ts`），用
     `--rebaseline` 指名它（它仍是链 tip，`_validate_rebaseline_target` 三项校验

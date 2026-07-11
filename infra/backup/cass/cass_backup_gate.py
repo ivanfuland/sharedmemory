@@ -66,7 +66,10 @@ def leg0(con) -> LegResult:
 
 _SIG_A_STDOUT = "ok"
 _SIG_B_STDERR = "Error: stepping, database disk image is malformed (11)"
-_SIG_B_LINE_RE = re.compile(r"^(\*\*\* in database main \*\*\*|Page \d+: never used)$")
+# `.fullmatch()`（见 `classify_integrity`）：这里输入是 `stdout.splitlines()`（已剥离行
+# 终止符），`.match()` + `^...$` 今天等价于 fullmatch、无尾随 \n 隐患；改 fullmatch 是
+# 同族硬化——彻底关掉「`$` 匹配到 trailing newline 之前」这一类 foot-gun，行为不变。
+_SIG_B_LINE_RE = re.compile(r"(\*\*\* in database main \*\*\*|Page \d+: never used)")
 
 
 def classify_integrity(stdout: str, stderr: str, exit_code: int) -> Literal["A", "B", "FAIL"]:
@@ -84,7 +87,7 @@ def classify_integrity(stdout: str, stderr: str, exit_code: int) -> Literal["A",
 
     if (
         stdout_lines
-        and all(_SIG_B_LINE_RE.match(line) for line in stdout_lines)
+        and all(_SIG_B_LINE_RE.fullmatch(line) for line in stdout_lines)
         and stderr.rstrip("\n") == _SIG_B_STDERR
     ):
         return "B"
@@ -404,7 +407,13 @@ REQUIRED_LEG4_WATERMARK_KEYS: tuple[str, ...] = (
     "schema_version",
 )
 
-_LEG4_UINT_RE = re.compile(r"^[0-9]+$")
+# `.fullmatch()`（不是 `.match()`）：Python 的 `$` 会匹配到 trailing newline **之前**，
+# 故 `^[0-9]+$` + `.match()` 对 `"1783605600227\n"` 过匹配、`int()` 还能成功 → spec-
+# invalid 的水位（含尾随 \n）被当合法整数放行（codex R7-P0 真库复现；与 Task 8 tier0
+# 的 blob hex `.match()`→`.fullmatch()` 完全同源）。spec §5.5(b)/§11：先过 `^[0-9]+$`、
+# 解析失败即 FAIL，且按十进制整数比较。fullmatch 锚定整串，尾随 \n / 前导 \n / 内嵌
+# 空格一律拒。
+_LEG4_UINT_RE = re.compile(r"[0-9]+")
 
 
 def _enc(v):
@@ -457,9 +466,9 @@ class Leg4Result:
 
 
 def _leg4_parse_uint(value) -> int | None:
-    """`^[0-9]+$` 校验后解析为无符号整数；不满足正则或非字符串一律返回 None
-    （调用方按「解析失败即 FAIL」处理，不是跳过）。"""
-    if not isinstance(value, str) or not _LEG4_UINT_RE.match(value):
+    """`fullmatch([0-9]+)` 校验后解析为无符号整数；不满足（含尾随/前导 `\\n`、内嵌
+    空格）或非字符串一律返回 None（调用方按「解析失败即 FAIL」处理，不是跳过）。"""
+    if not isinstance(value, str) or not _LEG4_UINT_RE.fullmatch(value):
         return None
     return int(value)
 
@@ -647,7 +656,10 @@ def _validate_rebaseline_target(
 
 # codex R2-P0 修复：基线的 census.tsv/digest.json 供腿 3/4 消费的子结构必须
 # 「全有或全无」——见 `_validate_baseline` docstring。
-_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+# 用 `.fullmatch()`（见下方 `_validate_baseline`）：`prefix_digest` 来自基线 digest.json
+# （对抗信道），`^...$` + `.match()` 会放过「64 hex + 尾随 \n」这类 spec-invalid 值
+# 进结构门（codex R7-P0 同族），须整串锚定。
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _validate_baseline(
@@ -720,7 +732,7 @@ def _validate_baseline(
                 f'基线 digest.json 的 tables["{table_name}"].count 非法'
                 f"（{count!r}，应为非负 int）——基线损坏/被改，需人工 rebaseline"
             )
-        if not isinstance(prefix_digest, str) or not _HEX64_RE.match(prefix_digest):
+        if not isinstance(prefix_digest, str) or not _HEX64_RE.fullmatch(prefix_digest):
             return (
                 f'基线 digest.json 的 tables["{table_name}"].prefix_digest 非法'
                 f"（{prefix_digest!r}，应为 64 位十六进制字符串）"
