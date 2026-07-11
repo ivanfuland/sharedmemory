@@ -688,6 +688,90 @@ def test_publish_gate_unknown_alias_in_state_is_internal_error(tmp_path):
     assert rc == 1
 
 
+# ---------------------------------------------------------------------------
+# codex R4-P1：发布门必须扫 $DEST/sessions/ 实际全部内容，未知顶层 alias / 裸文件
+# 也要 FAIL（spec §6.3.1「NAS 上任何无清单记录文件 ⇒ FAIL」）。修复前发布门只枚举
+# --roots 已知 alias 的子树，`sessions/rogue/stray.jsonl` 整个逃过验收（rc=0）。
+# ---------------------------------------------------------------------------
+
+
+def test_r4_rogue_file_under_unknown_alias_fails(tmp_path):
+    """codex 复现：`sessions/rogue/stray.jsonl`（rogue 不是 --roots 里的 alias）
+    + 空 state + 空 transferred → 发布门必须 FAIL，不写 state/out-tsv，且不可被
+    --adopt 收编（未知 alias 无 source root 可对账）。"""
+    sessions_root = tmp_path / "sessions"
+    (sessions_root / "rogue").mkdir(parents=True)
+    (sessions_root / "rogue" / "stray.jsonl").write_bytes(b"i-am-an-orphan\n")
+    state_path = tmp_path / "state.tsv"  # 从不存在起
+    transferred = tmp_path / "transferred.txt"
+    transferred.write_text("")
+    out_tsv = tmp_path / "out" / "sessions.tsv"
+
+    rc = cass_sessions.publish_gate(
+        str(state_path), str(sessions_root), "alpha=" + str(tmp_path / "src"),
+        str(transferred), str(out_tsv),
+    )
+    assert rc == 1, "未知 alias 下的 rogue 文件必须 FAIL（spec §6.3.1）"
+    assert not state_path.exists(), "FAIL 时不写 state"
+    assert not out_tsv.exists(), "FAIL 时不写 out-tsv"
+
+    # --adopt 也救不了它（adopt 只收编已知 root 下的 receiver-only 文件）：
+    rc_adopt = cass_sessions.publish_gate(
+        str(state_path), str(sessions_root), "alpha=" + str(tmp_path / "src"),
+        str(transferred), str(out_tsv), adopt=True, adopt_reason="尝试收编 rogue",
+    )
+    assert rc_adopt == 1, "未知 alias 的 rogue 文件不可 --adopt，必须仍 FAIL"
+
+
+def test_r4_bare_file_at_sessions_root_fails(tmp_path):
+    """裸文件直接落在 `$DEST/sessions/` 根下（无 alias/子路径）——同样是无清单记录
+    的 orphan，必须 FAIL，不能因为 `_split_relpath` 拆不出 alias 就静默跳过。"""
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    (sessions_root / "bare.jsonl").write_bytes(b"loose-file\n")
+    state_path = tmp_path / "state.tsv"
+    transferred = tmp_path / "transferred.txt"
+    transferred.write_text("")
+    out_tsv = tmp_path / "out" / "sessions.tsv"
+
+    rc = cass_sessions.publish_gate(
+        str(state_path), str(sessions_root), "alpha=" + str(tmp_path / "src"),
+        str(transferred), str(out_tsv),
+    )
+    assert rc == 1, "sessions 根下的裸文件必须 FAIL"
+    assert not state_path.exists()
+    assert not out_tsv.exists()
+
+
+def test_r4_rogue_file_alongside_valid_known_alias_still_fails(tmp_path):
+    """同一轮里既有合法的已知 alias 文件（有记录、内容相符，本该 PASS），又有一个
+    未知 alias 的 rogue 文件——整体必须 FAIL（rogue 一票否决），且不写任何东西
+    （保留现场）。证明 rogue 检测不是「只在全空时才跑」。"""
+    sessions_root = tmp_path / "sessions"
+    (sessions_root / "alpha").mkdir(parents=True)
+    good = b"legit\n"
+    (sessions_root / "alpha" / "s.jsonl").write_bytes(good)
+    (sessions_root / "rogue").mkdir(parents=True)
+    (sessions_root / "rogue" / "stray.jsonl").write_bytes(b"orphan\n")
+    src_root = tmp_path / "src" / "alpha"
+    src_root.mkdir(parents=True)
+    (src_root / "s.jsonl").write_bytes(good)
+    state_path = tmp_path / "state.tsv"
+    cass_common.state_write_atomic(state_path, [_rec("alpha/s.jsonl", good)])
+    state_bytes_before = state_path.read_bytes()
+    transferred = tmp_path / "transferred.txt"
+    transferred.write_text("")
+    out_tsv = tmp_path / "out" / "sessions.tsv"
+
+    rc = cass_sessions.publish_gate(
+        str(state_path), str(sessions_root), f"alpha={src_root}",
+        str(transferred), str(out_tsv),
+    )
+    assert rc == 1, "rogue 文件一票否决整轮发布"
+    assert state_path.read_bytes() == state_bytes_before, "FAIL 时 state 原封不动"
+    assert not out_tsv.exists()
+
+
 def test_publish_gate_cli_subprocess_pass(tmp_path):
     sessions_root = tmp_path / "sessions"
     (sessions_root / "alpha").mkdir(parents=True)

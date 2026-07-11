@@ -452,6 +452,42 @@ def test_baseline_rebaseline_escape_hatch_bypasses_validation(gate_baseline, tmp
 
 
 # ---------------------------------------------------------------------------
+# codex R4-P0：基线选择 strict——真实 tip 不可读时绝不静默退回更老基线放行。
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_gate_unreadable_newer_tip_fails_not_silently_uses_older(gate_baseline, tmp_path):
+    """codex 复现：gen1 有效基线（cass-baseline）+ 一个更新的 cass-*（含 COMPLETE
+    但 generation 坏）。修复前 latest_published 宽容跳过坏 tip、退回 gen1 比对，
+    当前 db（未变）→ 五腿全 PASS、rc=0（把「真实上一份不可读」当没发生）。修复后
+    strict 选择 raise → gate 打 [baseline] FAIL、强制 rc=1，五腿仍全部打印、产物
+    仍落地（SUSPECT 取证）。"""
+    db, dest = gate_baseline  # cass-baseline generation=1，结构完整
+
+    newer = dest / "cass-newer-brokengen"
+    newer.mkdir()
+    (newer / "digest.json").write_bytes(
+        cass_common.dumps_canonical({"generation": "2"})  # 字符串，非法
+    )
+    (newer / "COMPLETE").touch()
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"真实 tip 不可读必须 FAIL，不得静默退回 gen1：stdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" in out, out
+    assert "cass-newer-brokengen" in out, out
+    assert "基线集不可信" in out or "需人工" in out, out
+    # 五腿仍跑完、产物仍落地（不因基线不可信就短路五腿门本身）：
+    for i in range(5):
+        assert f"[leg {i}] " in out, out
+    assert out_census.exists()
+    assert out_gate.exists()
+
+
+# ---------------------------------------------------------------------------
 # Step 3：合成库全门计时 < 30s（合成库远小于生产；生产 <6s 验收在 Tier B）
 # ---------------------------------------------------------------------------
 

@@ -25,6 +25,12 @@ class StateCorrupt(Exception):
     字节不符，或缺失该首行 / 首行格式不对。"""
 
 
+class PublishedScanError(Exception):
+    """基线集扫描（strict）发现「含 COMPLETE 但 generation 不可读/非法」的 cass-*/
+    成员——真实链 tip 不可信。基线选择绝不能像轮转那样宽容 skip 掉它、静默退回更老
+    的一份比对（那会把相对真实上一份缩水的坏备份当好备份放行，codex R4-P0）。"""
+
+
 # status ∈ {"present", "absent_at_source"}
 SessionRec = namedtuple("SessionRec", "relpath nas_size blake3 status")
 
@@ -74,24 +80,33 @@ def read_digest(backup_dir) -> dict | None:
     return json.loads(raw)
 
 
-def _iter_published(dest) -> list[tuple[int, str, dict]]:
-    """扫 `dest` 下含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json，返回
-    `(generation, 目录名, digest dict)` 列表（未排序）。不看 mtime。
-    `latest_published`/`rotation_victims` 共用这份扫描逻辑（同族），两个消费者
-    的失败语义分两层，不可混：
+def _scan_published(dest) -> tuple[list[tuple[int, str, dict]], list[str]]:
+    """扫 `dest` 下含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json。返回
+    `(valid, skipped)`：
+
+    - `valid`：digest 可读且 `generation` 为 int 的成员 `(generation, 目录名,
+      digest dict)` 列表（未排序）。
+    - `skipped`：含 COMPLETE 但 digest/generation 读不到或非法的成员，每个一条
+      人读原因（无 digest.json / 读失败 / 坏 JSON / 非 dict / 缺 generation 键 /
+      generation 非 int）。**这是 `_iter_published` 宽容跳过、`latest_published(
+      strict=True)` 响亮拒绝的同一批成员**——两层共用这一份分类逻辑（DRY，避免
+      skip 条件在两处漂移，codex R4-P0「挂一漏万」教训）。
+
+    失败语义分两层，不可混（历史注释保留在此处，是本模块唯一的 skip 判据源头）：
 
     - **目录探测层（is_dir / COMPLETE 存在性）刻意不包 try**：OS 级错误（如
       `chmod 000` 导致的 `PermissionError`，Python 3.12 起 `Path.exists()` 不再
-      吞它）**照常上抛 = 响亮失败**。`latest_published` 是基线/链 tip 解析——
-      DEST 子目录整体权限坏属于完整性事件，若静默跳过会把它变成「首晚模式」
-      （无前驱），绕过 generation 链比对发布假绿；上抛则五腿门 CLI 当场崩、
-      备份当晚 FATAL，人必须来看。
-    - **digest 内容层的 skip 语义**（spec「读不到 `generation` 的目录不参与
-      轮转也不被删」的本意）只覆盖：无 digest.json / digest.json 读失败 /
-      坏 JSON / 缺 `generation` 键 / `generation` 非 int——这类目录既不参与
-      `latest_published` 的 tip 判定，也不参与 `rotation_victims` 的轮转。"""
+      吞它）**照常上抛 = 响亮失败**。DEST 子目录整体权限坏属于完整性事件，若
+      静默跳过会把它变成「首晚模式」（无前驱），绕过 generation 链比对发布假绿；
+      上抛则消费方（五腿门 CLI / 轮转选点）当场崩、备份当晚 FATAL，人必须来看。
+    - **digest 内容层**：无 digest.json / 读失败 / 坏 JSON / 非 dict / 缺
+      `generation` 键 / `generation` 非 int——`_iter_published`（轮转）宽容跳过
+      （少删安全）；`latest_published(strict=True)`（基线选择）拿 `skipped` 非空
+      即 raise（选错 tip 危险，见 `PublishedScanError`）。
+    """
     dest = pathlib.Path(dest)
-    out: list[tuple[int, str, dict]] = []
+    valid: list[tuple[int, str, dict]] = []
+    skipped: list[str] = []
     for entry in sorted(dest.glob("cass-*")):
         if not entry.is_dir():
             continue
@@ -99,30 +114,51 @@ def _iter_published(dest) -> list[tuple[int, str, dict]]:
             continue
         try:
             digest = read_digest(entry)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            skipped.append(f"{entry.name}: digest.json 读取失败（{type(exc).__name__}: {exc}）")
             continue
         if not isinstance(digest, dict) or "generation" not in digest:
             # 非 dict（合法 JSON 但裸标量，如 digest.json 内容是 `5`/`true`）同样归
-            # 入「读不到 generation」的 skip 语义——不然 `"generation" not in digest`
-            # 对 int/bool 会 TypeError（`in` 要求可迭代）。
+            # 入「读不到 generation」——不然 `"generation" not in digest` 对 int/bool
+            # 会 TypeError（`in` 要求可迭代）。digest is None（无 digest.json）也在此。
+            skipped.append(f"{entry.name}: digest.json 缺失/非 dict/缺 generation 键")
             continue
         if type(digest["generation"]) is not int:
-            # 脏数据（如手编 digest 把 generation 写成字符串 "7"）归入「读不到
-            # generation」的 skip 语义——不 crash（下游 sorted/max 混型比较会
-            # TypeError），也绝不据此删目录。type() 精确匹配顺带排除 bool。
+            # 脏数据（如手编 digest 把 generation 写成字符串 "7"）——不 crash（下游
+            # sorted/max 混型比较会 TypeError），也绝不据此删目录。type() 精确匹配
+            # 顺带排除 bool。
+            skipped.append(f"{entry.name}: generation 非 int（{digest['generation']!r}）")
             continue
-        out.append((digest["generation"], entry.name, digest))
-    return out
+        valid.append((digest["generation"], entry.name, digest))
+    return valid, skipped
 
 
-def latest_published(dest) -> tuple[str, dict] | None:
+def _iter_published(dest) -> list[tuple[int, str, dict]]:
+    """轮转/宽容视角：只返回 `_scan_published` 的 valid 成员（读不到 generation 的
+    目录静默跳过——`rotation_victims` 的「少删安全」语义）。基线选择请改用
+    `latest_published(dest, strict=True)`（strict 拒绝跳过、绝不选错 tip）。"""
+    return _scan_published(dest)[0]
+
+
+def latest_published(dest, *, strict: bool = False) -> tuple[str, dict] | None:
     """在 `dest` 下扫含 `COMPLETE` 的 `cass-*/` 目录，各读 digest.json，返回
-    `generation` 最大者的 `(目录名, digest dict)`。不看 mtime；读不到 digest/generation
-    的目录跳过；一个都没有返回 None。"""
-    published = _iter_published(dest)
-    if not published:
+    `generation` 最大者的 `(目录名, digest dict)`；一个都没有返回 None。不看 mtime。
+
+    - `strict=False`（默认，历史行为）：读不到 digest/generation 的目录**宽容跳过**。
+    - `strict=True`（基线选择专用，codex R4-P0）：任何一个含 COMPLETE 的 cass-*/
+      的 generation 不可读/非法 ⇒ raise `PublishedScanError`。真实链 tip 不可读 =
+      基线集不可信，绝不静默退回更老的一份比对（那会把相对真实上一份缩水的坏备份
+      当好备份放行）。
+    """
+    valid, skipped = _scan_published(dest)
+    if strict and skipped:
+        raise PublishedScanError(
+            "基线集不可信（含 COMPLETE 但 generation 不可读/非法的成员，绝不静默退回"
+            "更老基线；需人工调查/rebaseline）: " + "; ".join(skipped)
+        )
+    if not valid:
         return None
-    generation, name, digest = max(published, key=lambda t: t[0])
+    generation, name, digest = max(valid, key=lambda t: t[0])
     return (name, digest)
 
 

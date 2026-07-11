@@ -11,7 +11,9 @@
   - mtime 无关性：把最小 generation 的目录 `touch` 成 mtime 最新 → 仍按
     generation 被删（轮转排序不看 mtime）。
   - 读不到 generation 的 `cass-*/`（含 `COMPLETE` 但 `digest.json` 是坏 JSON）
-    → 不参与轮转也不被删。
+    → 轮转选点仍宽容跳过（不参与轮转、不被删）；但整跑 backup-cass.sh 时五腿门
+    在轮转前先跑 strict 基线选择（codex R4-P0），此成员让基线集不可信 → 门 FAIL、
+    落 SUSPECT、轮转段不执行（rotation_victims 的宽容语义由 test_common.py 单测覆盖）。
   - 轮转失败路径：`chmod 0o555` 某个待删目录 → 备份 exit 非零，但新发布的
     `cass-*/` 已完好（`ROTATE_FAIL` 构型，同 `backup-gbrain.sh`）。
   - 发布失败的晚上轮转不执行：用既有 `CASS_BACKUP_FAULT` 故障注入
@@ -303,14 +305,23 @@ def test_rotation_ignores_mtime_orders_by_generation(
 
 
 # ---------------------------------------------------------------------------
-# 读不到 generation 的目录：不参与轮转也不被删
+# 读不到 generation 的目录：轮转选点（rotation_victims）仍宽容跳过它（单测
+# test_common.py::test_rotation_victims_still_lenient_skips_bad_generation 覆盖）；
+# 但整跑 backup-cass.sh 时五腿门在轮转**之前**先跑 strict 基线选择（codex R4-P0），
+# 真实 tip 不可读 = 基线集不可信 → 门 FAIL、落 SUSPECT、轮转段根本不执行。
 # ---------------------------------------------------------------------------
 
 
 @requires_cass
-def test_rotation_skips_dirs_with_unreadable_generation(
+def test_corrupt_published_member_fails_gate_before_rotation_runs(
     tmp_home, run_backup, synth_dd, cass_stub, tmp_path
 ):
+    """codex R4-P0 交互（原 test_rotation_skips_dirs_with_unreadable_generation 在
+    strict 基线选择下的正确新行为）：DEST 里放一个含 COMPLETE 但 digest.json 是坏
+    JSON 的 cass-*/。轮转选点本身仍宽容跳过它（少删安全，见上方注释指向的单测），
+    但整跑 backup-cass.sh 时五腿门先跑 strict 基线选择——含 COMPLETE 但 generation
+    不可读的成员让基线集不可信 → 门 FAIL、落 SUSPECT、exit 非零，轮转段没跑到。
+    因此谁也没被删（gen1 保留、坏目录原封、无新发布），比旧行为更保守安全。"""
     dest = tmp_path / "dest"
     dest.mkdir()
     staging = tmp_path / "staging"
@@ -330,13 +341,17 @@ def test_rotation_skips_dirs_with_unreadable_generation(
         tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "bg-new",
         extra_env={"CASS_BACKUP_KEEP": "2"},
     )
-    assert rc == 0, out
+    assert rc != 0, out
+    assert "[baseline] FAIL" in out, out
+    assert "cass-badgen" in out, out
 
-    assert not gen1.exists(), "generation 1 应被轮转删除（bad digest 目录不计入 keep 名额）"
+    # 门 FAIL、轮转段没跑到 → 谁也没被删，没有新发布，落 SUSPECT。
+    assert gen1.exists(), "门 FAIL、轮转未执行 → gen1 不应被删"
     assert (dest / "cass-bg-2").is_dir()
-    assert (dest / "cass-bg-new").is_dir()
+    assert not (dest / "cass-bg-new").exists(), "门 FAIL 当晚不发布"
+    assert (dest / "SUSPECT-bg-new").is_dir(), out
 
-    assert bad.is_dir(), "读不到 generation 的目录不参与轮转，不应被删"
+    assert bad.is_dir(), "坏 digest 目录原封"
     assert (bad / "COMPLETE").is_file()
     assert (bad / "digest.json").read_bytes() == bad_digest_bytes, "坏 digest.json 内容应原封不动"
 

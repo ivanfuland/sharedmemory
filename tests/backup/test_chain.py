@@ -582,6 +582,55 @@ def test_c1_termination_post_reset_orphan_fails(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# codex R4-P1：C2（rebaseline）终止分支的孤儿/分叉逃逸——R1 修 B/C1 孤儿时漏的
+# 第三个终止分支。rebaseline 点之后（gen >= r_c2）的成员必须全在走查路径上。
+# ---------------------------------------------------------------------------
+
+
+def test_c2_termination_post_rebaseline_fork_fails(tmp_path):
+    """codex 复现：g1←g2(rebaselined_from=g1)，g3(prev=g2 sha 正确)+g4(prev=g2
+    sha 正确, tip) 两条边从 g2 分叉。走查 g4→A→g2 经 C2 合法终止（rebaselined_from
+    ==prev、reason 非空），g3 从不被任何一跳校验触及；g=4 < KEEP=7 ⇒ expected=
+    |R|=4，计数下界也放行。修复前假 PASS；修复后 C2 终止时必须断言 gen >= 重置点
+    的成员全在走查路径上 → FAIL 指认 post-rebaseline 孤儿 g3。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    make_fake_backup(dest, "cass-g1", gen=1)
+    b2 = make_fake_backup(
+        dest, "cass-g2", gen=2,
+        prev_name="cass-g1", prev_sha="irrelevant-under-C2",
+        rebaselined_from="cass-g1", reason="合法 rebaseline，但之后链分叉了",
+    )
+    sha2 = cass_common.sha256_file(b2 / "digest.json")
+    make_fake_backup(dest, "cass-g3", gen=3, prev_name="cass-g2", prev_sha=sha2)  # 孤儿
+    make_fake_backup(dest, "cass-g4", gen=4, prev_name="cass-g2", prev_sha=sha2)  # tip
+
+    problems = cass_chain.verify_chain(dest, keep=7)
+    assert problems != [], "post-rebaseline 分叉（g3 不在 tip→rebaseline 点路径上）必须 FAIL"
+    assert any("cass-g3" in p and ("孤儿" in p or "分叉" in p) for p in problems), problems
+
+
+def test_c2_termination_no_fork_still_passes(tmp_path):
+    """对照回归：rebaseline 点之后是线性链（g2(rebaseline)←g3←g4(tip)，无分叉）
+    → C2 孤儿检查不误伤，PASS。rebaseline 之前的 g1（gen < 重置点）允许不在走查
+    路径上——那正是 rebaseline 关掉旧历史比对的语义。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    make_fake_backup(dest, "cass-g1", gen=1)
+    b2 = make_fake_backup(
+        dest, "cass-g2", gen=2,
+        prev_name="cass-g1", prev_sha="irrelevant-under-C2",
+        rebaselined_from="cass-g1", reason="合法 rebaseline，之后线性推进",
+    )
+    sha2 = cass_common.sha256_file(b2 / "digest.json")
+    b3 = make_fake_backup(dest, "cass-g3", gen=3, prev_name="cass-g2", prev_sha=sha2)
+    sha3 = cass_common.sha256_file(b3 / "digest.json")
+    make_fake_backup(dest, "cass-g4", gen=4, prev_name="cass-g3", prev_sha=sha3)
+
+    assert cass_chain.verify_chain(dest, keep=7) == []
+
+
+# ---------------------------------------------------------------------------
 # generation 重复 → FAIL（spec「generation 重复/非正 int → FAIL」）
 # ---------------------------------------------------------------------------
 

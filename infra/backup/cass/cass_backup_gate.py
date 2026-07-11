@@ -774,13 +774,25 @@ def main(argv: list[str] | None = None) -> int:
     rebaseline = bool(args.rebaseline)
     dest = pathlib.Path(args.dest)
 
-    baseline = cass_common.latest_published(dest)
+    # codex R4-P0：基线选择必须 strict——若基线集里有「含 COMPLETE 但 generation
+    # 不可读/非法」的成员，真实链 tip 不可信，绝不像轮转那样宽容 skip 掉它、静默
+    # 退回更老的一份比对（那会把相对真实上一份缩水的坏备份当好备份放行）。视同
+    # 「基线不可信」：不喂 prev 给腿 3/4（无比对）、五腿照跑、产物照写（SUSPECT
+    # 取证）、强制 exit 1。连 rebaseline 也不放行——tip 都算不出，rebaseline 目标
+    # 的 tip 校验没有意义，须人工先修/清理该成员再来。
+    baseline_error: str | None = None
+    try:
+        baseline = cass_common.latest_published(dest, strict=True)
+    except cass_common.PublishedScanError as exc:
+        baseline = None
+        baseline_error = str(exc)
+
     if baseline is None:
         prev_name, prev_digest = None, None
     else:
         prev_name, prev_digest = baseline
 
-    if rebaseline:
+    if rebaseline and baseline_error is None:
         error = _validate_rebaseline_target(dest, args.rebaseline, prev_name)
         if error is not None:
             print(f"错误: {error}", file=sys.stderr)
@@ -791,8 +803,7 @@ def main(argv: list[str] | None = None) -> int:
     # 腿 3/4，那样只会把基线损坏悄悄传播成「比对不到对应键就跳过」的假绿（见
     # `_validate_baseline` docstring 的三种复现）。rebaseline 模式跳过本校验——
     # 毒基线的合法逃生门，rebaseline 本来就只与硬编码不变式比（spec §5.7）。
-    baseline_error: str | None = None
-    if prev_name is not None and not rebaseline:
+    if baseline_error is None and prev_name is not None and not rebaseline:
         baseline_error = _validate_baseline(dest, prev_name, prev_digest)
 
     if prev_name is None or baseline_error is not None:

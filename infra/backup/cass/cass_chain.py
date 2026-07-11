@@ -179,6 +179,24 @@ def verify_chain(dest, keep: int) -> list[str]:
                 )
             if not reason:
                 problems.append(f"{cur}: rebaselined_from 缺非空 reason")
+            # 与 C1/B 终止的孤儿检查同族（spec §8.3「无分叉、无缺环」的 C2 侧，
+            # codex R4-P1：这是 R1 修 B/C1 孤儿时漏的第三个终止分支）。C2 合法
+            # 终止时「rebaseline 之前（gen < r_c2）的成员允许不在走查路径上」
+            # ——那正是 rebaseline 关掉与旧历史比对的语义（同 C1 对 gen < r 的
+            # 处理）；但 gen >= r_c2 的成员必须全部在 tip→rebaseline 点的走查路
+            # 径上，否则是 rebaseline 点之后的分叉/孤儿（codex 复现：g2(rebaseline)
+            # ←g3 与 g2←g4(tip) 两条边，走查 g4→A→g2 经 C2 终止，g3 从不被触及，
+            # 而 |R|==4==计数下界 → 假 PASS）。gen < r_c2 的成员若真是分叉，会让
+            # |R| > 计数下界、由下界检查兜底；且 rebaseline 本就不校验旧历史结构。
+            r_c2 = digest["generation"]
+            orphans = sorted(
+                m for m in set(valid) - visited if valid[m]["generation"] >= r_c2
+            )
+            if orphans:
+                problems.append(
+                    f"孤儿/分叉：成员 {orphans} 的 generation >= rebaseline 点 {r_c2}，"
+                    f"却不在 tip({tip_name})→rebaseline 点({cur}) 的走查路径上"
+                )
             break
 
         prev_field = digest.get("prev_backup_name", "")

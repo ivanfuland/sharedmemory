@@ -238,6 +238,86 @@ def test_latest_published_all_missing_generation_returns_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# codex R4-P0：strict 基线选择——含 COMPLETE 但 generation 不可读/非法的成员，
+# 基线选择绝不静默 skip 退回更老一份（那会选错 tip、把缩水的坏备份当好备份）。
+# ---------------------------------------------------------------------------
+
+
+def test_latest_published_strict_raises_on_unreadable_generation(tmp_path):
+    """codex 复现的核心机理：gen1 有效 + 一个更新的目录含 COMPLETE 但 generation
+    坏（字符串）。非 strict（轮转语义）宽容跳过、退回 gen1；strict（基线选择）
+    必须 raise，绝不静默退回更老基线。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _make_published_backup(dest, "cass-20260710-000000-1", generation=1)
+    newer = dest / "cass-20260711-000000-2"
+    newer.mkdir()
+    # generation 是字符串（非法）——真实 tip 不可读。
+    (newer / "digest.json").write_bytes(cass_common.dumps_canonical({"generation": "2"}))
+    (newer / "COMPLETE").write_bytes(b"")
+
+    # 非 strict：宽容 skip，静默退回 gen1（这正是危险的旧行为）。
+    lenient = cass_common.latest_published(dest)
+    assert lenient is not None and lenient[0] == "cass-20260710-000000-1"
+
+    # strict：必须 raise，指认坏成员。
+    with pytest.raises(cass_common.PublishedScanError) as excinfo:
+        cass_common.latest_published(dest, strict=True)
+    assert "cass-20260711-000000-2" in str(excinfo.value)
+
+
+def test_latest_published_strict_raises_on_missing_digest_in_complete_dir(tmp_path):
+    """含 COMPLETE 但完全没有 digest.json 的目录，strict 同样 raise（COMPLETE 是
+    最后写的，缺 digest.json 是完整性事件）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _make_published_backup(dest, "cass-20260710-000000-1", generation=1)
+    bare = dest / "cass-20260711-000000-9"
+    bare.mkdir()
+    (bare / "COMPLETE").write_bytes(b"")  # 无 digest.json
+
+    with pytest.raises(cass_common.PublishedScanError):
+        cass_common.latest_published(dest, strict=True)
+
+
+def test_latest_published_strict_clean_set_matches_lenient(tmp_path):
+    """对照：基线集全部干净时，strict 与非 strict 返回同一个 tip（strict 只在有
+    坏成员时才 raise，不改变正常路径）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _make_published_backup(dest, "cass-a", generation=1)
+    _make_published_backup(dest, "cass-b", generation=2)
+
+    assert cass_common.latest_published(dest, strict=True) == cass_common.latest_published(dest)
+    assert cass_common.latest_published(dest, strict=True)[0] == "cass-b"
+
+
+def test_latest_published_strict_empty_returns_none(tmp_path):
+    """无任何含 COMPLETE 的 cass-*/：strict 也返回 None（首晚，不是错误）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    assert cass_common.latest_published(dest, strict=True) is None
+
+
+def test_rotation_victims_still_lenient_skips_bad_generation(tmp_path):
+    """同族自查：轮转选点仍走宽容 skip（少删安全）——含 COMPLETE 但 generation 坏
+    的目录不参与轮转、也不出现在待删名单里（不因 R4-P0 的 strict 改动被牵连）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    for i in range(1, 4):
+        _make_published_backup(dest, f"cass-{i}", generation=i)
+    bad = dest / "cass-badgen"
+    bad.mkdir()
+    (bad / "digest.json").write_bytes(cass_common.dumps_canonical({"generation": "x"}))
+    (bad / "COMPLETE").write_bytes(b"")
+
+    # keep=1：3 个合法成员里删最旧 2 个；坏 generation 的那个不参与、不被删。
+    victims = cass_common.rotation_victims(dest, keep=1)
+    assert "cass-badgen" not in victims
+    assert set(victims) == {"cass-1", "cass-2"}
+
+
+# ---------------------------------------------------------------------------
 # state_read / state_write_atomic
 # ---------------------------------------------------------------------------
 

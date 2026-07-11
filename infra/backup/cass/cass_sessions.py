@@ -403,14 +403,26 @@ def publish_gate(
     by_relpath: dict[str, cass_common.SessionRec] = {r.relpath: r for r in existing}
     sessions_root_path = pathlib.Path(sessions_root)
 
+    # 发布门必须以「$DEST/sessions/ 的实际全部内容」为准枚举，**不能**只枚举
+    # `--roots` 已知 alias 的子树（codex R4-P1：`sessions/rogue/stray.jsonl` 那样
+    # 挂在未知顶层目录、或裸落在 sessions 根下的文件会整个逃过验收）。spec §6.3.1
+    # 「NAS 上任何无清单记录文件 ⇒ FAIL」。递归扫全树 → 每个文件按其 alias 分流：
+    #   - alias ∈ roots：进 disk_relpaths，走下面的记录对账（self-heal/adopt/drift）。
+    #   - alias ∉ roots / 裸文件（无 alias/子路径）：rogue 孤儿——无对应 source root
+    #     可对账（adopt 只收编「已知 root 下的 receiver-only 文件」），必须响亮 FAIL
+    #     交人工调查/清理，不可 --adopt 掩盖。
     disk_relpaths: set[str] = set()
-    for alias in roots:
-        alias_dir = sessions_root_path / alias
-        if not alias_dir.is_dir():
-            continue
-        for entry in alias_dir.rglob("*"):
-            if entry.is_file():
-                disk_relpaths.add(f"{alias}/{entry.relative_to(alias_dir).as_posix()}")
+    rogue_files: list[str] = []
+    if sessions_root_path.is_dir():
+        for entry in sessions_root_path.rglob("*"):
+            if not entry.is_file():
+                continue
+            rel = entry.relative_to(sessions_root_path).as_posix()
+            split = _split_relpath(rel)
+            if split is None or split[0] not in roots:
+                rogue_files.append(rel)
+                continue
+            disk_relpaths.add(rel)
 
     all_relpaths = set(by_relpath) | disk_relpaths
 
@@ -419,6 +431,12 @@ def publish_gate(
     self_healed: list[str] = []
     drift_corrected: list[str] = []
     problems: list[str] = []
+
+    for rel in sorted(rogue_files):
+        problems.append(
+            f"NAS file under $DEST/sessions/ outside any known root alias "
+            f"(orphan, not adoptable — needs human investigation): {rel}"
+        )
 
     for relpath in sorted(all_relpaths):
         split = _split_relpath(relpath)
