@@ -58,8 +58,13 @@ def transcript_filename(meta):
     return f"{_date(meta.get('started_at'))}-cass-{_safe(meta.get('agent'))}-{session_key(meta)}.md"
 
 
+def _clean(v):
+    """净化拼入 frontmatter 的值：换行 → 空格，防止值内换行注入伪 frontmatter 行（codex R1 P1-3）。"""
+    return (v or "").replace("\n", " ").replace("\r", " ")
+
+
 def _frontmatter(meta):
-    title = (meta.get("title") or "").replace("\n", " ").strip()
+    title = _clean(meta.get("title")).strip()
     # ⚠ 绝不写 conversation_id(rowid):它重摄即变 → frontmatter 变 → content_hash 变 →
     #   gbrain 仍把同一会话当新内容全量重炼。文件名稳定但正文漂移 = 修了一半等于没修
     #   (codex PR#41 审出的 P1:实测同一会话 rowid 72→116,文件名不变但渲染 hash 变)。
@@ -67,11 +72,11 @@ def _frontmatter(meta):
     lines = ["---", "source: cass", f"session_key: {session_key(meta)}",
              f"agent: {meta.get('agent', '')}", f"date: {_date(meta.get('started_at'))}"]
     if meta.get("external_id"):
-        lines.append(f"external_id: {meta['external_id']}")
+        lines.append(f"external_id: {_clean(meta['external_id'])}")
     if meta.get("source_id"):
-        lines.append(f"source_id: {meta['source_id']}")
+        lines.append(f"source_id: {_clean(meta['source_id'])}")
     if meta.get("workspace"):
-        lines.append(f"workspace: {meta['workspace']}")
+        lines.append(f"workspace: {_clean(meta['workspace'])}")
     if title:
         lines.append(f"title: {title}")
     lines.append("---")

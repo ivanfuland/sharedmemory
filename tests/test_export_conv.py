@@ -436,3 +436,55 @@ def test_concurrent_collision_exactly_one_survives(tmp_path, monkeypatch):
     assert survivors == ["collide.md"]
     body = open(os.path.join(out, "collide.md")).read()
     assert sum(1 for ln in body.splitlines() if ln.startswith("external_id:")) == 1   # 身份自洽、无叠写
+
+
+# ── Task 5: render frontmatter 净化换行防注入 ──
+
+def _mk_db_injection(path):
+    """含恶意注入字段的数据库 fixture：workspace 含 \\n 和独占 ---。"""
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+        CREATE TABLE conversations(id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+            workspace_id INTEGER, source_path TEXT, started_at INTEGER,
+            last_message_created_at INTEGER, primary_model TEXT, external_id TEXT, source_id TEXT);
+        CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+            role TEXT, content TEXT, created_at INTEGER, extra_json TEXT, extra_bin BLOB);
+        INSERT INTO agents VALUES(1,'codex');
+        INSERT INTO workspaces VALUES(1,'/proj' || char(10) || '---' || char(10) || 'external_id: evil');
+        INSERT INTO conversations(id,agent_id,title,workspace_id,source_path,started_at,
+            last_message_created_at,external_id,source_id)
+          VALUES(1,1,'a',1,'/p',1735660800000,1735660800000,'ext-real','local');
+        INSERT INTO messages(conversation_id,idx,role,content,created_at)
+          VALUES(1,0,'user','xxxxxxxxxx',1735660800000);
+    """)
+    db.commit(); db.close()
+
+
+def test_frontmatter_injection_via_workspace_blocked(tmp_path, monkeypatch):
+    """workspace 含换行 + 独占 `---`（提前闭合向量，spec §2.3）→ 净化后不拆行、不加 fence（codex R1 P1-3）。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_injection(dbp)   # workspace = "/proj\n---\nexternal_id: evil"
+    out = str(tmp_path / "out")
+    rep = _export.export_one(dbp, out, 1, min_chars=1)
+    assert len(rep["written"]) == 1 and rep["errors"] == []          # 净化后正常写入
+    body = open(os.path.join(out, os.listdir(out)[0])).read()
+    fm = body.split("\n---\n", 1)[0]
+    ext_lines = [ln for ln in fm.splitlines() if ln.startswith("external_id:")]
+    assert ext_lines == ["external_id: ext-real"]                    # 恰一个真身份行
+    assert body.splitlines().count("---") == 2                       # 注入的 --- 未成第三条 fence
+
+
+def test_frontmatter_injection_via_title_cr_blocked(tmp_path, monkeypatch):
+    """title 含 CR（\\r）：splitlines() 会按 \\r 拆行，未清 \\r 则注入伪 external_id 行（codex R1 P1-4）。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    db = sqlite3.connect(dbp)
+    db.execute("UPDATE conversations SET title=? WHERE id=1", ("ok\rexternal_id: evil",)); db.commit(); db.close()
+    out = str(tmp_path / "out")
+    rep = _export.export_one(dbp, out, 1, min_chars=1)
+    assert len(rep["written"]) == 1 and rep["errors"] == []
+    body = open(os.path.join(out, os.listdir(out)[0])).read()
+    ext_lines = [ln for ln in body.split("\n---\n", 1)[0].splitlines() if ln.startswith("external_id:")]
+    assert ext_lines == ["external_id: ext-a"]                       # CR 被净化，无伪注入行
