@@ -14,6 +14,9 @@ O_DIRECT 读回 / blobs 池 / manifests 双门，spec §6 数据流 step 10-12, 
     从进程外构造，本 task 的 `CASS_BACKUP_FAULT` 枚举也不含此钩子）；发布前闭合检查的
     存在性 / `st_size` / BLAKE3 内容三道判据（V13b/V13c/V13c2）；`blob_relative_path`
     路径穿越只做形状校验、绝不参与文件系统操作（V13d）。
+  - codex R1 P2：14a 反向核查——目录里比 `manifests.sha256sum` 清单多出的 `*.json`
+    文件必须 FAIL（spec step 14a「每个文件」原文要求，逐行比对只覆盖清单列出的
+    那部分，不覆盖多出的部分）。
   - `--publish-check` 子命令的若干单元测试。
 
 大多数测试依赖真 `cass` 二进制构建 `synth_dd`（`requires_cass`，同 test_script_guards.py
@@ -388,6 +391,56 @@ def test_v13a2_swapped_self_consistent_manifest_passes_14b_but_fails_14a(
     )
     assert not ok_14a, "14a 必须抓出 manifests.sha256sum 与被调包内容不符"
     assert any("checksum mismatch" in p for p in problems_14a), problems_14a
+
+
+@requires_cass
+def test_p2_14a_extra_unlisted_manifest_file_fails_reverse_listing_check(
+    synth_dd, tmp_path
+):
+    """codex R1 P2：`manifests.sha256sum` 逐行比对（14a）只验证清单里**列出的**
+    文件——`.incomplete-<stamp>/manifests/` 目录里比清单多出的文件（如清单生成后
+    又偷偷塞进一个未被记录的 manifest）不受任何约束。spec step 14a 原文是「对
+    `.incomplete-<stamp>/manifests/` 的**每个文件**校验」，多出的文件同样要 FAIL
+    ——用集合恒等（清单列出的相对路径 == 目录实际的 *.json 文件）补齐这道反向
+    核查。"""
+    manifests_dir = synth_dd / "raw-mirror" / "v1" / "manifests"
+
+    incomplete = tmp_path / "fake-incomplete"
+    incomplete.mkdir()
+    shutil.copytree(manifests_dir, incomplete / "manifests")
+    subprocess.run(
+        "sha256sum manifests/*.json > manifests.sha256sum",
+        shell=True, cwd=incomplete, check=True, timeout=30,
+    )
+
+    # 反例基线：篡改前（清单与目录恰好一一对应）必须 PASS。
+    ok_before, problems_before = cass_manifest_census.verify_manifests_sha256sum(
+        incomplete / "manifests", incomplete / "manifests.sha256sum"
+    )
+    assert ok_before, f"反例应证伪：篡改前清单与目录一一对应，应 PASS: {problems_before}"
+
+    # 目录里塞一个清单没列出的额外文件（内容本身是否自洽不重要——14a 的反向核
+    # 查只关心「目录里多了一个清单没提过的 *.json」这件事本身）。
+    extra_manifest = {
+        "schema_version": 1,
+        "manifest_kind": "cass_raw_session_mirror_v1",
+        "manifest_id": "p2-unlisted-extra",
+        "blob_hash_algorithm": "blake3",
+        "blob_relative_path": "blobs/blake3/00/" + "0" * 64 + ".raw",
+        "blob_blake3": "0" * 64,
+        "blob_size_bytes": 0,
+    }
+    (incomplete / "manifests" / "extra-unlisted.json").write_text(
+        json.dumps(extra_manifest), encoding="utf-8"
+    )
+
+    ok_after, problems_after = cass_manifest_census.verify_manifests_sha256sum(
+        incomplete / "manifests", incomplete / "manifests.sha256sum"
+    )
+    assert not ok_after, "多出清单未列出的文件必须 FAIL，不能被逐行比对放过"
+    assert any(
+        "extra-unlisted.json" in p and "未列出的多余文件" in p for p in problems_after
+    ), problems_after
 
 
 @requires_cass

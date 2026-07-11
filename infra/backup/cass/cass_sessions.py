@@ -7,11 +7,14 @@ B，step 13e-13g）。
 `check-source`：只读源端（`--roots` 指向的目录）+ 共享权威状态
 `$DEST/sessions.state.tsv`（由调用方 `--state` 传入，本模块不知道也不关心 DEST 长
 什么样——**函数签名/CLI 参数不含任何 NAS/DEST 路径**，只读源端 + 一份状态文件）。
-对状态里标 `present` 且此刻仍存在于源端的每条记录，核对
-`size(src) >= nas_size` 与 `blake3(src[0:nas_size]) == 记录 hash`；任一不成立 ⇒
-该文件判为「异常」，排除出本次同步。`absent_at_source` 记录直接跳过（源端本来就
-没有，无从比对）；此刻源端也没有该文件的 `present` 记录同样跳过（比对不了，交给
-Task 12 的 13e/13f 全量回读门收口）。
+对**此刻仍存在于源端**的每条记录（判据是 `src_path.exists()`，与记录 status 是
+`present` 还是 `absent_at_source` 无关——codex R1 P1-2 修复：旧版判据先按 status
+早退，若源端文件被删后又以不同内容重建，重建后的文件明明存在于源端，却因记录
+还标着 `absent_at_source` 而被无条件跳过，攻击者的新内容永远进不了比对视野），
+核对 `size(src) >= nas_size` 与 `blake3(src[0:nas_size]) == 记录 hash`；任一不成
+立 ⇒ 该文件判为「异常」，排除出本次同步。此刻源端不存在该文件的记录（不论其
+status）同样跳过（真正的「源端没有，无从比对」，交给 Task 12 的 13e/13f 全量回
+读门收口）。
 
 `--quarantine`/`--quarantine-reason`（与 spec §5.7 rebaseline 同构的人工放行通
 道）点名的文件无条件排除出同步，且**不计入异常**——它的存在意义正是让操作者显式
@@ -194,8 +197,6 @@ def check_source(
             return 1
 
         for rec in records:
-            if rec.status == "absent_at_source":
-                continue  # 源端本来就没有——无从比对，见模块 docstring
             split = _split_relpath(rec.relpath)
             if split is None:
                 _fatal(f"state record has malformed relpath (want alias/subpath): {rec.relpath!r}")
@@ -210,9 +211,14 @@ def check_source(
             if (alias, subpath) in quarantined:
                 continue  # 人工点名放行——不比对、不计入异常
 
+            # 判据是「此刻源端是否存在」，与记录 status 无关（codex R1 P1-2）：
+            # status 只是上一轮结转下来的旧标签，`absent_at_source` 记录若源端被
+            # 删后又重建，此刻它确实存在，必须照跑下面的前缀校验——旧记录的
+            # nas_size/hash 就是比对基线。真正不存在才跳过（无从比对，交给 13e/
+            # 13f 全量回读门收口）。
             src_path = roots[alias] / subpath
             if not src_path.exists():
-                continue  # 此刻源端也没有——同上，比对不了
+                continue
 
             size = src_path.stat().st_size
             if size < rec.nas_size:

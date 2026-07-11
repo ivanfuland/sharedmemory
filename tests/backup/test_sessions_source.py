@@ -10,6 +10,9 @@
     「忽略 cd/.d/.f」不是可有可无的细节）；未知行 fail-closed。
   - V12a/V12b/V12b2/V12c/V12d/V12e：`check_source` 的截断判定 / 前缀改写判定 /
     `--append` 语义反例演示 / 接口级不读 DEST / quarantine 通道。
+  - codex R1 P1-2：`absent_at_source` 记录的判据改为「此刻源端是否存在」，不是
+    记录 status——源端重建不同内容（同尺寸）必须照跑前缀校验、判为异常挡住发布；
+    对照：重建为合法前缀延长不误伤。
   - DEV-1（jsonl-only 过滤）+ codex R1-P1（filter 顺序）+ 跨 root 同名不碰撞。
   - e2e（`run_backup` 全脚本）：V12a/V12b 的「排除 + 不发布」两件事同时成立。
 
@@ -311,6 +314,61 @@ def test_absent_at_source_record_skipped_without_check(tmp_path):
     rc = cass_sessions.check_source(str(state_path), f"a={root}", str(out_dir))
 
     assert rc == 0
+    assert (out_dir / "exclude.a").read_text() == ""
+
+
+# ---------------------------------------------------------------------------
+# codex R1 P1-2：absent_at_source 记录的源端文件被删后又以不同内容重建——判据
+# 必须是「此刻源端是否存在」，不是记录 status。
+# ---------------------------------------------------------------------------
+
+
+def test_p1_2_absent_at_source_reappeared_with_different_same_size_content_excluded(tmp_path):
+    """`absent_at_source` 记录的源端文件被删后又以**不同内容、同尺寸**重建——旧版
+    判据先看记录 status，见 `absent_at_source` 直接早退，重建后的新内容永远进不
+    了比对视野（攻击面：源端同路径删后重建且内容不同 → check_source 无条件跳过
+    → rsync 无事 → publish-gate 读 NAS 旧内容与记录相符 → 状态翻回 present、
+    exit 0——新内容永远没进备份且无告警）。修复后判据改为「当前源端文件是否存
+    在」，与记录 status 无关：文件确实存在于源端，必须照跑前缀校验（旧记录的
+    nas_size/hash 就是比对基线），同尺寸不同内容 ⇒ 判为异常。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    old_content = b"old-line\n"
+    state_path = tmp_path / "state.tsv"
+    cass_common.state_write_atomic(
+        state_path, [_rec("a/gone.jsonl", old_content, status="absent_at_source")]
+    )
+    new_content = b"BAD-line\n"
+    assert len(new_content) == len(old_content), "复现构造要求同尺寸不同内容"
+    (root / "gone.jsonl").write_bytes(new_content)
+    out_dir = tmp_path / "excl"
+
+    rc = cass_sessions.check_source(str(state_path), f"a={root}", str(out_dir))
+
+    assert rc == 3, (
+        "重建后内容与旧记录不符，必须判为异常——不能因记录 status 是 "
+        "absent_at_source 就无条件跳过比对"
+    )
+    assert (out_dir / "exclude.a").read_text() == "/gone.jsonl\n"
+
+
+def test_p1_2_absent_at_source_reappeared_with_legit_append_extension_not_excluded(tmp_path):
+    """对照（append 语义回归不误伤）：`absent_at_source` 记录的源端文件被删后又
+    以「旧记录内容的合法前缀延长」重建——判据改为按存在性走比对后，这种正常场景
+    不该被误判为异常。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    old_content = b"old-line\n"
+    state_path = tmp_path / "state.tsv"
+    cass_common.state_write_atomic(
+        state_path, [_rec("a/gone.jsonl", old_content, status="absent_at_source")]
+    )
+    (root / "gone.jsonl").write_bytes(old_content + b"more-line\n")
+    out_dir = tmp_path / "excl"
+
+    rc = cass_sessions.check_source(str(state_path), f"a={root}", str(out_dir))
+
+    assert rc == 0, "旧前缀合法延长不应误判为异常"
     assert (out_dir / "exclude.a").read_text() == ""
 
 
@@ -774,6 +832,107 @@ def test_v12b_e2e_prefix_rewrite_blocks_publish_no_complete(
     assert (dest / "sessions" / "alpha" / "s.jsonl").read_bytes() == good, (
         "--append + exclude 双保险：NAS 前缀必须原封不动"
     )
+
+
+# ---------------------------------------------------------------------------
+# codex R1 P1-2 e2e：absent_at_source 记录源端重建不同内容（同尺寸）→ 整晚 FAIL
+# 不发布；对照：重建为合法前缀延长 → 照常同步（append 语义回归不误伤）。
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_p1_2_e2e_absent_at_source_reappeared_different_content_blocks_publish(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """codex R1 P1-2 攻击的完整链路：源端文件被删（记录降级为 `absent_at_source`）
+    后又以不同内容重建（同尺寸）——旧版判据无条件跳过 `absent_at_source` 记录的
+    比对，check-source 看不出问题，rsync 无事，publish-gate 读到的是 NAS 侧仍与
+    记录相符的旧内容，状态翻回 `present`、整晚照常发布 exit 0——新内容永远没进
+    备份，也没有任何告警。修复后 check-source 必须照跑前缀校验，判为异常，挡住
+    发布。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    root = tmp_path / "root"
+    root.mkdir()
+    session_roots = f"alpha={root}"
+
+    old_content = b"old-line\n"
+    session_file = root / "s.jsonl"
+    session_file.write_bytes(old_content)
+
+    rc1, out1 = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "p1-2-first", session_roots,
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
+    )
+    assert rc1 == 0, out1
+    nas_copy = dest / "sessions" / "alpha" / "s.jsonl"
+    assert nas_copy.read_bytes() == old_content, out1
+
+    # 手工把记录降级为 absent_at_source（真实流程由某晚 publish-gate 的「源端消
+    # 失则结转 absent_at_source」分支产出，这里直接构造终态，聚焦本 bug 的攻击
+    # 面本身，同本文件其余 e2e 测试「手工种基线状态」的写法）。
+    cass_common.state_write_atomic(
+        dest / "sessions.state.tsv",
+        [_rec("alpha/s.jsonl", old_content, status="absent_at_source")],
+    )
+    session_file.unlink()
+
+    # 源端「重建」：同尺寸但内容不同。
+    new_content = b"BAD-line\n"
+    assert len(new_content) == len(old_content), "复现构造要求同尺寸不同内容"
+    session_file.write_bytes(new_content)
+
+    cass_before = sorted(p.name for p in dest.glob("cass-*"))
+    rc2, out2 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "p1-2-second", session_roots)
+
+    assert rc2 != 0, out2
+    assert (dest / "INCOMPLETE-p1-2-second").is_dir(), out2
+    assert not (dest / ".incomplete-p1-2-second").exists(), out2
+    assert sorted(p.name for p in dest.glob("cass-*")) == cass_before, (
+        f"重建内容与旧记录不符必须挡住发布，不能有新的 cass-*/: {out2}"
+    )
+    assert nas_copy.read_bytes() == old_content, (
+        "NAS 旧内容必须原封不动（排除 + --append 双保险）"
+    )
+
+
+@requires_cass
+def test_p1_2_e2e_absent_at_source_reappeared_legit_append_syncs_normally(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """对照（append 语义回归不误伤）：`absent_at_source` 记录的源端文件被删后又
+    以「旧记录内容的合法前缀延长」重建——挡住 P1-2 攻击的同一处判据改动不该误伤
+    这种正常场景，必须照常同步、正常发布。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    root = tmp_path / "root"
+    root.mkdir()
+    session_roots = f"alpha={root}"
+
+    old_content = b"old-line\n"
+    session_file = root / "s.jsonl"
+    session_file.write_bytes(old_content)
+
+    rc1, out1 = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "p1-2ok-first", session_roots,
+        extra_env={"CASS_BACKUP_ADOPT_SESSIONS": "1", "CASS_BACKUP_ADOPT_REASON": "test bootstrap"},
+    )
+    assert rc1 == 0, out1
+
+    cass_common.state_write_atomic(
+        dest / "sessions.state.tsv",
+        [_rec("alpha/s.jsonl", old_content, status="absent_at_source")],
+    )
+    session_file.unlink()
+    session_file.write_bytes(old_content + b"more-line\n")
+
+    rc2, out2 = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "p1-2ok-second", session_roots)
+
+    assert rc2 == 0, out2
+    nas_copy = dest / "sessions" / "alpha" / "s.jsonl"
+    assert nas_copy.read_bytes() == old_content + b"more-line\n", out2
 
 
 # ---------------------------------------------------------------------------

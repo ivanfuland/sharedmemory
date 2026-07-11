@@ -266,6 +266,13 @@ def verify_manifests_sha256sum(
     真实自洽的 manifest，14b 的四项检查全过（它校验的是替换后那份 manifest 自己
     引用的 blob）——只有这里的 `manifests.sha256sum` 比对能抓出「内容被整体调包」。
 
+    **反向核查**（P2，spec step 14a「对 `.incomplete-<stamp>/manifests/` 的**每个
+    文件**校验」原文要求）：上面的逐行比对只验证清单里**列出的**文件，`manifests_dir`
+    下比清单多出的文件（如清单生成后又偷偷塞进一个未被记录的 manifest）不受任何
+    约束——这不是「每个文件」。用集合恒等断言两头：清单列出的相对路径集合必须
+    等于目录实际的 `*.json` 文件集合，多出/少出都 FAIL（少出已由上面逐行比对的
+    「记录的文件缺失」覆盖，这里的恒等断言是对称补齐）。
+
     返回 `(ok, problems)`；`problems` 为空即 `ok=True`。
     """
     base_dir = manifests_dir.parent
@@ -275,11 +282,13 @@ def verify_manifests_sha256sum(
     if not lines:
         return False, ["manifests.sha256sum 为空"]
 
+    listed_rel_paths: set[str] = set()
     for line in lines:
         expected_hash, sep, rel_path = line.partition("  ")
         if not sep or not expected_hash or not rel_path:
             problems.append(f"manifests.sha256sum 行格式不对: {line!r}")
             continue
+        listed_rel_paths.add(rel_path)
         manifest_path = base_dir / rel_path
         if not manifest_path.is_file():
             problems.append(f"manifests.sha256sum 记录的文件缺失: {rel_path}")
@@ -289,6 +298,17 @@ def verify_manifests_sha256sum(
             problems.append(
                 f"checksum mismatch: {rel_path}（期望={expected_hash}, 实际={actual_hash}）"
             )
+
+    # 反向核查：目录里比清单多出的 *.json 文件 ⇒ FAIL（P2，见函数 docstring）。
+    # 前缀用 manifests_dir 相对 base_dir 的实际路径推导，不硬编码 "manifests"
+    # ——与生成侧 `cd "$STG" && sha256sum manifests/*.json > ...` 的相对基准同构。
+    rel_dir_prefix = manifests_dir.relative_to(base_dir).as_posix()
+    actual_rel_paths = {f"{rel_dir_prefix}/{p.name}" for p in manifests_dir.glob("*.json")}
+    extra = actual_rel_paths - listed_rel_paths
+    if extra:
+        problems.extend(
+            f"manifests.sha256sum 未列出的多余文件: {p}" for p in sorted(extra)
+        )
 
     return not problems, problems
 

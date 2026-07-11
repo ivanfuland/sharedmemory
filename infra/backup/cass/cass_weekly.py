@@ -22,16 +22,28 @@
        - `db` 的 sha256 == `digest.json.db_sha256` == 同目录 `db.sha256` 文件内容
        - `manifests.sha256sum` 逐文件核验（复用
          `cass_manifest_census.verify_manifests_sha256sum`，Fadvise 已在其内部）
+         **+ 自身 sha256 == `digest.json.manifests_sha256sum_sha256`**（codex R1
+         P1-1 补齐——前者只验证「manifest 内容与 manifests.sha256sum 记录彼此自
+         洽」，若某份保留 manifest 被整体替换、且攻击者**同步重新生成**
+         `manifests.sha256sum`，自洽性依然成立、上面那条检查看不出问题；只有
+         绑定 `digest.json` 在发布当晚记录的锚点值（`manifests_sha256sum_sha256`，
+         `backup-cass.sh` step 14c 写入，发布后不可变）才能抓出「manifest + 校验
+         文件被一起调包」）
        - `census.tsv` / `sessions.tsv` 的 sha256 == `digest.json` 对应字段
      **这一步读到的 NAS 文件（db / 每份 manifest / census.tsv / sessions.tsv）
      全部经 `cass_common.sha256_file(fadvise=True)` 或
      `cass_manifest_census.verify_manifests_sha256sum`（内部同样 fadvise）—— 不
      shell out 到 `sha256sum -c`（后者不带 fadvise，绕不过「刚写完立刻读，读到的
      是本地页缓存」这一类问题；本机页缓存会遮住 NAS 侧/跨客户端的腐烂，codex
-     R3-P1）。** `db.sha256`/`manifests.sha256sum` 自身是几十字节的文本文件，只
-     记录别人的哈希，不是被验证的内容寻址产物本身——用普通 `read_text` 读取其
-     文本内容，不占 fadvise 覆盖集（覆盖集 = blob 池全部 + db + manifests + census.tsv
-     + sessions.tsv + sessions.state.tsv，见 `verify_backup_self`/`verify_blob_pool`/
+     R3-P1）。** `db.sha256` 自身是几十字节的文本文件，只记录别人的哈希，不是被
+     验证的内容寻址产物本身——用普通 `read_text` 读取其文本内容，不占 fadvise
+     覆盖集。`manifests.sha256sum` 不同：它被解析为校验清单时仍是普通
+     `read_text`（`verify_manifests_sha256sum` 内部），但 codex R1 P1-1 补齐的
+     digest 绑定检查额外把它**整个文件本身**当内容寻址产物对待，用
+     `cass_common.sha256_file(fadvise=True)` 重算一次去对 `digest.json` 的锚点值
+     ——这一次是占 fadvise 覆盖集的（覆盖集 = blob 池全部 + db + 每份 manifest +
+     每个保留备份的 manifests.sha256sum 自身 + census.tsv + sessions.tsv +
+     sessions.state.tsv，见 `verify_backup_self`/`verify_blob_pool`/
      `verify_state_header` 与测试 V14c）。
   5. **`$DEST/sessions.state.tsv`** 首行 `#sha256` 自校验（`cass_common.state_read`；
      `StateCorrupt` → FAIL）。**读前同样先 fadvise(DONTNEED)**——页缓存陈旧性与
@@ -205,6 +217,23 @@ def verify_backup_self(backup_dir: pathlib.Path) -> list[str]:
         )
         if not ok:
             problems.extend(f"{name}: {p}" for p in sub_problems)
+
+        # manifests.sha256sum ↔ digest.json 绑定（codex R1 P1-1）：上面那组只验证
+        # 「manifest 内容 vs manifests.sha256sum 记录」彼此自洽——一致替换某份
+        # manifest 并同步重新生成 manifests.sha256sum，自洽性不受影响，会漏判。
+        # 拿 manifests.sha256sum 自身的 sha256 去对 digest.json 发布当晚记录的锚点
+        # 值，才能抓出「manifest + 校验文件被一起调包」。与 db 三方一致同一套
+        # 结构：重算不依赖 digest.json 是否可读（取证完整性），只有比较环节在
+        # digest 不可用时跳过。
+        actual_sha256sum_sha256 = cass_common.sha256_file(sha256sum_path, fadvise=True)
+        if digest is not None:
+            if "manifests_sha256sum_sha256" not in digest:
+                problems.append(f"{name}: digest.json 缺 manifests_sha256sum_sha256 字段")
+            elif actual_sha256sum_sha256 != digest["manifests_sha256sum_sha256"]:
+                problems.append(
+                    f"{name}: manifests.sha256sum: FAILED（重算={actual_sha256sum_sha256}, "
+                    f"digest.json.manifests_sha256sum_sha256={digest['manifests_sha256sum_sha256']}）"
+                )
 
     # --- census.tsv / sessions.tsv 的 sha256 == digest.json 对应字段 ---
     if digest is not None:

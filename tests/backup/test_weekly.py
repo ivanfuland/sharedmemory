@@ -13,10 +13,12 @@
     全池扫描（①）能抓；反例断言 `verify_closure` 对它天然视而不见（它只遍历
     manifest 引用，压根不知道这个文件存在）。
   - V14c：monkeypatch `os.posix_fadvise` 计数——健康两晚状态下调用数必须恰好
-    等于「blob 池全部 + 每个保留备份的 db/census.tsv/sessions.tsv 各一次 +
-    每份 manifest 一次 + sessions.state.tsv 一次」（覆盖集断言，逐文件恰一次）。
-    blob 期望数用 `rglob("*.raw")` 独立推导（不照抄生产 glob），另断言两种口径
-    相等——生产 glob 若静默变窄，等式两边同降的假绿就此被拦。
+    等于「blob 池全部 + 每个保留备份的 db/census.tsv/sessions.tsv/manifests.sha256sum
+    自身各一次 + 每份 manifest 一次 + sessions.state.tsv 一次」（覆盖集断言，逐
+    文件恰一次；manifests.sha256sum 自身一次是 codex R1 P1-1 新增的 digest 绑定
+    读，3×retained 变 4×retained）。blob 期望数用 `rglob("*.raw")` 独立推导（不
+    照抄生产 glob），另断言两种口径相等——生产 glob 若静默变窄，等式两边同降的
+    假绿就此被拦。
   - V15m：篡改某保留 `cass-*/db` 一个字节 → `verify_weekly` FAIL 报文含
     `db: FAILED`；反例断言：只调用 `verify_blob_pool`（①）+
     `cass_chain.verify_chain`（③）时两者全过——db 内容不是 blob，也不在链算法
@@ -161,6 +163,78 @@ def test_healthy_two_night_backup_weekly_verify_passes(
     rc, out, err = _cli(dest, 7)
     assert rc == 0, f"stdout={out}\nstderr={err}"
     assert "[weekly] PASS" in out
+
+
+# ---------------------------------------------------------------------------
+# codex R1 P1-1：一致替换某保留 manifest + 同步重新生成 manifests.sha256sum ——
+# 只有绑定 digest.json.manifests_sha256sum_sha256 的锚点检查能抓出
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_p1_1_manifest_and_sha256sum_both_replaced_consistently_caught_by_digest_binding(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """把某个保留 `cass-*/manifests/` 里一份 manifest 整体换成另一份真实自洽
+    manifest（引用一个真实存在、内容匹配的 blob），并**同步重新生成**
+    `manifests.sha256sum`（保持"manifest 内容与其记录的哈希彼此自洽"）——单独看
+    `verify_manifests_sha256sum` 这一步会 PASS（两者一起换，内部自洽性没被破坏，
+    同 test_blobs_manifests.py::test_v13a2 的手法，但这里是发布**之后**的保留目录
+    ，不是发布前的 `.incomplete` 暂存区）。只有 `manifests.sha256sum` 自身的
+    sha256 对 `digest.json.manifests_sha256sum_sha256`（发布当晚记录的锚点值，
+    发布后不可变）的绑定检查能抓出这种「整体调包 + 同步重算校验文件」的攻击
+    （spec §11 硬约束：保留 cass-*/ 的自校验含 manifests.sha256sum 对 digest.json）。
+    """
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+
+    rc, out = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "p1-1")
+    assert rc == 0, out
+
+    # 正常路径基线：篡改前 weekly 必须 PASS（对照，避免下面的 FAIL 只是别的原因）。
+    assert cass_weekly.verify_weekly(dest, keep=7) == []
+
+    backup_dir = dest / "cass-p1-1"
+    manifests_dir = backup_dir / "manifests"
+    blobs_root = dest / "raw-mirror" / "v1" / "blobs"
+
+    # 造一份真实自洽的替换 manifest（同 test_v13a2 手法）。
+    extra_content = b"weekly-p1-1-self-consistent-alternate-manifest-blob"
+    extra_hash = blake3.blake3(extra_content).hexdigest()
+    extra_blob_path = blobs_root / "blake3" / extra_hash[:2] / f"{extra_hash}.raw"
+    extra_blob_path.parent.mkdir(parents=True, exist_ok=True)
+    extra_blob_path.write_bytes(extra_content)
+
+    replacement_manifest = {
+        "schema_version": 1,
+        "manifest_kind": "cass_raw_session_mirror_v1",
+        "manifest_id": "p1-1-synthetic-replacement",
+        "blob_hash_algorithm": "blake3",
+        "blob_relative_path": f"blobs/blake3/{extra_hash[:2]}/{extra_hash}.raw",
+        "blob_blake3": extra_hash,
+        "blob_size_bytes": len(extra_content),
+    }
+    target = sorted(manifests_dir.glob("*.json"))[0]
+    target.write_text(json.dumps(replacement_manifest), encoding="utf-8")
+
+    # 攻击的关键一步：同步重新生成 manifests.sha256sum，让「manifest 内容 vs
+    # manifests.sha256sum」这组自洽性检查（verify_manifests_sha256sum）看不出问题。
+    subprocess.run(
+        "sha256sum manifests/*.json > manifests.sha256sum",
+        shell=True, cwd=backup_dir, check=True, timeout=30,
+    )
+
+    # 反例断言：单独看 verify_manifests_sha256sum，两者一起换后确实自洽、PASS。
+    ok_self_consistency, self_consistency_problems = cass_manifest_census.verify_manifests_sha256sum(
+        manifests_dir, backup_dir / "manifests.sha256sum"
+    )
+    assert ok_self_consistency, (
+        f"反例应证伪：manifest 与重新生成的 manifests.sha256sum 彼此自洽: {self_consistency_problems}"
+    )
+
+    problems = cass_weekly.verify_weekly(dest, keep=7)
+    assert any("manifests.sha256sum" in p and "FAILED" in p for p in problems), problems
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +418,9 @@ def test_v14c_fadvise_called_once_per_covered_nas_file(
     assert n_blobs > 0, "覆盖集断言至少要有 1 个 blob 才有意义"
     retained = _retained_backup_dirs(dest)
     n_manifests = sum(len(list((b / "manifests").glob("*.json"))) for b in retained)
-    # 每个保留备份各读一次 db + census.tsv + sessions.tsv。
-    n_per_backup_files = len(retained) * 3
+    # 每个保留备份各读一次 db + census.tsv + sessions.tsv + manifests.sha256sum
+    # 自身（P1-1 的 digest 绑定读——见 verify_backup_self）。
+    n_per_backup_files = len(retained) * 4
     # sessions.state.tsv 一次（⑤ 读前同样 fadvise——页缓存陈旧性与文件大小无关）。
     n_state = 1
 
