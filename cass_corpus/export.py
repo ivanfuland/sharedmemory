@@ -7,7 +7,7 @@ import stat
 import sys
 import uuid
 from cass_corpus import reader, render
-from cass_corpus.redact import redact_secrets
+from cass_corpus.redact import redact_secrets, redact_transcript
 from cass_corpus import state as _state
 from cass_corpus.pruner import DeterministicPruner
 
@@ -177,7 +177,7 @@ def export(db_path, out_dir, limit=20, agents=None,
         try:                                            # per-conversation 隔离:单会话失败不中断整批
             msgs = reader.read_messages(db_path, meta["id"])
             text = render.render(meta, pruner.prune(msgs))
-            text = redact_secrets(text)                 # ① 脱敏（在 min_chars 门之前）
+            text = redact_transcript(text)                 # ① 脱敏（在 min_chars 门之前）
             if len(text) < min_chars:                   # gbrain minChars 默认 2000 会丢,先本地跳过
                 skipped.append((meta["id"], len(text)))
             else:
@@ -214,7 +214,7 @@ def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
         exported_ts = reader.max_message_ts(db_path, meta["id"])
         msgs = reader.read_messages(db_path, meta["id"])
         text = render.render(meta, pruner.prune(msgs))
-        text = redact_secrets(text)                     # ① 脱敏（在 min_chars 门之前）
+        text = redact_transcript(text)                     # ① 脱敏（在 min_chars 门之前）
         if len(text) < min_chars:
             skipped.append((meta["id"], len(text)))
         else:
