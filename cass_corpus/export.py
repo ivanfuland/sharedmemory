@@ -3,7 +3,9 @@
 # 用法:uv run python -m cass_corpus.export [out_dir] [limit]
 import os
 import re
+import stat
 import sys
+import uuid
 from cass_corpus import reader, render
 from cass_corpus.redact import redact_secrets
 from cass_corpus import state as _state
@@ -91,16 +93,18 @@ def _validate_text_identity(text, meta):
 
 
 def _guard_write_target(path, meta):
-    """持久 fail-loud:目标已存在且身份不同 → 绝不覆盖。
-    覆盖只允许发生在"同一逻辑会话的内容更新"上。
-    老/合成 schema 无 external_id → 两侧身份同为 (None, None, agent),放行
-    (那种库本就没有稳定身份;不同会话的 rowid 派生 key 不同名,不会走到这里)。"""
-    if not os.path.exists(path):
+    """持久 fail-loud：目标已存在且（身份不同 或 非普通文件）→ 绝不覆盖。
+    lexists+lstat：symlink/dangling symlink/特殊文件一律按 FOREIGN 拒写（codex R1 P2-2）。"""
+    if not os.path.lexists(path):
         return
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise TranscriptIdentityError(
+            f"拒绝覆盖 {os.path.basename(path)}：目标不是普通文件（symlink/特殊文件）。")
     prev, cur = _identity_of_file(path), _identity_of_meta(meta)
     if prev != cur:
         raise TranscriptIdentityError(
-            f"拒绝覆盖 {os.path.basename(path)}:已有文件身份 {prev},待写身份 {cur}。"
+            f"拒绝覆盖 {os.path.basename(path)}：已有文件身份 {prev}，待写身份 {cur}。"
             f"同名不同会话 = session_key 碰撞或外来文件 —— 绝不静默覆盖。"
             f"若为真碰撞,增大 render._KEY_BYTES 并重刷。")
 
@@ -120,9 +124,8 @@ def _assert_no_legacy_names(out_dir):
 
 
 def _atomic_write(path, text):
-    """原子写:先写同目录 tmp 再 os.replace 顶替。reader(gbrain autopilot)永远看完整文件,
-    不会撞写了一半的残包。失败清理 tmp。"""
-    tmp = f"{path}.tmp.{os.getpid()}"
+    """原子写：先写同目录 tmp 再 os.replace 顶替。tmp 名加 uuid → 同进程多线程也唯一。"""
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
@@ -133,6 +136,32 @@ def _atomic_write(path, text):
         except OSError:
             pass
         raise
+
+
+def _write_transcript(path, text, meta):
+    """熔合的原子占位写（替代 _guard_write_target + _atomic_write 两步）。
+    ① 写盘前自校验待写内容身份（P0）；② os.link 原子创建，EEXIST → 比原像 → replace(同)/raise(异)。
+    危险分支（不同身份新文件竞争创建）由 os.link 原子性保证恰一个成功，窗口消失。"""
+    if not _validate_text_identity(text, meta):
+        raise TranscriptIdentityError(
+            f"拒绝覆盖/写入 {os.path.basename(path)}：待写内容 frontmatter 身份 ≠ 会话身份，"
+            f"或 frontmatter 非法（malformed/重复身份 key）—— 绝不落盘被污染的 transcript。")
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            os.link(tmp, path)              # 原子创建：仅 path 不存在才成功
+            return "created"
+        except FileExistsError:
+            _guard_write_target(path, meta)  # 既有文件身份校验（lexists）：异 → raise
+            os.replace(tmp, path)            # 同身份 = 合法更新，原子覆盖
+            return "updated"
+    finally:
+        try:
+            os.unlink(tmp)                   # created 后 tmp 仍在 → 清；replace 后已消失 → 忽略
+        except OSError:
+            pass                             # 宽捕获：清理失败绝不遮蔽主异常
 
 
 def export(db_path, out_dir, limit=20, agents=None,
@@ -154,8 +183,7 @@ def export(db_path, out_dir, limit=20, agents=None,
             else:
                 fn = render.transcript_filename(meta)
                 path = os.path.join(out_dir, fn)
-                _guard_write_target(path, meta)      # 持久:跨批、跨 retry 都拦得住
-                _atomic_write(path, text)
+                _write_transcript(path, text, meta)
                 written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
         except Exception as e:
             errors.append((meta.get("id"), repr(e)[:200]))
@@ -192,8 +220,7 @@ def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
         else:
             fn = render.transcript_filename(meta)
             path = os.path.join(out_dir, fn)
-            _guard_write_target(path, meta)          # F3 逐条驱动也必须拦(codex R2 P1)
-            _atomic_write(path, text)
+            _write_transcript(path, text, meta)
             written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
     except Exception as e:
         errors.append((meta.get("id"), repr(e)[:200]))
