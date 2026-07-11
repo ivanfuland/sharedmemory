@@ -224,3 +224,87 @@ def _mk_db_two_convs(path):
           VALUES(1,0,'user','aaaa',1735660800000),(2,0,'user','bbbb',1735660900000);
     """)
     db.commit(); db.close()
+
+
+def test_parse_frontmatter_identity_ok():
+    s = "---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    ident, dup, status = _export._parse_frontmatter_identity(s)
+    assert status == "OK" and dup == set()
+    assert ident == ("ext-a", "local", "codex")
+
+
+def test_parse_frontmatter_identity_unclosed():
+    ident, dup, status = _export._parse_frontmatter_identity("---\nexternal_id: ext-a\nno closing fence\n")
+    assert status == "UNCLOSED"
+
+
+def test_parse_frontmatter_identity_duplicate_key():
+    s = "---\nexternal_id: ext-a\nexternal_id: evil\nsource_id: local\nagent: codex\n---\n"
+    ident, dup, status = _export._parse_frontmatter_identity(s)
+    assert status == "OK" and "external_id" in dup
+
+
+def test_identity_of_file_long_title_not_frozen(tmp_path):
+    """cap 充分性守卫（非 base-regression）：身份字段在顶部、title 排其后，故 base(4096) 也读得到真身份。
+    本测试防将来有人把 _read_frontmatter_head 的 cap 改回 4096——那样 8000 字 title 会把闭合 --- 推到
+    cap 之外，parse 得 UNCLOSED → _identity_of_file 返 FOREIGN → 二次导出永久冻结（codex R1 P1-1）。"""
+    p = tmp_path / "long.md"
+    body = ("---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n"
+            "title: " + ("x" * 8000) + "\n---\n正文\n")
+    p.write_text(body, encoding="utf-8")
+    assert _export._identity_of_file(str(p)) == ("ext-a", "local", "codex")
+
+
+def test_identity_of_file_duplicate_identity_is_foreign(tmp_path):
+    """磁盘已有文件含重复身份 key（被注入污染）→ _identity_of_file 判 FOREIGN，
+    guard 绝不信任它的 last-wins 身份（codex R1 P1-2）。"""
+    p = tmp_path / "dup.md"
+    p.write_text("---\nexternal_id: victim\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\n",
+                 encoding="utf-8")
+    assert _export._identity_of_file(str(p)) == "FOREIGN"
+
+
+def test_identity_of_file_huge_unclosed_is_foreign(tmp_path):
+    """超长单行 + 无闭合 fence（malformed/攻击文件）→ 有界 read(cap) 只读 ≤cap 字符、判 FOREIGN，
+    不把整个巨行读进内存（codex R2 must-fix：`for line in f` 会）。"""
+    p = tmp_path / "huge.md"
+    p.write_text("---\n" + "x" * 300000, encoding="utf-8")     # 无闭合 ---，单行 >cap
+    assert _export._identity_of_file(str(p)) == "FOREIGN"
+
+
+def test_validate_text_identity_whitespace_canonical():
+    """身份值前后空格：parser 的 .strip() 与 _identity_of_meta 的 strip 对称 → 不误 fail-loud（codex R2 P2#3）。"""
+    meta = {"external_id": " ext-a ", "source_id": "local", "agent": "codex"}
+    text = "---\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is True
+
+
+def test_validate_text_identity_match(tmp_path):
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is True
+
+
+def test_validate_text_identity_mismatch_redacted():
+    # 模拟 redact 把 external_id 改成 REDACTED
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nexternal_id: [REDACTED_SECRET]\nsource_id: local\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is False
+
+
+def test_validate_text_identity_duplicate_injected():
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nexternal_id: ext-a\nsource_id: local\nagent: codex\nexternal_id: evil\n---\n"
+    assert _export._validate_text_identity(text, meta) is False
+
+
+def test_validate_text_identity_legacy_schema():
+    # legacy meta 无 external_id/source_id → 身份 (None, None, agent)，text 也不写这两行
+    meta = {"agent": "codex"}
+    text = "---\nsource: cass\nsession_key: sabc\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is True
+
+
+def test_validate_text_identity_malformed_no_frontmatter():
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    assert _export._validate_text_identity("just text\nexternal_id: ext-a\n", meta) is False

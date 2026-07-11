@@ -33,25 +33,61 @@ class TranscriptIdentityError(RuntimeError):
     pass
 
 
-def _identity_of_meta(meta):
-    return tuple(meta.get(k) for k in _IDENTITY_KEYS)
-
-
-def _identity_of_file(path):
-    """读已有 transcript 的 frontmatter 身份。无 frontmatter(外来文件)→ 'FOREIGN'(拒写)。"""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        head = f.read(4096)
-    lines = head.splitlines()
+def _parse_frontmatter_identity(s):
+    """解析一段文本的 frontmatter 身份。返回 (identity_tuple, dup_keys, status)。
+    status: OK(有闭合 ---) / NO_FRONTMATTER(首行非 ---) / UNCLOSED(有起始无闭合)。
+    dup_keys: frontmatter 内出现 >1 次的 key（防 §2.3 注入覆盖真身份行）。"""
+    lines = s.splitlines()
     if not lines or lines[0].strip() != "---":
-        return "FOREIGN"
-    fm = {}
+        return (("FOREIGN",), set(), "NO_FRONTMATTER")
+    fm, counts, closed = {}, {}, False
     for line in lines[1:]:
         if line.strip() == "---":
+            closed = True
             break
         m = _FM_LINE.match(line)
         if m:
-            fm[m.group(1)] = m.group(2).strip()
-    return tuple(fm.get(k) for k in _IDENTITY_KEYS)
+            k = m.group(1)
+            counts[k] = counts.get(k, 0) + 1
+            fm[k] = m.group(2).strip()
+    dup = {k for k, c in counts.items() if c > 1}
+    identity = tuple(fm.get(k) for k in _IDENTITY_KEYS)
+    return (identity, dup, "OK" if closed else "UNCLOSED")
+
+
+def _read_frontmatter_head(path, cap=262144):
+    """有界读取：最多 cap 个字符（真实 frontmatter 身份行在顶部、title 是短会话标题，绰绰有余）。
+    用单次 bounded read 而非 `for line in f`——后者遇无换行的超长单行会把整行读进内存（128MB body
+    没有闭合 fence 时实测 head 达 134MB，cap 形同虚设，codex R2）。text-mode read(cap) 读 ≤cap 字符，
+    内存有界；闭合 --- 若在 cap 之外 → 视为 UNCLOSED → FOREIGN（真实文件的 fence 永远在前，安全欠标）。"""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(cap)
+
+
+def _identity_of_meta(meta):
+    """会话身份原像 (external_id, source_id, agent)。strip 字符串值 → 与 parser 的 group(2).strip()
+    对称（消除 raw-meta vs parsed-file 的前后空格不对称，codex R2 P2#3；无空格 fixture 为 no-op）。"""
+    return tuple((v.strip() if isinstance(v, str) else v)
+                 for v in (meta.get(k) for k in _IDENTITY_KEYS))
+
+
+def _identity_of_file(path):
+    """读已有 transcript 的 frontmatter 身份。无/未闭合 frontmatter、或含重复身份 key → 'FOREIGN'（拒写）。"""
+    identity, dup, status = _parse_frontmatter_identity(_read_frontmatter_head(path))
+    if status != "OK" or (dup & set(_IDENTITY_KEYS)):   # 重复身份 key 也不可信（codex R1 P1-2）
+        return "FOREIGN"
+    return identity
+
+
+def _validate_text_identity(text, meta):
+    """写盘前自校验：待写 text 的 frontmatter 身份必须 == meta 身份，且无重复身份 key、
+    frontmatter 闭合良好。以 meta 为基准 → legacy(无 ext/source) 与新 schema 都天然涵盖。"""
+    identity, dup, status = _parse_frontmatter_identity(text)
+    if status != "OK":
+        return False
+    if dup & set(_IDENTITY_KEYS):
+        return False
+    return identity == _identity_of_meta(meta)
 
 
 def _guard_write_target(path, meta):
