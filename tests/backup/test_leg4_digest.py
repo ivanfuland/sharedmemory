@@ -512,6 +512,45 @@ def test_watermark_trailing_newline_fails_full_leg4_v5d2_r7(synth_dd):
     assert "解析失败" in result.detail
 
 
+@requires_cass
+def test_watermark_format_check_is_unconditional_first_night_and_rebaseline_r9(synth_dd):
+    """codex R9-P0：水位「值 `fullmatch([0-9]+)` 格式校验」是**无条件硬编码不变式**，
+    不该被首晚/rebaseline 连带豁免（spec §5.5(b) 无条件）。修复前它只在
+    `not rebaseline and prev is not None` 分支跑 → 首晚坏水位 `数字\\n` 走「首晚登记
+    PASS」、rebaseline 坏水位也放行。修复后：**首晚（prev=None）和 rebaseline 两个
+    分支都必须 FAIL**，且单调性比较仍只在正常分支跑（合法整数值不误伤）。"""
+    db = synth_dd / "agent_search.db"
+
+    # 把 last_scan_ts 改成「同数字 + 尾随 \n」（数值未回退，只有格式门能拦）。
+    con = sqlite3.connect(str(db))
+    try:
+        cur_val = con.execute("SELECT value FROM meta WHERE key='last_scan_ts'").fetchone()[0]
+        con.execute("UPDATE meta SET value=? WHERE key='last_scan_ts'", (f"{cur_val}\n",))
+        con.commit()
+    finally:
+        con.close()
+
+    # (1) 首晚登记（prev_tables=None, prev_watermarks=None）——修复前会 PASS。
+    con = sqlite3.connect(str(db))
+    try:
+        first_night = leg4(con, prev_tables=None, prev_watermarks=None)
+    finally:
+        con.close()
+    assert first_night.ok is False, f"首晚坏水位必须 FAIL（格式校验无条件）: {first_night.detail}"
+    assert "last_scan_ts" in first_night.detail and "解析失败" in first_night.detail
+
+    # (2) rebaseline（给 prev 但 rebaseline=True）——修复前会 PASS。
+    con = sqlite3.connect(str(db))
+    try:
+        # 用一份合法 prev（值都是合法整数），证明 FAIL 来自格式校验而非比较。
+        legit_prev = {k: "1" for k in REQUIRED_LEG4_WATERMARK_KEYS}
+        rebaselined = leg4(con, prev_tables=None, prev_watermarks=legit_prev, rebaseline=True)
+    finally:
+        con.close()
+    assert rebaselined.ok is False, f"rebaseline 坏水位必须 FAIL（格式校验无条件）: {rebaselined.detail}"
+    assert "last_scan_ts" in rebaselined.detail and "解析失败" in rebaselined.detail
+
+
 # ---------------------------------------------------------------------------
 # 攻击⑦：删 last_scan_ts 整行——必需清单拦，99% 阈值式检查本会放行（V5d4）
 # ---------------------------------------------------------------------------

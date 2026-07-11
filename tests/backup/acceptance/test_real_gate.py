@@ -413,6 +413,46 @@ def test_v5d2_watermark_trailing_newline_real_db_fails_leg4_r7(
     assert "解析失败" in leg4_line
 
 
+def test_v5d2_watermark_bad_format_first_night_real_db_fails_r9(fixtures_dir, tmp_path):
+    """codex R9-P0 真库钉子（首晚复现）：**空 DEST（首晚登记模式，无基线）** +
+    probe-snapshot 可写副本的 `last_scan_ts` 改「同数字 + 尾随 \\n」→ gate 必须
+    exit 1、腿 4 FAIL。修复前水位格式校验只在「与 prev 比较」分支跑，首晚走
+    「[leg 4] PASS 首晚登记」、rc=0、发布含 COMPLETE 的 cass-*（保留尾随换行）。
+    这条与 R7 真库钉子的关键差异：dest 为空（首晚），专门覆盖被 baseline-gated
+    漏掉的首晚分支。可写副本用完即删。"""
+    probe_db = fixtures_dir / "probe-snapshot.db"
+    generated = tmp_path / "watermark-newline-firstnight.db"
+    shutil.copyfile(probe_db, generated)
+    try:
+        con = sqlite3.connect(str(generated))
+        try:
+            cur_val = con.execute(
+                "SELECT value FROM meta WHERE key='last_scan_ts'"
+            ).fetchone()[0]
+            con.execute(
+                "UPDATE meta SET value=? WHERE key='last_scan_ts'", (f"{cur_val}\n",)
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        empty_dest = tmp_path / "empty-dest"  # 空 DEST = 首晚（无基线）
+        empty_dest.mkdir()
+        census = tmp_path / "census.tsv"
+        gate_json = tmp_path / "gate.json"
+        rc, out, err = _run_gate_cli(generated, empty_dest, census, gate_json, timeout=60)
+    finally:
+        generated.unlink(missing_ok=True)
+
+    assert rc == 1, f"首晚坏水位必须 FAIL（格式校验无条件）：\nSTDOUT={out}\nSTDERR={err}"
+    verdicts = _leg_verdicts(out)
+    assert verdicts[4] == "FAIL", out
+    leg4_line = next(line for line in out.splitlines() if line.startswith("[leg 4]"))
+    assert "last_scan_ts" in leg4_line
+    assert "解析失败" in leg4_line
+    assert "PASS" not in leg4_line, "首晚坏水位不该走「[leg 4] PASS 首晚登记」老路"
+
+
 # ---------------------------------------------------------------------------
 # Step 2 —— 生成器对拍：fixture_factory.attack1..7 应用到 probe-snapshot.db 的
 # 可写副本，与保险副本 attack*.db 跑同一个五腿门，比较逐腿 verdict（不比字节）。

@@ -476,9 +476,20 @@ def _leg4_parse_uint(value) -> int | None:
 def _leg4_watermarks(
     con, prev_watermarks: dict[str, str] | None, rebaseline: bool
 ) -> tuple[list[str], dict[str, str]]:
-    """meta 水位两部分：(a) 必需键存在（硬编码清单，缺任一 FAIL，rebaseline 也不
-    豁免）；(b) 单调不减（先 `^[0-9]+$` 校验再按无符号整数比较，解析失败即 FAIL）。
-    `rebaseline=True` 或 `prev_watermarks is None`（首晚）时跳过 (b)。
+    """meta 水位三部分——(a)/(b) 是【硬编码不变式·无条件】，(c) 是【与 baseline 的
+    比较·可豁免】（codex R9-P0：格式校验此前被错误耦合进 (c) 分支，被 rebaseline/
+    首晚连带豁免了）：
+
+    - (a) 必需键存在（硬编码清单，缺任一 FAIL）——**rebaseline / 首晚 / 正常三分支
+      都跑**。
+    - (b) 值格式合法性：每个**存在的**必需键的值必须过 `fullmatch([0-9]+)`（合法
+      十进制无符号整数，无前导/尾随空白或换行），解析失败即 FAIL——**rebaseline /
+      首晚 / 正常三分支都跑**。spec §5.5(b)「每个键先过 `^[0-9]+$`，解析失败即
+      FAIL」是**无条件**的，不依赖 baseline（值是不是合法整数，跟有没有上一份、
+      是不是 rebaseline 无关）。
+    - (c) 单调不减（`cur >= prev`，按无符号整数比较）——这是【与历史 baseline 的
+      比较】，`rebaseline=True` 或 `prev_watermarks is None`（首晚）时**跳过**
+      （spec §5.7/§11：rebaseline/首晚 只豁免与历史 baseline 的比较）。
 
     `meta` 表本身整体不可读（如攻击①用 `writable_schema` 删掉其 schema 条目）时
     `SELECT` 会抛 `sqlite3.DatabaseError`——与腿 3 对缺表的受控处理同一套哲学：
@@ -496,24 +507,42 @@ def _leg4_watermarks(
         rows = []
     current = dict(rows)
 
+    # (a) 必需键存在——无条件。
     missing = [key for key in REQUIRED_LEG4_WATERMARK_KEYS if key not in current]
     if missing:
         problems.append("必需水位键缺失: " + ", ".join(missing))
 
+    # (b) 值格式合法性——无条件（rebaseline/首晚也跑）。对每个存在的必需键的值过
+    # `fullmatch([0-9]+)`；解析失败即 FAIL。通过的存进 current_ints 供 (c) 复用，
+    # 避免重复解析。（缺失的键已在 (a) 报过，这里只校验存在键的值格式。）
+    current_ints: dict[str, int] = {}
+    for key in REQUIRED_LEG4_WATERMARK_KEYS:
+        if key not in current:
+            continue
+        parsed = _leg4_parse_uint(current[key])
+        if parsed is None:
+            problems.append(
+                f'水位键 "{key}" 解析失败（值={current[key]!r} 非合法十进制整数）'
+            )
+        else:
+            current_ints[key] = parsed
+
+    # (c) 单调不减——仅在有 prev 且非 rebaseline 时跑（与历史 baseline 的比较）。
     if not rebaseline and prev_watermarks is not None:
         for key in REQUIRED_LEG4_WATERMARK_KEYS:
-            if key not in current or key not in prev_watermarks:
+            if key not in current_ints or key not in prev_watermarks:
                 continue
-            cur_int = _leg4_parse_uint(current[key])
             prev_int = _leg4_parse_uint(prev_watermarks[key])
-            if cur_int is None or prev_int is None:
+            if prev_int is None:
+                # 基线侧水位值非法 = 毒基线，响亮报「需人工 rebaseline」（绝不带毒
+                # 基线比较放行）——与 leg3 `_leg3_compare_census` 的毒基线处置同族。
                 problems.append(
-                    f'水位键 "{key}" 解析失败（当前值={current[key]!r}, '
-                    f"上次值={prev_watermarks[key]!r}）"
+                    f'基线水位键 "{key}" 解析失败（值={prev_watermarks[key]!r} 非合法'
+                    "十进制整数），需人工 rebaseline"
                 )
                 continue
-            if cur_int < prev_int:
-                problems.append(f'水位键 "{key}" 回退（{prev_int} → {cur_int}）')
+            if current_ints[key] < prev_int:
+                problems.append(f'水位键 "{key}" 回退（{prev_int} → {current_ints[key]}）')
 
     return problems, current
 
@@ -538,8 +567,9 @@ def leg4(
     `prev_tables is None`（首晚）：登记模式，2/3 与摘要比对天然跳过（无基线可比），
     `ok` 只取决于 1 + meta 必需水位键存在。
 
-    `meta` 水位检查见 `_leg4_watermarks`：(a) 必需键存在永不可关（即使 rebaseline）；
-    (b) 单调不减，`rebaseline` 或首晚时跳过。
+    `meta` 水位检查见 `_leg4_watermarks`：(a) 必需键存在 + (b) 值格式合法
+    （`fullmatch([0-9]+)`）都是**无条件不变式**，rebaseline/首晚也照跑（codex R9-P0）；
+    只有 (c) 单调不减是与历史 baseline 的比较，`rebaseline` 或首晚时跳过。
     """
     problems: list[str] = []
     tables: dict[str, dict[str, int | str]] = {}

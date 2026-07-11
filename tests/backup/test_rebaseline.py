@@ -290,3 +290,31 @@ def test_rebaseline_attack1_still_fails_required_objects(gate_baseline, tmp_path
     assert rc == 1, f"rebaseline 不是 bypass-all，仍应 FAIL：stdout={out}\nstderr={err}"
     assert "[leg 3] FAIL" in out
     assert "meta" in out
+
+
+@requires_cass
+def test_rebaseline_bad_watermark_format_still_fails_r9(gate_baseline, tmp_path):
+    """codex R9-P0（rebaseline 复现）：rebaseline 只关闭「与历史 baseline 的比较」
+    （水位单调性等），但水位「值 `fullmatch([0-9]+)` 格式合法性」是无条件不变式
+    （spec §5.5(b)），rebaseline 不豁免。`last_scan_ts` 改「同数字 + 尾随 \\n」+
+    rebaseline 指名合法 tip → 整体门仍必须 FAIL、`[leg 4] FAIL` 指认水位解析失败。
+    修复前 rebaseline 分支不跑格式校验 → rc=0 放行。"""
+    db, dest = gate_baseline
+    con = sqlite3.connect(str(db))
+    try:
+        cur_val = con.execute("SELECT value FROM meta WHERE key='last_scan_ts'").fetchone()[0]
+        con.execute("UPDATE meta SET value=? WHERE key='last_scan_ts'", (f"{cur_val}\n",))
+        con.commit()
+    finally:
+        con.close()
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(
+        db, dest, out_census, out_gate,
+        rebaseline="cass-baseline", rebaseline_reason="坏水位在 rebaseline 下仍应 FAIL",
+    )
+
+    assert rc == 1, f"rebaseline 不豁免水位格式校验：stdout={out}\nstderr={err}"
+    assert "[leg 4] FAIL" in out, out
+    assert "last_scan_ts" in out and "解析失败" in out, out

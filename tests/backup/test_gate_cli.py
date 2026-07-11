@@ -147,6 +147,37 @@ def test_first_night_no_baseline_passes_and_writes_artifacts(synth_dd, tmp_path)
     assert gate["census_sha256"] == hashlib.sha256(out_census.read_bytes()).hexdigest()
 
 
+@requires_cass
+def test_first_night_bad_watermark_format_fails_gate_r9(synth_dd, tmp_path):
+    """codex R9-P0（首晚复现）：全新 DEST（无基线，首晚登记模式）+ `last_scan_ts`
+    改「同数字 + 尾随 \\n」→ gate CLI 必须 exit 1、`[leg 4] FAIL`。修复前水位格式
+    校验只在「与 prev 比较」分支跑，首晚走「[leg 4] PASS 首晚登记」、发布含 COMPLETE
+    的 cass-*（digest 里保留尾随换行）。水位格式合法性是无条件不变式（spec §5.5(b)）。"""
+    db = synth_dd / "agent_search.db"
+    con = sqlite3.connect(str(db))
+    try:
+        cur_val = con.execute("SELECT value FROM meta WHERE key='last_scan_ts'").fetchone()[0]
+        con.execute("UPDATE meta SET value=? WHERE key='last_scan_ts'", (f"{cur_val}\n",))
+        con.commit()
+    finally:
+        con.close()
+
+    dest = tmp_path / "dest"
+    dest.mkdir()  # 空 dest = 首晚，无基线
+    out_census = tmp_path / "census.tsv"
+    out_gate = tmp_path / "gate.json"
+
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"首晚坏水位必须 FAIL（格式校验无条件）：stdout={out}\nstderr={err}"
+    assert "[leg 4] FAIL" in out, out
+    assert "last_scan_ts" in out and "解析失败" in out, out
+    # 首晚登记的 PASS 措辞不该出现在腿4（证明没走「登记放行」老路）：
+    assert "[leg 4] PASS" not in out, out
+    # 产物仍落地（SUSPECT 取证契约）：
+    assert out_census.exists() and out_gate.exists()
+
+
 # ---------------------------------------------------------------------------
 # 第二次以第一次为基线：自比对 PASS
 # ---------------------------------------------------------------------------
