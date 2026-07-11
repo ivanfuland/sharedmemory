@@ -184,6 +184,47 @@ def _make_fake_published(dest, name, generation) -> pathlib.Path:
     return backup_dir
 
 
+def _make_chained_published(dest, name, generation, prev_dir=None) -> pathlib.Path:
+    """带**正确链指针**的最小「已发布」cass-*/（`COMPLETE` + digest.json，含
+    `generation`/`prev_backup_name`/`prev_sidecar_sha256`）。`prev_dir=None` ⇒ 链头
+    （prev 空）。用于「verify_chain 有意义」的轮转测试——`_make_fake_published`
+    没有 prev 指针，verify_chain 会误报 fixture 自身的断链，没法区分「删除 bug 造成
+    的断链」与「fixture 本来就没链」。"""
+    backup_dir = pathlib.Path(dest) / name
+    backup_dir.mkdir()
+    if prev_dir is None:
+        prev_name, prev_sha = "", ""
+    else:
+        prev_dir = pathlib.Path(prev_dir)
+        prev_name = prev_dir.name
+        prev_sha = cass_common.sha256_file(prev_dir / "digest.json")
+    (backup_dir / "digest.json").write_bytes(
+        cass_common.dumps_canonical(
+            {
+                "backup_name": name,
+                "generation": generation,
+                "prev_backup_name": prev_name,
+                "prev_sidecar_sha256": prev_sha,
+            }
+        )
+    )
+    (backup_dir / "COMPLETE").touch()
+    return backup_dir
+
+
+def _chain_real_tip_to_prev(tip_dir, prev_dir) -> None:
+    """把 `_publish_real_tip` 产出的真 tip 的 digest.json 补上指向 `prev_dir` 的链
+    指针（census/tables/水位等真实字段不动——`_validate_baseline` 不看 prev 字段，
+    故打补丁不破坏 gate 的基线校验/腿比对）。让真 tip 接到手工链尾巴上，使整条
+    R 有完整指针、verify_chain 只可能因计数下界而非断链报问题。"""
+    tip_dir = pathlib.Path(tip_dir)
+    prev_dir = pathlib.Path(prev_dir)
+    digest = json.loads((tip_dir / "digest.json").read_bytes())
+    digest["prev_backup_name"] = prev_dir.name
+    digest["prev_sidecar_sha256"] = cass_common.sha256_file(prev_dir / "digest.json")
+    (tip_dir / "digest.json").write_bytes(cass_common.dumps_canonical(digest))
+
+
 def _make_protected_fixtures(dest: pathlib.Path) -> dict[str, pathlib.Path]:
     """spec §11 明确点名的、轮转绝不可删的非 `cass-*` 系列条目：`SUSPECT-*` /
     `INCOMPLETE-*` / `RECOVERABLE-*` / 既有 `agent_search.db.pre-franken-*`。
@@ -508,6 +549,113 @@ def test_rotation_delete_failure_is_loud_but_backup_stays_published(
             assert (dest / f"cass-rf-{g}").is_dir(), f"generation {g} 不应被误删（本轮唯一该删的是 generation 1）"
     finally:
         gen1.chmod(0o700)
+
+
+# ---------------------------------------------------------------------------
+# codex R8-P1：多 victim 部分删除失败——升序 + 遇失败即 break ⇒ R 连续、链不断裂
+# （旧「记 flag 继续删」会留 {g1,g4..} 断链）。
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_r8_rotation_multi_victim_delete_failure_breaks_keeps_chain_contiguous(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """codex 复现：真链 g1←…←g9（g9 真 tip 供 gate 比对）+ 发布 g10，KEEP=7 →
+    victim=[g1,g2,g3]（升序）。g1（最老）chmod 555 使 rm 失败 → **break** 停止后续
+    删除 → g2/g3 未被删（旧 continue 逻辑会删掉它们 → R={g1,g4..g10} 断链）。断言：
+    全部 g1..g10 在（R 连续）、verify_chain **无断链/分叉问题**（只可能有良性的超额
+    计数、下一轮自愈）、rc 非零。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    db = synth_dd / "agent_search.db"
+    scratch = tmp_path / "gate-scratch"
+
+    prev = _make_chained_published(dest, "cass-mv-1", 1, prev_dir=None)
+    for g in range(2, 9):
+        prev = _make_chained_published(dest, f"cass-mv-{g}", g, prev_dir=prev)
+    tip = _publish_real_tip(dest, "cass-mv-9", db, generation=9, scratch_dir=scratch)
+    _chain_real_tip_to_prev(tip, prev)  # g9.prev = g8，整条 R 指针完整
+
+    g1 = dest / "cass-mv-1"
+    g1.chmod(0o555)  # 最老 victim rm 失败
+    try:
+        rc, out = _run(
+            tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "mv-10",
+            extra_env={"CASS_BACKUP_KEEP": "7"},
+        )
+        assert rc != 0, out
+        assert "halting further deletions" in out, out
+
+        new_dir = dest / "cass-mv-10"
+        assert new_dir.is_dir() and (new_dir / "COMPLETE").is_file(), "备份本身应发布成功"
+
+        # break 后 R 连续：g1 删失败留守，g2/g3 因 break 未被删（关键区分点）。
+        for g in range(1, 11):
+            assert (dest / f"cass-mv-{g}").is_dir(), f"cass-mv-{g} 应仍在（R 连续，无缺口）"
+        assert (dest / "cass-mv-2").is_dir() and (dest / "cass-mv-3").is_dir(), (
+            "关键区分：break 保住了 g2/g3；旧 continue 逻辑会删掉它们造成 g4.prev 断链"
+        )
+
+        # verify_chain 无断链/分叉（只可能有超额计数下界问题，良性）：
+        problems = cass_chain.verify_chain(dest, keep=7)
+        assert not any(
+            ("不在保留集内" in p) or ("孤儿" in p) or ("分叉" in p) for p in problems
+        ), f"break 后 R 连续，不应有断链/分叉问题：{problems}"
+    finally:
+        g1.chmod(0o700)
+
+
+@requires_cass
+def test_r8_retention_reset_delete_failure_keeps_all_old_and_recovers(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """codex 同根复现（retention_reset 侧）：old1 删失败 → break → old2/old3 未删
+    （旧 continue 会删掉它们 → old2/old3 丢失）。重置点因非链头被 preflight 判 FAIL
+    → 进 RECOVERABLE（现有逻辑）→ 旧份零丢失。断言：old1/old2/old3 全留、重置点
+    进 RECOVERABLE-*、无已发布 cass-reset-*、rc 非零。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    db = synth_dd / "agent_search.db"
+    scratch = tmp_path / "gate-scratch"
+
+    _make_fake_published(dest, "cass-old-1", generation=1)
+    _make_fake_published(dest, "cass-old-2", generation=2)
+    _publish_real_tip(dest, "cass-old-3", db, generation=3, scratch_dir=scratch)
+
+    tg_env = tmp_path / "tg.env"
+    tg_env.write_text(
+        'TELEGRAM_BOT_TOKEN="fake-token"\nTELEGRAM_CHAT_ID="12345"\n', encoding="utf-8"
+    )
+    curl_stub_dir = tmp_path / "curl-stub-bin"
+    _write_curl_stub(curl_stub_dir)
+
+    old1 = dest / "cass-old-1"
+    old1.chmod(0o555)  # 最老 victim rm 失败 → break
+    try:
+        rc, out = _run(
+            tmp_home, run_backup, synth_dd, cass_stub, dest, staging, "reset-new",
+            extra_env={
+                "CASS_BACKUP_RETENTION_RESET": "1",
+                "CASS_BACKUP_RETENTION_RESET_REASON": "reset with delete failure",
+                "CASS_BACKUP_KEEP": "7",
+                "CASS_BACKUP_TG_ENV": str(tg_env),
+                "PATH": f"{curl_stub_dir}{os.pathsep}{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+            },
+        )
+        assert rc != 0, out
+        # old1 删失败 → break → old2/old3 未删；旧份零丢失。
+        assert old1.is_dir(), out
+        assert (dest / "cass-old-2").is_dir(), "break 后 old2 应保留（旧 continue 会删它 → 丢失）"
+        assert (dest / "cass-old-3").is_dir(), "break 后 old3 应保留"
+        # 重置点非链头（old1..3 仍在）→ preflight FAIL → 进 RECOVERABLE，不留作已发布 tip。
+        assert (dest / "RECOVERABLE-reset-new").is_dir(), out
+        assert not (dest / "cass-reset-new").exists(), "非链头的重置点不应留作已发布 cass-*"
+        assert "preflight FAILED" in out, out
+    finally:
+        old1.chmod(0o700)
 
 
 # ---------------------------------------------------------------------------

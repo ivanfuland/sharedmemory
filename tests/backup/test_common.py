@@ -317,6 +317,18 @@ def test_rotation_victims_still_lenient_skips_bad_generation(tmp_path):
     assert set(victims) == {"cass-1", "cass-2"}
 
 
+def test_rotation_victims_returns_oldest_first_ascending(tmp_path):
+    """codex R8-P1：victim 必须按 generation 升序（最老在前）——调用方遇 rm 失败即
+    break，只有升序才能让「删到哪、R 就是从哪往上的连续尾段」，链不缺口。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    # 乱序建，证明顺序由 generation 决定。
+    for g in (5, 1, 4, 2, 3):
+        _make_published_backup(dest, f"cass-g{g}", generation=g)
+    victims = cass_common.rotation_victims(dest, keep=2)
+    assert victims == ["cass-g1", "cass-g2", "cass-g3"], "必须按 generation 升序（最老在前）"
+
+
 # ---------------------------------------------------------------------------
 # codex R5-P1：pre_reset_victims —— retention_reset 清掉所有 generation < 重置点的份
 # ---------------------------------------------------------------------------
@@ -324,15 +336,18 @@ def test_rotation_victims_still_lenient_skips_bad_generation(tmp_path):
 
 def test_pre_reset_victims_selects_all_older_than_reset_point(tmp_path):
     """重置点 generation=4：gen1/2/3 全部选为待删，重置点自身（gen4）不 < 4，绝不
-    被选。"""
+    被选。**且按 generation 升序返回**（codex R8-P1：调用方遇 rm 失败即 break，只有
+    升序才能让中断处以上连续保留、链不缺口）。"""
     dest = tmp_path / "dest"
     dest.mkdir()
-    for i in range(1, 4):
-        _make_published_backup(dest, f"cass-{i}", generation=i)
+    # 乱序建（generation 3,1,2）以证明返回顺序取决于 generation 而非建目录顺序/名字。
+    _make_published_backup(dest, "cass-c", generation=3)
+    _make_published_backup(dest, "cass-a", generation=1)
+    _make_published_backup(dest, "cass-b", generation=2)
     _make_published_backup(dest, "cass-reset", generation=4)
 
     victims = cass_common.pre_reset_victims(dest, reset_generation=4)
-    assert set(victims) == {"cass-1", "cass-2", "cass-3"}
+    assert victims == ["cass-a", "cass-b", "cass-c"], "必须按 generation 升序（最老在前）"
     assert "cass-reset" not in victims
 
 

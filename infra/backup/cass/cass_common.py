@@ -190,9 +190,15 @@ def pre_reset_victims(dest, reset_generation: int) -> list[str]:
     （SUSPECT-*/INCOMPLETE-*/RECOVERABLE-*/raw-mirror/sessions/state/pre-franken）
     天然不匹配「含 COMPLETE 的 cass-*/」，不在候选集里。`reset_generation` 是本次
     发布（重置点）的 generation——它自身 `gen == reset_generation` 不 `< `，绝不
-    被选为 victim。"""
+    被选为 victim。
+
+    **按 generation 升序返回（最老在前）**（codex R8-P1）：调用方（backup-cass.sh
+    的删除循环）保证「遇 rm 失败即 break」，只有升序删除才能让「删到哪、R 就是从
+    哪往上的连续尾段」——中断处以上全部保留，链不会被删出缺口。"""
     return [
-        name for gen, name, _digest in _iter_published(dest) if gen < reset_generation
+        name
+        for gen, name, _digest in sorted(_iter_published(dest), key=lambda t: t[0])
+        if gen < reset_generation
     ]
 
 

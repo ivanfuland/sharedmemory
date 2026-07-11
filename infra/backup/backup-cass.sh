@@ -880,13 +880,20 @@ then
 else
   mapfile -t ROTATE_VICTIMS < "$STG/rotate.victims"
 fi
+# 删除顺序是**最老先删**（victim 列表由 `rotation_victims`/`pre_reset_victims` 按
+# generation 升序返回），且**遇 `rm -rf` 失败即 `break`**（codex R8-P1）：部分删除
+# 失败若继续删后续，会把 R 删成非连续（如 g1 删失败、g2/g3 删成功 → R={g1,g4..}，
+# g4.prev=g3 不在 R 且 g4 非最老 = 断链，违反 §8.3「沿 prev 走通到链头，每跳都在
+# R 内」）。升序 + 遇失败即停 ⇒ 删除停在哪、R 就是从那一代往上的连续尾段 ⇒ 链必然
+# 完整。ROTATE_FAIL=1 → exit 非零告警照旧；未删的超额份留到下一轮成功时再清。
 for victim in "${ROTATE_VICTIMS[@]}"; do
   [ -n "$victim" ] || continue
   if rm -rf "$DEST/$victim"; then
     echo "[backup] rotate rm $victim"
   else
-    echo "[backup] WARN: rotate rm failed: $victim" >&2
+    echo "[backup] WARN: rotate rm failed: $victim — halting further deletions to keep R contiguous (chain intact)" >&2
     ROTATE_FAIL=1
+    break
   fi
 done
 
@@ -907,6 +914,23 @@ if [ -n "$RETENTION_RESET" ]; then
     echo "[backup] ALERT: retention_reset published but verify_chain preflight FAILED" \
       "— moving to RECOVERABLE-$STAMP (needs human review; do not trust as published tip)"
     mv -T "$PUBLISHED_DIR" "$DEST/RECOVERABLE-$STAMP" 2>/dev/null || true
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# step 16c — 普通轮转的 verify_chain 兜底 preflight（codex R8-P1，与 retention_reset
+# 的 step 16b 对称）：**只在删除实际失败时跑**（`ROTATE_FAIL=1` 且非 retention_reset）。
+# 「升序 + 遇失败即 break」已从结构上保证部分删除后 R 仍是连续尾段（链完整），这里
+# 是双保险——若因任何未料原因 R 竟出现断链，verify_chain 会指认，与既有 ROTATE_FAIL
+# 一并 exit 非零告警。**不无条件跑**：健康轮转（ROTATE_FAIL=0）R 天然连续，且 verify_chain
+# 的严格指针模型不该压在每晚热路径上（那是 step 18 周校验的职责），无条件跑还会对
+# 不构造完整链指针的历史产物误报。删除失败不回滚已发布备份（它已安全）。
+# ---------------------------------------------------------------------------
+if [ -z "$RETENTION_RESET" ] && [ "$ROTATE_FAIL" = 1 ]; then
+  if "$VENV_PY" "$LIB/cass_chain.py" --dest "$DEST" --keep "$KEEP" 8>&-; then
+    echo "[backup] rotation-failure chain preflight: no broken chain (only over-retention, self-heals next run)"
+  else
+    echo "[backup] WARN: rotation had delete failures AND verify_chain flagged issues above — investigate"
   fi
 fi
 
