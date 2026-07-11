@@ -58,20 +58,33 @@ def transcript_filename(meta):
     return f"{_date(meta.get('started_at'))}-cass-{_safe(meta.get('agent'))}-{session_key(meta)}.md"
 
 
+# 覆盖 str.splitlines() 认作行边界的全部分隔符：LF CR VT FF FS-RS NEL LS PS。
+# parser（export._parse_frontmatter_identity）用 splitlines() 切行，_clean 必须清同一集合，
+# 否则 U+2028 等分隔符能绕过净化、在 splitlines 下拆出伪 frontmatter 行（codex 实现审 R1 P2#2）。
+_FM_BREAK = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
+def _clean(v):
+    """净化拼入 frontmatter 的值：任何行分隔符 → 空格，防止值内分隔符注入伪 frontmatter 行（codex R1 P1-3 + R2 P2#2）。"""
+    return _FM_BREAK.sub(" ", v or "")
+
+
 def _frontmatter(meta):
-    title = (meta.get("title") or "").replace("\n", " ").strip()
+    title = _clean(meta.get("title")).strip()
     # ⚠ 绝不写 conversation_id(rowid):它重摄即变 → frontmatter 变 → content_hash 变 →
     #   gbrain 仍把同一会话当新内容全量重炼。文件名稳定但正文漂移 = 修了一半等于没修
     #   (codex PR#41 审出的 P1:实测同一会话 rowid 72→116,文件名不变但渲染 hash 变)。
     #   要对当前库调试,用 external_id 反查:SELECT id FROM conversations WHERE external_id=?
+    # agent 是 CASS DB 的 slug（安全派生值），不经 _clean；万一含换行也会被
+    # export._validate_text_identity 的 dup/身份不符检查 fail-loud 拦下，不会静默污染。
     lines = ["---", "source: cass", f"session_key: {session_key(meta)}",
              f"agent: {meta.get('agent', '')}", f"date: {_date(meta.get('started_at'))}"]
     if meta.get("external_id"):
-        lines.append(f"external_id: {meta['external_id']}")
+        lines.append(f"external_id: {_clean(meta['external_id'])}")
     if meta.get("source_id"):
-        lines.append(f"source_id: {meta['source_id']}")
+        lines.append(f"source_id: {_clean(meta['source_id'])}")
     if meta.get("workspace"):
-        lines.append(f"workspace: {meta['workspace']}")
+        lines.append(f"workspace: {_clean(meta['workspace'])}")
     if title:
         lines.append(f"title: {title}")
     lines.append("---")

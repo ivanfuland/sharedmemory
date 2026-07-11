@@ -3,6 +3,7 @@
 # 全合成数据（PUBLIC 仓隐私）。messages 带 created_at（毫秒 epoch）以验 max_message_ts / exported_ts。
 import os
 import sqlite3
+import threading
 
 import pytest
 
@@ -224,3 +225,299 @@ def _mk_db_two_convs(path):
           VALUES(1,0,'user','aaaa',1735660800000),(2,0,'user','bbbb',1735660900000);
     """)
     db.commit(); db.close()
+
+
+def _mk_db_n_convs(path, n):
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+        CREATE TABLE conversations(id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+            workspace_id INTEGER, source_path TEXT, started_at INTEGER,
+            last_message_created_at INTEGER, primary_model TEXT,
+            external_id TEXT, source_id TEXT);
+        CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+            role TEXT, content TEXT, created_at INTEGER, extra_json TEXT, extra_bin BLOB);
+        INSERT INTO agents VALUES(1,'codex');
+    """)
+    for i in range(1, n + 1):
+        db.execute("INSERT INTO conversations(id,agent_id,title,source_path,started_at,"
+                   "last_message_created_at,external_id,source_id) VALUES(?,?,?,?,?,?,?,?)",
+                   (i, 1, f"t{i}", "/p", 1735660800000 + i, 1735660800000 + i, f"ext-{i}", "local"))
+        db.execute("INSERT INTO messages(conversation_id,idx,role,content,created_at) VALUES(?,?,?,?,?)",
+                   (i, 0, "user", "x" * 50, 1735660800000 + i))
+    db.commit(); db.close()
+
+
+def test_parse_frontmatter_identity_ok():
+    s = "---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    ident, dup, status = _export._parse_frontmatter_identity(s)
+    assert status == "OK" and dup == set()
+    assert ident == ("ext-a", "local", "codex")
+
+
+def test_parse_frontmatter_identity_unclosed():
+    ident, dup, status = _export._parse_frontmatter_identity("---\nexternal_id: ext-a\nno closing fence\n")
+    assert status == "UNCLOSED"
+
+
+def test_parse_frontmatter_identity_duplicate_key():
+    s = "---\nexternal_id: ext-a\nexternal_id: evil\nsource_id: local\nagent: codex\n---\n"
+    ident, dup, status = _export._parse_frontmatter_identity(s)
+    assert status == "OK" and "external_id" in dup
+
+
+def test_identity_of_file_long_title_not_frozen(tmp_path):
+    """cap 充分性守卫（非 base-regression）：身份字段在顶部、title 排其后，故 base(4096) 也读得到真身份。
+    本测试防将来有人把 _read_frontmatter_head 的 cap 改回 4096——那样 8000 字 title 会把闭合 --- 推到
+    cap 之外，parse 得 UNCLOSED → _identity_of_file 返 FOREIGN → 二次导出永久冻结（codex R1 P1-1）。"""
+    p = tmp_path / "long.md"
+    body = ("---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n"
+            "title: " + ("x" * 8000) + "\n---\n正文\n")
+    p.write_text(body, encoding="utf-8")
+    assert _export._identity_of_file(str(p)) == ("ext-a", "local", "codex")
+
+
+def test_identity_of_file_duplicate_identity_is_foreign(tmp_path):
+    """磁盘已有文件含重复身份 key（被注入污染）→ _identity_of_file 判 FOREIGN，
+    guard 绝不信任它的 last-wins 身份（codex R1 P1-2）。"""
+    p = tmp_path / "dup.md"
+    p.write_text("---\nexternal_id: victim\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\n",
+                 encoding="utf-8")
+    assert _export._identity_of_file(str(p)) == "FOREIGN"
+
+
+def test_identity_of_file_huge_unclosed_is_foreign(tmp_path):
+    """超长单行 + 无闭合 fence（malformed/攻击文件）→ 有界 read(cap) 只读 ≤cap 字符、判 FOREIGN，
+    不把整个巨行读进内存（codex R2 must-fix：`for line in f` 会）。"""
+    p = tmp_path / "huge.md"
+    p.write_text("---\n" + "x" * 300000, encoding="utf-8")     # 无闭合 ---，单行 >cap
+    assert _export._identity_of_file(str(p)) == "FOREIGN"
+
+
+def test_read_frontmatter_head_uses_bounded_read_not_iteration(monkeypatch):
+    """杀"退回 for line in f"变异（codex 实现审 R2 P2#3）：huge-unclosed 断言只看结果=FOREIGN，
+    退回逐行迭代仍会绿（只是多读内存）。这里用只支持 read(n)、__iter__ 会 assert 失败的假 file
+    钉住"必须走 bounded read(cap)、绝不迭代"，不依赖 128MB 真文件。"""
+    import builtins
+
+    class BoundedOnly:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n=-1):
+            assert n == 262144, f"必须 bounded read(cap)，实际 n={n}"
+            return "---\n" + ("x" * (n - 4))
+
+        def __iter__(self):
+            raise AssertionError("必须 bounded read(cap)，不得 `for line in f` 迭代")
+
+    monkeypatch.setattr(builtins, "open", lambda *a, **k: BoundedOnly())
+    assert len(_export._read_frontmatter_head("ignored.md")) == 262144
+    assert _export._identity_of_file("ignored.md") == "FOREIGN"
+
+
+def test_clean_neutralizes_all_splitlines_separators():
+    """_clean 必须清 str.splitlines() 认作行边界的每一个分隔符（codex 实现审 R2 P2#2）：
+    只清 \\n\\r 时 U+2028 等能绕过净化、在 parser 的 splitlines() 下拆出伪 frontmatter 行。"""
+    for sep in ["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]:
+        cleaned = render._clean(f"/p{sep}external_id: evil")
+        assert len(cleaned.splitlines()) == 1, f"分隔符 {sep!r} 未被净化，仍会拆行"
+
+
+def test_validate_text_identity_whitespace_canonical():
+    """身份值前后空格：parser 的 .strip() 与 _identity_of_meta 的 strip 对称 → 不误 fail-loud（codex R2 P2#3）。"""
+    meta = {"external_id": " ext-a ", "source_id": "local", "agent": "codex"}
+    text = "---\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is True
+
+
+def test_validate_text_identity_match(tmp_path):
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is True
+
+
+def test_validate_text_identity_mismatch_redacted():
+    # 模拟 redact 把 external_id 改成 REDACTED
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nexternal_id: [REDACTED_SECRET]\nsource_id: local\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is False
+
+
+def test_validate_text_identity_duplicate_injected():
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nexternal_id: ext-a\nsource_id: local\nagent: codex\nexternal_id: evil\n---\n"
+    assert _export._validate_text_identity(text, meta) is False
+
+
+def test_validate_text_identity_legacy_schema():
+    # legacy meta 无 external_id/source_id → 身份 (None, None, agent)，text 也不写这两行
+    meta = {"agent": "codex"}
+    text = "---\nsource: cass\nsession_key: sabc\nagent: codex\n---\nbody\n"
+    assert _export._validate_text_identity(text, meta) is True
+
+
+def test_validate_text_identity_malformed_no_frontmatter():
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    assert _export._validate_text_identity("just text\nexternal_id: ext-a\n", meta) is False
+
+
+# ── Task 3: os.link 原子占位熔合 + guard lexists + tmp uuid ──
+
+def test_write_transcript_refuses_identity_mismatch(tmp_path):
+    """写入层自校验：待写 text 身份 ≠ meta 身份 → raise 且不落盘（抓"摘掉写前自校验"变异）。
+    直接测 _write_transcript（谓词级测试挡不住这个变异——它们不经过写路径）。"""
+    p = str(tmp_path / "x.md")
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    bad = "---\nexternal_id: [REDACTED_SECRET]\nsource_id: local\nagent: codex\n---\nbody\n"
+    with pytest.raises(_export.TranscriptIdentityError):
+        _export._write_transcript(p, bad, meta)
+    assert not os.path.exists(p)                                # 绝不落盘
+
+
+def test_reexport_same_session_updates_content(tmp_path, monkeypatch):
+    """同身份再导走 EEXIST → os.replace，且**内容真更新**（不只 written/errors 绿 —— codex R1 P2-1：
+    内容不变也会绿是弱断言）。第二次前改 DB 消息内容，断言磁盘文件内容随之变化。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    out = str(tmp_path / "out")
+    assert len(_export.export_one(dbp, out, 1, min_chars=1)["written"]) == 1
+    fn = os.path.join(out, os.listdir(out)[0]); before = open(fn).read()
+    db = sqlite3.connect(dbp)                                    # 改 conv1 的消息内容
+    db.execute("UPDATE messages SET content='UPDATED_BODY_ZZZ' WHERE conversation_id=1"); db.commit(); db.close()
+    rep = _export.export_one(dbp, out, 1, min_chars=1)           # EEXIST → 同身份 → os.replace
+    assert len(rep["written"]) == 1 and rep["errors"] == []
+    after = open(fn).read()
+    assert "UPDATED_BODY_ZZZ" in after and after != before       # 内容确实被更新
+
+
+def test_reexport_long_title_not_frozen(tmp_path, monkeypatch):
+    """长 title（闭合 --- 超 4096）的会话二次导出不被冻结（codex R1 P1-1 端到端）。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    db = sqlite3.connect(dbp)
+    db.execute("UPDATE conversations SET title=? WHERE id=1", ("x" * 8000,)); db.commit(); db.close()
+    out = str(tmp_path / "out")
+    assert len(_export.export_one(dbp, out, 1, min_chars=1)["written"]) == 1
+    rep = _export.export_one(dbp, out, 1, min_chars=1)           # 不得因长 title 判 FOREIGN 而 拒绝覆盖
+    assert len(rep["written"]) == 1 and rep["errors"] == []
+
+
+def test_write_transcript_link_oserror_cleans_tmp(tmp_path, monkeypatch):
+    """os.link 抛非-EEXIST OSError（如跨 fs EXDEV）→ 传播（上层进 errors），且 finally 清 tmp（codex R1 P2-2）。"""
+    import errno as _errno
+    p = str(tmp_path / "x.md")
+    meta = {"external_id": "ext-a", "source_id": "local", "agent": "codex"}
+    text = "---\nsource: cass\nexternal_id: ext-a\nsource_id: local\nagent: codex\n---\nbody\n"
+    monkeypatch.setattr(_export.os, "link",
+                        lambda s, d: (_ for _ in ()).throw(OSError(_errno.EXDEV, "cross-device")))
+    with pytest.raises(OSError):
+        _export._write_transcript(p, text, meta)
+    leftovers = [f for f in os.listdir(tmp_path) if ".tmp." in f]
+    assert leftovers == [] and not os.path.exists(p)            # tmp 已清、path 未建
+
+
+def test_guard_refuses_symlink(tmp_path):
+    target = tmp_path / "real.md"; target.write_text("x", encoding="utf-8")
+    link = tmp_path / "link.md"; link.symlink_to(target)
+    with pytest.raises(_export.TranscriptIdentityError):
+        _export._guard_write_target(str(link), {"external_id": "e", "source_id": "local", "agent": "codex"})
+    dangling = tmp_path / "dangling.md"; dangling.symlink_to(tmp_path / "nope.md")
+    with pytest.raises(_export.TranscriptIdentityError):
+        _export._guard_write_target(str(dangling), {"external_id": "e", "source_id": "local", "agent": "codex"})
+
+
+def test_concurrent_collision_exactly_one_survives(tmp_path, monkeypatch):
+    """K 个不同身份会话被 monkeypatch 成同文件名（真碰撞代理）→ 恰一个存活、K-1 报 拒绝覆盖、无静默覆盖。
+    对齐到 os.link 并断言其被命中：'退回旧两步' mutant 不调 os.link → 命中数 0 → 本测必红（防假绿）。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    K = 8
+    dbp = str(tmp_path / "c.db"); _mk_db_n_convs(dbp, K)
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(render, "transcript_filename", lambda meta: "collide.md")
+
+    real_link = os.link
+    hits = {"n": 0}
+    lock = threading.Lock()
+    barrier = threading.Barrier(K, timeout=30)
+
+    def counting_link(src, dst):
+        with lock:
+            hits["n"] += 1
+        barrier.wait()                      # 全部 K 线程对齐到 link 点，最大化重叠
+        return real_link(src, dst)
+    monkeypatch.setattr(_export.os, "link", counting_link)
+
+    reps = [None] * K
+
+    def worker(i):
+        reps[i] = _export.export_one(dbp, out, i + 1, min_chars=1)
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(K)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    written = sum(len(r["written"]) for r in reps)
+    errored = [e for r in reps for e in r["errors"]]
+    assert written == 1, f"应恰好一个存活，实际 {written}"
+    assert len(errored) == K - 1 and all("拒绝覆盖" in e[1] for e in errored)
+    assert hits["n"] >= K, "os.link 未被命中：熔合被绕过（防假绿断言）"
+    survivors = os.listdir(out)
+    assert survivors == ["collide.md"]
+    body = open(os.path.join(out, "collide.md")).read()
+    assert sum(1 for ln in body.splitlines() if ln.startswith("external_id:")) == 1   # 身份自洽、无叠写
+
+
+# ── Task 5: render frontmatter 净化换行防注入 ──
+
+def _mk_db_injection(path):
+    """含恶意注入字段的数据库 fixture：workspace 含 \\n 和独占 ---。"""
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+        CREATE TABLE conversations(id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+            workspace_id INTEGER, source_path TEXT, started_at INTEGER,
+            last_message_created_at INTEGER, primary_model TEXT, external_id TEXT, source_id TEXT);
+        CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+            role TEXT, content TEXT, created_at INTEGER, extra_json TEXT, extra_bin BLOB);
+        INSERT INTO agents VALUES(1,'codex');
+        INSERT INTO workspaces VALUES(1,'/proj' || char(10) || '---' || char(10) || 'external_id: evil');
+        INSERT INTO conversations(id,agent_id,title,workspace_id,source_path,started_at,
+            last_message_created_at,external_id,source_id)
+          VALUES(1,1,'a',1,'/p',1735660800000,1735660800000,'ext-real','local');
+        INSERT INTO messages(conversation_id,idx,role,content,created_at)
+          VALUES(1,0,'user','xxxxxxxxxx',1735660800000);
+    """)
+    db.commit(); db.close()
+
+
+def test_frontmatter_injection_via_workspace_blocked(tmp_path, monkeypatch):
+    """workspace 含换行 + 独占 `---`（提前闭合向量，spec §2.3）→ 净化后不拆行、不加 fence（codex R1 P1-3）。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_injection(dbp)   # workspace = "/proj\n---\nexternal_id: evil"
+    out = str(tmp_path / "out")
+    rep = _export.export_one(dbp, out, 1, min_chars=1)
+    assert len(rep["written"]) == 1 and rep["errors"] == []          # 净化后正常写入
+    body = open(os.path.join(out, os.listdir(out)[0])).read()
+    fm = body.split("\n---\n", 1)[0]
+    ext_lines = [ln for ln in fm.splitlines() if ln.startswith("external_id:")]
+    assert ext_lines == ["external_id: ext-real"]                    # 恰一个真身份行
+    assert body.splitlines().count("---") == 2                       # 注入的 --- 未成第三条 fence
+
+
+def test_frontmatter_injection_via_title_cr_blocked(tmp_path, monkeypatch):
+    """title 含 CR（\\r）：splitlines() 会按 \\r 拆行，未清 \\r 则注入伪 external_id 行（codex R1 P1-4）。"""
+    monkeypatch.delenv("CASS_CORPUS_ALLOW_MIXED", raising=False)
+    dbp = str(tmp_path / "c.db"); _mk_db_two_convs(dbp)
+    db = sqlite3.connect(dbp)
+    db.execute("UPDATE conversations SET title=? WHERE id=1", ("ok\rexternal_id: evil",)); db.commit(); db.close()
+    out = str(tmp_path / "out")
+    rep = _export.export_one(dbp, out, 1, min_chars=1)
+    assert len(rep["written"]) == 1 and rep["errors"] == []
+    body = open(os.path.join(out, os.listdir(out)[0])).read()
+    ext_lines = [ln for ln in body.split("\n---\n", 1)[0].splitlines() if ln.startswith("external_id:")]
+    assert ext_lines == ["external_id: ext-a"]                       # CR 被净化，无伪注入行

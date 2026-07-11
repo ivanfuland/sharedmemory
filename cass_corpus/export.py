@@ -3,9 +3,11 @@
 # 用法:uv run python -m cass_corpus.export [out_dir] [limit]
 import os
 import re
+import stat
 import sys
+import uuid
 from cass_corpus import reader, render
-from cass_corpus.redact import redact_secrets
+from cass_corpus.redact import redact_secrets, redact_transcript
 from cass_corpus import state as _state
 from cass_corpus.pruner import DeterministicPruner
 
@@ -33,38 +35,76 @@ class TranscriptIdentityError(RuntimeError):
     pass
 
 
-def _identity_of_meta(meta):
-    return tuple(meta.get(k) for k in _IDENTITY_KEYS)
-
-
-def _identity_of_file(path):
-    """读已有 transcript 的 frontmatter 身份。无 frontmatter(外来文件)→ 'FOREIGN'(拒写)。"""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        head = f.read(4096)
-    lines = head.splitlines()
+def _parse_frontmatter_identity(s):
+    """解析一段文本的 frontmatter 身份。返回 (identity_tuple, dup_keys, status)。
+    status: OK(有闭合 ---) / NO_FRONTMATTER(首行非 ---) / UNCLOSED(有起始无闭合)。
+    dup_keys: frontmatter 内出现 >1 次的 key（防 §2.3 注入覆盖真身份行）。"""
+    lines = s.splitlines()
     if not lines or lines[0].strip() != "---":
-        return "FOREIGN"
-    fm = {}
+        return (("FOREIGN",), set(), "NO_FRONTMATTER")
+    fm, counts, closed = {}, {}, False
     for line in lines[1:]:
         if line.strip() == "---":
+            closed = True
             break
         m = _FM_LINE.match(line)
         if m:
-            fm[m.group(1)] = m.group(2).strip()
-    return tuple(fm.get(k) for k in _IDENTITY_KEYS)
+            k = m.group(1)
+            counts[k] = counts.get(k, 0) + 1
+            fm[k] = m.group(2).strip()
+    dup = {k for k, c in counts.items() if c > 1}
+    identity = tuple(fm.get(k) for k in _IDENTITY_KEYS)
+    return (identity, dup, "OK" if closed else "UNCLOSED")
+
+
+def _read_frontmatter_head(path, cap=262144):
+    """有界读取：最多 cap 个字符（真实 frontmatter 身份行在顶部、title 是短会话标题，绰绰有余）。
+    用单次 bounded read 而非 `for line in f`——后者遇无换行的超长单行会把整行读进内存（128MB body
+    没有闭合 fence 时实测 head 达 134MB，cap 形同虚设，codex R2）。text-mode read(cap) 读 ≤cap 字符，
+    内存有界；闭合 --- 若在 cap 之外 → 视为 UNCLOSED → FOREIGN（真实文件的 fence 永远在前，安全欠标）。"""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(cap)
+
+
+def _identity_of_meta(meta):
+    """会话身份原像 (external_id, source_id, agent)。strip 字符串值 → 与 parser 的 group(2).strip()
+    对称（消除 raw-meta vs parsed-file 的前后空格不对称，codex R2 P2#3；无空格 fixture 为 no-op）。"""
+    return tuple((v.strip() if isinstance(v, str) else v)
+                 for v in (meta.get(k) for k in _IDENTITY_KEYS))
+
+
+def _identity_of_file(path):
+    """读已有 transcript 的 frontmatter 身份。无/未闭合 frontmatter、或含重复身份 key → 'FOREIGN'（拒写）。"""
+    identity, dup, status = _parse_frontmatter_identity(_read_frontmatter_head(path))
+    if status != "OK" or (dup & set(_IDENTITY_KEYS)):   # 重复身份 key 也不可信（codex R1 P1-2）
+        return "FOREIGN"
+    return identity
+
+
+def _validate_text_identity(text, meta):
+    """写盘前自校验：待写 text 的 frontmatter 身份必须 == meta 身份，且无重复身份 key、
+    frontmatter 闭合良好。以 meta 为基准 → legacy(无 ext/source) 与新 schema 都天然涵盖。"""
+    identity, dup, status = _parse_frontmatter_identity(text)
+    if status != "OK":
+        return False
+    if dup & set(_IDENTITY_KEYS):
+        return False
+    return identity == _identity_of_meta(meta)
 
 
 def _guard_write_target(path, meta):
-    """持久 fail-loud:目标已存在且身份不同 → 绝不覆盖。
-    覆盖只允许发生在"同一逻辑会话的内容更新"上。
-    老/合成 schema 无 external_id → 两侧身份同为 (None, None, agent),放行
-    (那种库本就没有稳定身份;不同会话的 rowid 派生 key 不同名,不会走到这里)。"""
-    if not os.path.exists(path):
+    """持久 fail-loud：目标已存在且（身份不同 或 非普通文件）→ 绝不覆盖。
+    lexists+lstat：symlink/dangling symlink/特殊文件一律按 FOREIGN 拒写（codex R1 P2-2）。"""
+    if not os.path.lexists(path):
         return
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise TranscriptIdentityError(
+            f"拒绝覆盖 {os.path.basename(path)}：目标不是普通文件（symlink/特殊文件）。")
     prev, cur = _identity_of_file(path), _identity_of_meta(meta)
     if prev != cur:
         raise TranscriptIdentityError(
-            f"拒绝覆盖 {os.path.basename(path)}:已有文件身份 {prev},待写身份 {cur}。"
+            f"拒绝覆盖 {os.path.basename(path)}：已有文件身份 {prev}，待写身份 {cur}。"
             f"同名不同会话 = session_key 碰撞或外来文件 —— 绝不静默覆盖。"
             f"若为真碰撞,增大 render._KEY_BYTES 并重刷。")
 
@@ -84,9 +124,8 @@ def _assert_no_legacy_names(out_dir):
 
 
 def _atomic_write(path, text):
-    """原子写:先写同目录 tmp 再 os.replace 顶替。reader(gbrain autopilot)永远看完整文件,
-    不会撞写了一半的残包。失败清理 tmp。"""
-    tmp = f"{path}.tmp.{os.getpid()}"
+    """原子写：先写同目录 tmp 再 os.replace 顶替。tmp 名加 uuid → 同进程多线程也唯一。"""
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
@@ -97,6 +136,32 @@ def _atomic_write(path, text):
         except OSError:
             pass
         raise
+
+
+def _write_transcript(path, text, meta):
+    """熔合的原子占位写（替代 _guard_write_target + _atomic_write 两步）。
+    ① 写盘前自校验待写内容身份（P0）；② os.link 原子创建，EEXIST → 比原像 → replace(同)/raise(异)。
+    危险分支（不同身份新文件竞争创建）由 os.link 原子性保证恰一个成功，窗口消失。"""
+    if not _validate_text_identity(text, meta):
+        raise TranscriptIdentityError(
+            f"拒绝覆盖/写入 {os.path.basename(path)}：待写内容 frontmatter 身份 ≠ 会话身份，"
+            f"或 frontmatter 非法（malformed/重复身份 key）—— 绝不落盘被污染的 transcript。")
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            os.link(tmp, path)              # 原子创建：仅 path 不存在才成功
+            return "created"
+        except FileExistsError:
+            _guard_write_target(path, meta)  # 既有文件身份校验（lexists）：异 → raise
+            os.replace(tmp, path)            # 同身份 = 合法更新，原子覆盖
+            return "updated"
+    finally:
+        try:
+            os.unlink(tmp)                   # created 后 tmp 仍在 → 清；replace 后已消失 → 忽略
+        except OSError:
+            pass                             # 宽捕获：清理失败绝不遮蔽主异常
 
 
 def export(db_path, out_dir, limit=20, agents=None,
@@ -112,14 +177,13 @@ def export(db_path, out_dir, limit=20, agents=None,
         try:                                            # per-conversation 隔离:单会话失败不中断整批
             msgs = reader.read_messages(db_path, meta["id"])
             text = render.render(meta, pruner.prune(msgs))
-            text = redact_secrets(text)                 # ① 脱敏（在 min_chars 门之前）
+            text = redact_transcript(text)                 # ① 脱敏（在 min_chars 门之前）
             if len(text) < min_chars:                   # gbrain minChars 默认 2000 会丢,先本地跳过
                 skipped.append((meta["id"], len(text)))
             else:
                 fn = render.transcript_filename(meta)
                 path = os.path.join(out_dir, fn)
-                _guard_write_target(path, meta)      # 持久:跨批、跨 retry 都拦得住
-                _atomic_write(path, text)
+                _write_transcript(path, text, meta)
                 written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
         except Exception as e:
             errors.append((meta.get("id"), repr(e)[:200]))
@@ -150,14 +214,13 @@ def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
         exported_ts = reader.max_message_ts(db_path, meta["id"])
         msgs = reader.read_messages(db_path, meta["id"])
         text = render.render(meta, pruner.prune(msgs))
-        text = redact_secrets(text)                     # ① 脱敏（在 min_chars 门之前）
+        text = redact_transcript(text)                     # ① 脱敏（在 min_chars 门之前）
         if len(text) < min_chars:
             skipped.append((meta["id"], len(text)))
         else:
             fn = render.transcript_filename(meta)
             path = os.path.join(out_dir, fn)
-            _guard_write_target(path, meta)          # F3 逐条驱动也必须拦(codex R2 P1)
-            _atomic_write(path, text)
+            _write_transcript(path, text, meta)
             written.append((fn, len(text), redact_secrets(meta.get("title") or "")))
     except Exception as e:
         errors.append((meta.get("id"), repr(e)[:200]))

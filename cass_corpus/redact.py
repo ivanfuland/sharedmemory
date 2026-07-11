@@ -45,3 +45,30 @@ def redact_secrets(text: str) -> str:
     for pat in _SECRET_PATTERNS:
         text = pat.sub(_REDACTED, text)
     return text
+
+
+_IDENTITY_PROTECT = {"external_id", "source_id", "session_key", "agent", "source", "date"}
+# 依赖 render._frontmatter 的输出格式 `key: value`（冒号后恒有空格）；若 render 改成
+# `key:value` 无空格，这里会静默漏保护身份行 —— 改 render 格式时必须同步这条正则。
+_FM_KEY = re.compile(r"^([A-Za-z_]+):\s")
+
+
+def redact_transcript(text: str) -> str:
+    """脱敏 transcript：保护 frontmatter 身份行不被改写（否则守卫误 raise / backfill orphan）。
+    - 无 frontmatter → 全文 redact_secrets。
+    - 未闭合 frontmatter → 原样返回（交 _validate_text_identity 兜底拒写，不落盘）。
+    - 正常：身份行逐字保留；title/workspace + 正文照常脱敏。"""
+    if not text.startswith("---\n"):
+        return redact_secrets(text)
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return text                                  # 未闭合 → 不动身份区
+    fm, rest = text[:end], text[end:]                # rest 以闭合 \n---\n 起（含正文）
+    out = []
+    for line in fm.split("\n"):
+        m = _FM_KEY.match(line)
+        if m and m.group(1) in _IDENTITY_PROTECT:
+            out.append(line)                         # 身份行逐字
+        else:
+            out.append(redact_secrets(line))
+    return "\n".join(out) + redact_secrets(rest)
