@@ -45,9 +45,18 @@ class DeterministicPruner:
     RESCUE_FRAC    = 4
     MARKER_RESERVE = 48     # 给指针/标记/join 换行预留额度,保证总输出 ≤ cap(codex PR R1 P2)
 
-    def __init__(self, *, tool_call_cap=800, tool_result_cap=1500, reasoning_cap=1000,
+    def __init__(self, *, tool_call_cap=1200, tool_result_cap=2500, reasoning_cap=1000,
                  max_err_lines=10, warn=None):
-        # cap 是 provisional 默认(spec §7.1/§U1:真值待 franken 产真 role 后按分布量定)
+        # cap 已按生产库真实分布量定(PR-C,2026-07-11;spec §U1 收口)。只读量 73k tool 消息:
+        #   tool_call  p50=217 p90=1053 → cap=1200(截断 8.5%,喂 25MB/完整 38MB);
+        #   tool_result p50=689 p90=9698 极重尾 → cap=2500(截断 31.5%,喂 81MB/完整 232MB);
+        #     _clamp 有损但保 head+tail+抢救硬错误行(verdict/报错常在 tail);实测 ~2.6% 会丢末行。
+        #   reasoning_cap 保留 1000(实际 moot):claude reasoning content 空(2万条)、codex reasoning
+        #     主体是 extra_bin 里的 Fernet 加密(gAAAAA... 客户端解不了),reader 只喂 content 列;
+        #     仅 202 条 codex reasoning 有明文 content 且全 ≤602 字符 → 永不触 cap。openclaw 无 reasoning role。
+        #     待将来出现长明文 reasoning(如 openclaw thinking 入库)再按分布量定。
+        # ⚠ 本次分布只量当前 reader 的 content 文本视图;extra_bin 另有结构化/多模态 payload
+        #   (image_url / toolUseResult / thinkingSignature)reader 未组装 → 若将来 reader 改组装,须重测。
         self.tool_call_cap   = tool_call_cap
         self.tool_result_cap = tool_result_cap
         self.reasoning_cap   = reasoning_cap
