@@ -69,6 +69,8 @@ def _frontmatter(meta):
     #   gbrain 仍把同一会话当新内容全量重炼。文件名稳定但正文漂移 = 修了一半等于没修
     #   (codex PR#41 审出的 P1:实测同一会话 rowid 72→116,文件名不变但渲染 hash 变)。
     #   要对当前库调试,用 external_id 反查:SELECT id FROM conversations WHERE external_id=?
+    # agent 是 CASS DB 的 slug（安全派生值），不经 _clean；万一含换行也会被
+    # export._validate_text_identity 的 dup/身份不符检查 fail-loud 拦下，不会静默污染。
     lines = ["---", "source: cass", f"session_key: {session_key(meta)}",
              f"agent: {meta.get('agent', '')}", f"date: {_date(meta.get('started_at'))}"]
     if meta.get("external_id"):

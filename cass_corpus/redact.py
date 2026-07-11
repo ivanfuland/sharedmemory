@@ -48,6 +48,8 @@ def redact_secrets(text: str) -> str:
 
 
 _IDENTITY_PROTECT = {"external_id", "source_id", "session_key", "agent", "source", "date"}
+# 依赖 render._frontmatter 的输出格式 `key: value`（冒号后恒有空格）；若 render 改成
+# `key:value` 无空格，这里会静默漏保护身份行 —— 改 render 格式时必须同步这条正则。
 _FM_KEY = re.compile(r"^([A-Za-z_]+):\s")
 
 
