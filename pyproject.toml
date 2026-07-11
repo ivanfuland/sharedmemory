@@ -16,7 +16,15 @@ build-backend = "hatchling.build"
 packages = ["distill", "cass_mcp"]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = [
+    "blake3>=1.0.9",
+    "pytest>=8.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: long-running acceptance tests (real doctor / full NAS readback)",
+    "realcass: requires the real cass binary on PATH",
+    "nas: writes to a real NAS scratch dir (CASS_ACCEPT_NAS=1)",
+]
