@@ -89,8 +89,13 @@ def fixtures_dir() -> pathlib.Path:
 
 @pytest.fixture(scope="session")
 def corrupt_bak_path() -> pathlib.Path:
-    """生产环境真实留存的损坏库备份（`chattr +i` 只读，`Rowid 905 out of order`
-    的对照物，V3）。文件缺失时只 skip 消费它的测试，不牵连整组。"""
+    """生产环境真实留存的损坏库备份（`Rowid 905 out of order` 的对照物，V3）。
+
+    **只读保护是代码级的，无 OS 级后备**（实测 `lsattr` 无 `i` 标志、权限 664）：
+    本套件消费它的唯一路径是 `cass_backup_gate.py`，其打开方式是
+    `file:...?immutable=1` URI（全路径只读，已核该 CLI 无任何写 db 的代码路径）。
+    若要 OS 级双保险，部署时人工 `sudo chattr +i <该文件>`（本测试套件不代做——
+    需要 root）。文件缺失时只 skip 消费它的测试，不牵连整组。"""
     p = pathlib.Path(os.environ.get(_CORRUPT_BAK_ENV, str(_DEFAULT_CORRUPT_BAK)))
     if not p.is_file():
         pytest.skip(f"{_CORRUPT_BAK_ENV} 指向的文件不存在（{p}）")

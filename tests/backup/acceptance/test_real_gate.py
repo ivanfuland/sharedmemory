@@ -25,6 +25,11 @@ PASS。本文件在**真实生产库**（`probe-snapshot.db` 已知天生签名B
 （腿4 从未 PASS 过），「腿1 是否 PASS」取决于攻击构造方式与目标库的既有 b-tree
 状态，不是这条攻击的固有性质。本文件如实断言真实观测（不强造字面 spec），并在此
 记录供人工 / codex 复核是否需要更新 spec 原文或 V4 攻击构造本身。
+
+**关于 V1 的经验性发现（OPEN-DECISION #2，与 V4 同类 spec 措辞 erratum）**：spec
+§9.1 V1 行的「整体 PASS」对五腿门定义下的 fresh-fts.db 结构性不可满足（该对照物
+不含任何 CASS 表，腿 0/3/4 必然 FAIL）——V1 的承重语义只剩「腿 1 命中签名 A」。
+详见 V1 测试的区块注释；同样交人工决策是否修 spec 原文。
 """
 from __future__ import annotations
 
@@ -40,7 +45,7 @@ import time
 import pytest
 
 import fixture_factory
-from cass_backup_gate import classify_integrity, leg0, run_integrity_check
+from cass_backup_gate import classify_integrity, run_integrity_check
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent.parent
 VENV_PY = REPO / ".venv" / "bin" / "python"
@@ -97,29 +102,44 @@ def _seed_baseline(db_path: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
 
 
 # ---------------------------------------------------------------------------
-# V1 — 干净新建库（含 FTS5 vtab）：腿1 命中签名A；腿0 因空表 FAIL（防呆机制的
-# 正确行为，不强造整门 PASS——task-18 brief 明确授权拆成两半断言）。
+# V1 — 干净新建库（含 FTS5 vtab）—— **OPEN-DECISION #2（spec 措辞 erratum，
+# 与 V4 同类，交人工决策）**：spec §9.1 V1 行写「腿 1 命中签名 A；整体 PASS」，
+# 但「整体 PASS」对五腿门定义下的 fresh-fts.db **结构性不可满足**——该对照物是
+# 干净新建的 FTS5 库，不含任何 CASS 表（messages/conversations/meta/... 全缺），
+# 真 CLI 实跑（reviewer 复核 + 本测试断言）腿 0（防呆 COUNT）、腿 3（必需对象
+# 清单）、腿 4（必需水位键，经 _safe 网受控降级）三条腿全部 FAIL、exit 1。
+# V1 的承重语义 = 腿 1 对「干净库」的签名 A 判定正确（fail-closed 分类器的
+# 阳性对照）；下面如实断言真 CLI 的全部五腿 verdict，不强造整门 PASS。
 # ---------------------------------------------------------------------------
 
 
-def test_v1_fresh_fts_signature_a_and_leg0_correctly_rejects_empty_db(fixtures_dir):
+def test_v1_fresh_fts_signature_a_via_real_cli_with_structural_leg_failures(fixtures_dir, tmp_path):
     db_path = fixtures_dir / "fresh-fts.db"
     assert db_path.is_file(), f"缺 fresh-fts.db：{db_path}"
 
+    # V1 的承重半句：腿 1 分类器对干净新建库（含 FTS5 vtab）给出签名 A。
     stdout, stderr, exit_code = run_integrity_check(db_path)
     assert classify_integrity(stdout, stderr, exit_code) == "A"
 
-    con = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
-    try:
-        result = leg0(con)
-    finally:
-        con.close()
-    # fresh-fts.db 是真正的空库（连 messages/conversations 表本身都不存在，不只是
-    # 空表）——腿0 的防呆 COUNT 受控 FAIL（不是裸 crash），这正是「count==0 即通过
-    # 这一整类假绿」的反面：一个全新初始化但从未摄入过内容的库不该被当成健康备份
-    # 对照物看待。
-    assert result.ok is False
-    assert "no such table" in result.detail
+    # 真 subprocess 跑完整 CLI（与本文件其余测试同一跑法）：如实断言全部五腿。
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    census = tmp_path / "census.tsv"
+    gate_json = tmp_path / "gate.json"
+    rc, out, err = _run_gate_cli(db_path, dest, census, gate_json, timeout=30)
+
+    assert rc == 1, f"空库（无 CASS 表）应整体 FAIL：\nSTDOUT={out}\nSTDERR={err}"
+    verdicts = _leg_verdicts(out)
+    assert verdicts[1] == "PASS", "V1 承重半句：腿 1 签名 A ⇒ PASS"
+    assert "integrity_check signature=A" in out
+    # 结构性 FAIL 三腿（见区块注释 / OPEN-DECISION #2）：
+    assert verdicts[0] == "FAIL"  # 防呆 COUNT：no such table: messages
+    assert verdicts[3] == "FAIL"  # 必需对象清单：CASS 表全缺
+    assert verdicts[4] == "FAIL"  # 必需水位键：meta 表不存在（_safe 网受控降级）
+    leg0_line = next(line for line in out.splitlines() if line.startswith("[leg 0]"))
+    assert "no such table" in leg0_line
+    # 腿 2 对仅有的 FTS shadow rowid 表照常通过（无分歧）——顺带如实记录。
+    assert verdicts[2] == "PASS"
 
 
 # ---------------------------------------------------------------------------

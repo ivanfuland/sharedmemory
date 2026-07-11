@@ -88,7 +88,9 @@ def _census_cli(manifests_dir, doctor_json, blobs_root, timeout=120) -> tuple[in
 @pytest.fixture(scope="module")
 def isolated_prod_copy(tmp_path_factory):
     """`cp` 生产 `db` + `raw-mirror/`（只读源，不碰生产其它内容）进隔离副本，
-    module 级只建一份——三段验证在同一份副本上恢复式进行。"""
+    module 级只建一份——三段验证在同一份副本上恢复式进行。副本 ~4.5GB，测后
+    finalizer 立即删除（磁盘余量保护，与本套件其余大文件的 try/finally 约定一致——
+    不等 pytest 的 tmp_path 保留策略慢慢轮换）。"""
     if shutil.which("cass") is None:
         pytest.skip("需要真 cass 二进制")
     if not PROD_DB.is_file():
@@ -99,7 +101,10 @@ def isolated_prod_copy(tmp_path_factory):
     dd = tmp_path_factory.mktemp("real-doctor-isolated-dd")
     subprocess.run(["cp", str(PROD_DB), str(dd / "agent_search.db")], check=True, timeout=300)
     subprocess.run(["cp", "-a", str(PROD_RAW_MIRROR), str(dd / "raw-mirror")], check=True, timeout=300)
-    return dd
+    try:
+        yield dd
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
 
 
 def test_v5g_healthy_then_missing_blob_then_corrupted_blob_recovery_style(isolated_prod_copy, tmp_path):
