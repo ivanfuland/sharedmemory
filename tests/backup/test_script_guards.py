@@ -518,6 +518,63 @@ def test_five_leg_gate_failure_lands_suspect_with_forensics(
 
 
 @requires_cass
+def test_poisoned_baseline_fails_whole_backup_run_lands_suspect(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """codex R2-P0 e2e：毒化已发布基线的 `census.tsv`（挖掉一行，不需要额外攻击
+    当前 db——毒基线本身就该拦）后跑一轮完整 `backup-cass.sh`——五腿门在 step 9
+    必须 FAIL（`_validate_baseline`），走同一条 SUSPECT 取证路径，exit 非零、不
+    发布任何新 `cass-*/`（gate FAIL 发生在 step 10+ 之前，走不到 sessions 通道，
+    不需要 ADOPT env）。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    db = synth_dd / "agent_search.db"
+    census1 = tmp_path / "census1.tsv"
+    gate1 = tmp_path / "gate1.json"
+    rc0 = cass_backup_gate.main(
+        [
+            "--db", str(db),
+            "--dest", str(dest),
+            "--out-census", str(census1),
+            "--out-gate-json", str(gate1),
+        ]
+    )
+    assert rc0 == 0, "基线本身不应 FAIL"
+    _publish_baseline(dest, "cass-baseline", json.loads(gate1.read_bytes()), census1, generation=1)
+
+    census_path = dest / "cass-baseline" / "census.tsv"
+    lines = census_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    tampered = [line for line in lines if not line.startswith("agents\t")]
+    assert len(tampered) < len(lines), "夹具自检：census.tsv 应含 agents 行"
+    census_path.write_text("".join(tampered), encoding="utf-8")
+
+    _write_verified_doctor_stub(tmp_home, synth_dd / "raw-mirror" / "v1" / "manifests")
+
+    rc, out, _dest = run_backup(
+        env={
+            "CASS_DATA_DIR": str(synth_dd),
+            "CASS_BACKUP_DEST": str(dest),
+            "CASS_BACKUP_STAGING": str(tmp_path / "staging"),
+            "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+    )
+
+    assert rc != 0, out
+    assert "[baseline] FAIL" in out, out
+    suspects = list(dest.glob("SUSPECT-*"))
+    assert len(suspects) == 1, out
+    susp = suspects[0]
+    assert (susp / "db").is_file()
+    assert (susp / "census.tsv").is_file()
+    assert (susp / "gate.json").is_file()
+    assert not (susp / "COMPLETE").exists()
+    assert sorted(p.name for p in dest.glob("cass-*")) == ["cass-baseline"], (
+        f"不应发布出任何新的 cass-*/: {out}"
+    )
+
+
+@requires_cass
 def test_tier0_gate_failure_zero_nas_artifacts(tmp_home, run_backup, synth_dd, cass_stub, tmp_path):
     """stub doctor 喂 `status:"warn"` → Tier 0 门 FAIL（与五腿门失败语义不同）→ exit 非零
     且 DEST 零产物（无 SUSPECT-*、无 .incomplete-*——Tier 0 门失败发生在锁内、发生在

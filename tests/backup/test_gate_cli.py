@@ -345,6 +345,113 @@ def test_attacks_targeting_leg4(gate_baseline, tmp_path, attack_name):
 
 
 # ---------------------------------------------------------------------------
+# codex R2-P0：基线「全有或全无」校验——三种复现（不需要额外攻击当前 db，毒
+# 基线本身就该被 `_validate_baseline` 拦下）+ rebaseline 逃生门回归。
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_baseline_census_line_removed_fails_census_binding(gate_baseline, tmp_path):
+    """复现①：直接删掉基线 `census.tsv` 里的一行（`agents`）——即使当前 db
+    的 `agents` 完全没变，census.tsv 与 digest.json 记录的 `census_sha256` 已经
+    对不上，必须被 `_validate_baseline` 拦下（不能像修复前那样：因为
+    `_leg3_compare_census` 只遍历 `prev_census.items()`，缺的键根本不会被拿来
+    比对，静默放行）。"""
+    db, dest = gate_baseline
+    census_path = dest / "cass-baseline" / "census.tsv"
+    lines = census_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    tampered = [line for line in lines if not line.startswith("agents\t")]
+    assert len(tampered) < len(lines), "夹具自检：census.tsv 应含 agents 行"
+    census_path.write_text("".join(tampered), encoding="utf-8")
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"stdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" in out, out
+    assert "census" in out, out
+    assert "需人工 rebaseline" in out, out
+    # 五腿仍必须跑完、产物仍必须落地（不因基线校验失败就短路五腿门本身）：
+    for i in range(5):
+        assert f"[leg {i}] " in out, out
+    assert out_census.exists()
+    assert out_gate.exists()
+
+
+@requires_cass
+def test_baseline_digest_missing_tables_messages_fails(gate_baseline, tmp_path):
+    """复现②：基线 `digest.json` 挖掉 `tables.messages`（不需要改写当前 db 的
+    消息内容来演示——结构缺失本身就该被拦下：`leg4` 对 `prev_tables.get(table)`
+    取到 `None` 时会当成「该表首晚登记」，跳过前缀摘要/单调性比对，静默放行
+    行内容篡改）。"""
+    db, dest = gate_baseline
+    digest_path = dest / "cass-baseline" / "digest.json"
+    digest = json.loads(digest_path.read_bytes())
+    del digest["tables"]["messages"]
+    digest_path.write_bytes(cass_common.dumps_canonical(digest))
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"stdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" in out, out
+    assert "tables" in out and "messages" in out, out
+    assert "需人工 rebaseline" in out, out
+
+
+@requires_cass
+def test_baseline_meta_watermarks_missing_last_scan_ts_fails(gate_baseline, tmp_path):
+    """复现③：基线 `digest.json` 的 `meta_watermarks` 挖掉 `last_scan_ts`——
+    `_leg4_watermarks` 的单调性比对逐键跳过「prev 里没有」的键，缺键会让水位
+    回退检查对那一个键彻底失效（当前必需键存在性检查只看当前 db，不看基线）。"""
+    db, dest = gate_baseline
+    digest_path = dest / "cass-baseline" / "digest.json"
+    digest = json.loads(digest_path.read_bytes())
+    del digest["meta_watermarks"]["last_scan_ts"]
+    digest_path.write_bytes(cass_common.dumps_canonical(digest))
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"stdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" in out, out
+    assert "meta_watermarks" in out and "last_scan_ts" in out, out
+    assert "需人工 rebaseline" in out, out
+
+
+@requires_cass
+def test_baseline_rebaseline_escape_hatch_bypasses_validation(gate_baseline, tmp_path):
+    """逃生门回归：同一份毒基线（挖掉 `meta_watermarks.last_scan_ts`），用
+    `--rebaseline` 指名它（它仍是链 tip，`_validate_rebaseline_target` 三项校验
+    只看目录存在 / COMPLETE / tip，不深入 digest 内容）+ reason，必须照常跑通
+    ——rebaseline 模式跳过 `_validate_baseline`（spec §5.7：与硬编码不变式的比对
+    永不可关，但与历史基线的比对本来就该被 rebaseline 关掉，这正是它存在的
+    理由）。"""
+    db, dest = gate_baseline
+    digest_path = dest / "cass-baseline" / "digest.json"
+    digest = json.loads(digest_path.read_bytes())
+    del digest["meta_watermarks"]["last_scan_ts"]
+    digest_path.write_bytes(cass_common.dumps_canonical(digest))
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(
+        db, dest, out_census, out_gate,
+        rebaseline="cass-baseline", rebaseline_reason="毒基线逃生门回归测试",
+    )
+
+    assert rc == 0, f"stdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" not in out, out
+    for i in range(5):
+        assert f"[leg {i}] PASS" in out, out
+    gate = json.loads(out_gate.read_bytes())
+    assert gate["rebaselined_from"] == "cass-baseline"
+
+
+# ---------------------------------------------------------------------------
 # Step 3：合成库全门计时 < 30s（合成库远小于生产；生产 <6s 验收在 Tier B）
 # ---------------------------------------------------------------------------
 

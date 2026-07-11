@@ -645,10 +645,110 @@ def _validate_rebaseline_target(
     return None
 
 
+# codex R2-P0 修复：基线的 census.tsv/digest.json 供腿 3/4 消费的子结构必须
+# 「全有或全无」——见 `_validate_baseline` docstring。
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_baseline(
+    dest: pathlib.Path, prev_name: str, prev_digest: dict
+) -> str | None:
+    """非 rebaseline 模式下、基线存在时的「全有或全无」校验（codex R2-P0：单点
+    删除基线的一个字段/一行会让腿 3/4「只比对 prev 里存在的键」的逻辑悄悄跳过
+    对应检查，制造静默降级成「无基线」的假绿——三种复现：删 census.tsv 里一行
+    再清空当前对应表、删 digest.json 的 tables.messages 再改写内容、删
+    meta_watermarks 的一个必需键再回退水位，三者都曾 rc=0）。
+
+    校验内容（任一不满足即失败，返回人读得懂的错误信息；全部满足返回
+    `None`）：
+
+    1. `<dest>/<prev_name>/census.tsv` 的原始字节 sha256 必须与
+       `prev_digest["census_sha256"]` 一致（文件缺失同样判失败）——防行级篡改。
+    2. `prev_digest` 供腿 3/4 消费的子结构完整性：
+       - `schema_fingerprint`：非空字符串。
+       - `tables[table]`（`table` ∈ `TABLES_FOR_LEG4`）：`max_id`/`count` 均为
+         非负 int，`prefix_digest` 为 64 位十六进制字符串。
+       - `meta_watermarks`：含 `REQUIRED_LEG4_WATERMARK_KEYS` 全部键（与腿 4
+         必需键清单同源 import，不在这里抄第二份）。
+
+    调用方（`main()`）据此判定：校验失败 ⇒ 不把 prev_census/prev_tables/
+    prev_watermarks 喂给腿 3/4（视同无基线，避免用可能同样残缺的结构继续算），
+    但仍跑完全部五腿并写产物（SUSPECT 取证需要完整画像），只是整体 exit code
+    额外受这次校验结果约束——不能悄悄退化成「首晚登记」式的 ok=True。
+    """
+    census_path = dest / prev_name / "census.tsv"
+    if not census_path.is_file():
+        return (
+            f"基线 census.tsv 缺失: {census_path}（基线损坏/被改，需人工 rebaseline）"
+        )
+    actual_sha256 = hashlib.sha256(census_path.read_bytes()).hexdigest()
+    expected_sha256 = prev_digest.get("census_sha256")
+    if actual_sha256 != expected_sha256:
+        return (
+            f"基线 census.tsv 与 digest.json 记录的 census_sha256 不符"
+            f"（实际={actual_sha256}，记录={expected_sha256!r}）"
+            "——基线损坏/被改，需人工 rebaseline"
+        )
+
+    fingerprint = prev_digest.get("schema_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return (
+            "基线 digest.json 缺 schema_fingerprint（应为非空字符串）"
+            "——基线损坏/被改，需人工 rebaseline"
+        )
+
+    tables = prev_digest.get("tables")
+    if not isinstance(tables, dict):
+        return "基线 digest.json 缺 tables（应为 dict）——基线损坏/被改，需人工 rebaseline"
+    for table_name in TABLES_FOR_LEG4:
+        entry = tables.get(table_name)
+        if not isinstance(entry, dict):
+            return (
+                f'基线 digest.json 的 tables["{table_name}"] 缺失或不是 dict'
+                "——基线损坏/被改，需人工 rebaseline"
+            )
+        max_id = entry.get("max_id")
+        count = entry.get("count")
+        prefix_digest = entry.get("prefix_digest")
+        if type(max_id) is not int or max_id < 0:
+            return (
+                f'基线 digest.json 的 tables["{table_name}"].max_id 非法'
+                f"（{max_id!r}，应为非负 int）——基线损坏/被改，需人工 rebaseline"
+            )
+        if type(count) is not int or count < 0:
+            return (
+                f'基线 digest.json 的 tables["{table_name}"].count 非法'
+                f"（{count!r}，应为非负 int）——基线损坏/被改，需人工 rebaseline"
+            )
+        if not isinstance(prefix_digest, str) or not _HEX64_RE.match(prefix_digest):
+            return (
+                f'基线 digest.json 的 tables["{table_name}"].prefix_digest 非法'
+                f"（{prefix_digest!r}，应为 64 位十六进制字符串）"
+                "——基线损坏/被改，需人工 rebaseline"
+            )
+
+    watermarks = prev_digest.get("meta_watermarks")
+    if not isinstance(watermarks, dict):
+        return (
+            "基线 digest.json 缺 meta_watermarks（应为 dict）"
+            "——基线损坏/被改，需人工 rebaseline"
+        )
+    missing_keys = [key for key in REQUIRED_LEG4_WATERMARK_KEYS if key not in watermarks]
+    if missing_keys:
+        return (
+            "基线 digest.json 的 meta_watermarks 缺必需键: "
+            + ", ".join(missing_keys)
+            + "——基线损坏/被改，需人工 rebaseline"
+        )
+
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """五腿门 CLI：跑腿 0→1→2→3→4（顺序固定，不短路），产出 `census.tsv` +
     `gate.json`（无论 PASS/FAIL 都写——SUSPECT 取证需要完整画像），返回
-    0=PASS / 1=FAIL(任一腿) / 2=用法或环境错误（含 rebaseline 目标校验失败）。
+    0=PASS / 1=FAIL（任一腿，或非 rebaseline 模式下基线本身校验不通过，见
+    `_validate_baseline`） / 2=用法或环境错误（含 rebaseline 目标校验失败）。
     """
     parser = argparse.ArgumentParser(prog="cass_backup_gate.py")
     parser.add_argument("--db", required=True, help="staging 副本 db 路径")
@@ -686,7 +786,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"错误: {error}", file=sys.stderr)
             return 2
 
-    if prev_name is None:
+    # codex R2-P0：非 rebaseline 模式下、基线存在时先做「全有或全无」校验——校验
+    # 失败就不能把（可能同样残缺的）prev_census/prev_tables/prev_watermarks 喂给
+    # 腿 3/4，那样只会把基线损坏悄悄传播成「比对不到对应键就跳过」的假绿（见
+    # `_validate_baseline` docstring 的三种复现）。rebaseline 模式跳过本校验——
+    # 毒基线的合法逃生门，rebaseline 本来就只与硬编码不变式比（spec §5.7）。
+    baseline_error: str | None = None
+    if prev_name is not None and not rebaseline:
+        baseline_error = _validate_baseline(dest, prev_name, prev_digest)
+
+    if prev_name is None or baseline_error is not None:
         prev_census: dict[str, int | str] | None = None
         prev_fingerprint: str | None = None
         prev_tables: dict[str, dict] | None = None
@@ -750,6 +859,13 @@ def main(argv: list[str] | None = None) -> int:
     leg_results = [r0, r1, r2, r3, r4]
     for i, r in enumerate(leg_results):
         print(f"[leg {i}] {'PASS' if r.ok else 'FAIL'}: {r.detail}")
+    if baseline_error is not None:
+        # 独立于五腿之外打印（不是某条腿的 detail）：这是「基线本身不可信」，
+        # 不是「当前 db 的数据不达标」——两件事分开报，但都必须让整体 exit
+        # 非零（见下方 return）。census.tsv/gate.json 仍照常写（用本次 db 现算
+        # 的 census/fingerprint/tables/watermarks，SUSPECT 取证需要完整画像，
+        # 也可能是人工核实后拿来做下一次 --rebaseline 目标的候选）。
+        print(f"[baseline] FAIL: {baseline_error}")
 
     census_bytes = _census_tsv_bytes(r3.census)
     pathlib.Path(args.out_census).write_bytes(census_bytes)
@@ -767,7 +883,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pathlib.Path(args.out_gate_json).write_bytes(cass_common.dumps_canonical(gate))
 
-    return 0 if all(r.ok for r in leg_results) else 1
+    return 0 if all(r.ok for r in leg_results) and baseline_error is None else 1
 
 
 if __name__ == "__main__":

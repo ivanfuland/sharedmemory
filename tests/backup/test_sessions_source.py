@@ -782,6 +782,9 @@ def test_v12a_e2e_truncated_session_blocks_publish_but_syncs_healthy_files(
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-v12a-second").is_dir(), out2
+    assert not (dest / "INCOMPLETE-v12a-second" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / ".incomplete-v12a-second").exists(), out2
     assert sorted(p.name for p in dest.glob("cass-*")) == cass_before, (
         f"不能发布出任何新的 cass-*/: {out2}"
@@ -825,6 +828,9 @@ def test_v12b_e2e_prefix_rewrite_blocks_publish_no_complete(
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-v12b-second").is_dir(), out2
+    assert not (dest / "INCOMPLETE-v12b-second" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / ".incomplete-v12b-second").exists(), out2
     assert sorted(p.name for p in dest.glob("cass-*")) == cass_before, (
         f"不能发布出任何新的 cass-*/: {out2}"
@@ -888,6 +894,9 @@ def test_p1_2_e2e_absent_at_source_reappeared_different_content_blocks_publish(
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-p1-2-second").is_dir(), out2
+    assert not (dest / "INCOMPLETE-p1-2-second" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / ".incomplete-p1-2-second").exists(), out2
     assert sorted(p.name for p in dest.glob("cass-*")) == cass_before, (
         f"重建内容与旧记录不符必须挡住发布，不能有新的 cass-*/: {out2}"
@@ -1061,6 +1070,9 @@ def test_glob_filename_anomaly_blocks_transfer_e2e(
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-glob-second").is_dir(), out2
+    assert not (dest / "INCOMPLETE-glob-second" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert nas_copy.read_bytes() == good, (
         "通配符文件名的 exclude 若失效，--append 会把新尾巴追加上来——NAS 好版本"
         "必须逐字节原封不动"

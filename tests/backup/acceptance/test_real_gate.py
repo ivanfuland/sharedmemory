@@ -73,11 +73,16 @@ def _leg_verdicts(stdout: str) -> dict[int, str]:
 
 def _seed_baseline(db_path: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
     """在 `dest` 下用 `db_path`（首晚登记模式）建一个满足
-    `cass_common.latest_published` 契约的最小「已发布」目录
+    `cass_common.latest_published` 契约的「已发布」目录
     （`cass-baseline/{COMPLETE,census.tsv,digest.json}`），供「第二晚比对」类
-    攻击测试（V5/V5a/V5b/V5c/V5d/V5d4）复用。只含 `main()` 读取所需的四个键
-    （`generation`/`schema_fingerprint`/`tables`/`meta_watermarks`）——本文件只测
-    五腿门本体，不是 `backup-cass.sh` 全脚本 e2e（那是 Tier A 的 `test_first_night.py`
+    攻击测试（V5/V5a/V5b/V5c/V5d/V5d4）复用。digest 含 `main()` 读取所需的键
+    （`generation`/`schema_fingerprint`/`tables`/`meta_watermarks`）**加
+    `census_sha256`**——codex R2-P0 起 `_validate_baseline` 对基线强制「全有或
+    全无」（census.tsv 字节绑定 + 子结构完整性），手搓基线也必须是结构完整的
+    真基线，否则会被当毒基线拒绝、比对腿静默进首晚登记模式（正是修复前 5 个
+    acceptance 攻击测试假 PASS 的机理）。gate.json 本身就带 `census_sha256`
+    （对 CLI 刚写出的 census.tsv 字节算的），直接抄——本文件只测五腿门本体，
+    不是 `backup-cass.sh` 全脚本 e2e（那是 Tier A 的 `test_first_night.py`
     覆盖的范围）。
     """
     dest.mkdir(parents=True, exist_ok=True)
@@ -96,6 +101,7 @@ def _seed_baseline(db_path: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
         "schema_fingerprint": gate["schema_fingerprint"],
         "tables": gate["tables"],
         "meta_watermarks": gate["meta_watermarks"],
+        "census_sha256": gate["census_sha256"],
     }
     (baseline_dir / "digest.json").write_bytes(json.dumps(digest).encode())
     return baseline_dir

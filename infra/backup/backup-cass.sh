@@ -308,10 +308,33 @@ fail_incomplete() {
   # EXIT trap 会把刚保下来的东西删掉。**先清空**（mv -T 之前）而不是之后——这样
   # 即使 mv -T 本身失败（源目录未被移动），trap 也不会趁乱把它删掉，两种结局
   # （改名成功 / mv 失败原地留守）都保住取证现场。
+  #
+  # 只用于 `touch COMPLETE`（step 15）之前的失败——COMPLETE 之后的失败必须走
+  # `fail_recoverable`，不能用这个（INCOMPLETE-* 内永不含 COMPLETE 是不变式，
+  # codex R2-P2，spec §6.6）。
   local reason="$1"
   TRAP_INCOMPLETE=""
   mv -T "$INCOMPLETE_DIR" "$DEST/INCOMPLETE-$STAMP"
   echo "[backup] FATAL: $reason"
+  exit 1
+}
+
+fail_recoverable() {
+  # codex R2-P2 修复：`touch COMPLETE`（step 15）之后的失败——载荷已全量校验
+  # 通过，语义等同 spec step 4 那个「stale .incomplete-* 内含 COMPLETE」状态，
+  # 必须改名 RECOVERABLE-$STAMP，不能像 fail_incomplete 那样改名
+  # INCOMPLETE-$STAMP（INCOMPLETE-* 内永不含 COMPLETE 是不变式，spec §6.6）。
+  # 先清空 TRAP_INCOMPLETE 再 mv，理由同 fail_incomplete。只在 $INCOMPLETE_DIR
+  # 还存在时才 mv——它可能已经被前面失败的 `mv -T "$INCOMPLETE_DIR"
+  # "$PUBLISHED_DIR"` 移走了一半（同文件系统内 rename() 是原子的，不会真的半
+  # 移走，但防御式写法不假设这一点），避免对不存在的路径重复失败掩盖了原始
+  # 错误消息。
+  local reason="$1"
+  TRAP_INCOMPLETE=""
+  if [ -e "$INCOMPLETE_DIR" ]; then
+    mv -T "$INCOMPLETE_DIR" "$DEST/RECOVERABLE-$STAMP"
+  fi
+  echo "[backup] ALERT: $reason — recovered to RECOVERABLE-$STAMP (needs human review)"
   exit 1
 }
 
@@ -703,8 +726,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # step 15 — 发布序列（spec §6 step 15 逐字）：mountpoint 重验 → touch COMPLETE →
-# 断言目标不存在 → `mv -T` → 最终断言。任一失败即 `fail_incomplete`/`exit 1`，
-# 成功后清空 `TRAP_INCOMPLETE`（发布成功，trap 不再碰它）。
+# 断言目标不存在 → `mv -T` → 最终断言。`touch COMPLETE` 之前的失败走
+# `fail_incomplete`；**之后**的失败一律走 `fail_recoverable`（codex R2-P2：
+# 载荷已全量校验通过，改名 INCOMPLETE-* 会违反「INCOMPLETE-* 内永无 COMPLETE」
+# 的不变式）。成功后清空 `TRAP_INCOMPLETE`（发布成功，trap 不再碰它）。
 # ---------------------------------------------------------------------------
 if [[ "$DEST" == "$NAS_PREFIX"* ]]; then
   mountpoint -q "$SHARE_ROOT" 2>/dev/null \
@@ -723,8 +748,8 @@ if [ "$FAULT" = "kill-after-complete-marker" ]; then
 fi
 
 PUBLISHED_DIR="$DEST/cass-$STAMP"
-test ! -e "$PUBLISHED_DIR" || fail_incomplete "publish target already exists: $PUBLISHED_DIR"
-mv -T "$INCOMPLETE_DIR" "$PUBLISHED_DIR"
+test ! -e "$PUBLISHED_DIR" || fail_recoverable "publish target already exists: $PUBLISHED_DIR"
+mv -T "$INCOMPLETE_DIR" "$PUBLISHED_DIR" || fail_recoverable "mv -T failed to publish (step 15)"
 
 # DEV-7 故障注入：`mv -T` 已完成、`sync`/最终断言尚未执行（V15k）——此刻已发布
 # 的 `cass-$STAMP/` 必须完好；下一轮 `.incomplete-*` 清理不会误删它（它已经不
@@ -734,7 +759,8 @@ if [ "$FAULT" = "kill-after-publish-mv" ]; then
 fi
 
 sync
-test -f "$PUBLISHED_DIR/COMPLETE" && test ! -e "$INCOMPLETE_DIR" || exit 1
+test -f "$PUBLISHED_DIR/COMPLETE" && test ! -e "$INCOMPLETE_DIR" \
+  || fail_recoverable "final publish assertion failed (step 15)"
 TRAP_INCOMPLETE=""   # 发布成功，trap 不再碰它
 
 # ---------------------------------------------------------------------------

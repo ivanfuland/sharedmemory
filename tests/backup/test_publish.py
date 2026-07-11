@@ -270,7 +270,12 @@ def test_v7_kill_after_incomplete_db_copy_stale_cleanup_lifecycle(
 
 
 # ---------------------------------------------------------------------------
-# V7a：发布目标已存在——发布前 test ! -e 拦下，旧内容原封不动，无嵌套 .incomplete
+# V7a：发布目标已存在——发布前 test ! -e 拦下，旧内容原封不动，无嵌套 .incomplete。
+#
+# codex R2-P2 修复：这个失败点在 `touch COMPLETE`（step 15）**之后**——载荷已全量
+# 校验通过，必须改名 `RECOVERABLE-<stamp>`（含 COMPLETE），不能像修复前那样改名
+# `INCOMPLETE-<stamp>`（INCOMPLETE-* 内永不含 COMPLETE 是不变式，spec §6.6：
+# 「含 COMPLETE 的载荷」定义为 RECOVERABLE 状态）。
 # ---------------------------------------------------------------------------
 
 
@@ -292,10 +297,17 @@ def test_v7a_publish_target_already_exists_refuses_and_preserves_old_content(
     assert rc != 0, out
     assert (old_dir / "sentinel.txt").read_text(encoding="utf-8") == (
         "pre-existing unrelated content\n"
-    ), "旧目录内容必须原封不动"
+    ), "旧目录内容必须原封不动（顶层 cass-* 未变）"
     assert not (old_dir / "COMPLETE").exists(), "旧目录不该被本轮内容污染"
     assert not (dest / f".incomplete-{stamp}").exists(), "不应留嵌套 .incomplete-*"
-    assert (dest / f"INCOMPLETE-{stamp}").is_dir(), out
+    assert not (dest / f"INCOMPLETE-{stamp}").exists(), (
+        "touch COMPLETE 之后的失败必须是 RECOVERABLE，不是 INCOMPLETE（spec §6.6）: " + out
+    )
+    recoverable_dir = dest / f"RECOVERABLE-{stamp}"
+    assert recoverable_dir.is_dir(), out
+    assert (recoverable_dir / "COMPLETE").is_file(), "载荷已全量校验通过，COMPLETE 必须随行"
+    assert not (recoverable_dir / f".incomplete-{stamp}").exists(), "不应有嵌套 .incomplete-*"
+    assert not (recoverable_dir / stamp).exists(), "不应有嵌套目录"
     assert "already exists" in out, out
 
 
@@ -321,6 +333,9 @@ def test_v8_sessions_rsync_failure_lands_incomplete_not_cass(
 
     assert rc != 0, out
     assert (dest / f"INCOMPLETE-{stamp}").is_dir(), out
+    assert not (dest / f"INCOMPLETE-{stamp}" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / f".incomplete-{stamp}").exists(), out
     assert not list(dest.glob("cass-*")), out
     assert "sessions rsync failed" in out, out
@@ -463,6 +478,9 @@ def test_14a_corrupt_manifest_after_snapshot_fails_sha256sum_gate(
 
     assert rc != 0, out
     assert (dest / f"INCOMPLETE-{stamp}").is_dir(), out
+    assert not (dest / f"INCOMPLETE-{stamp}" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / f".incomplete-{stamp}").exists(), out
     assert not list(dest.glob("cass-*")), out
     assert "step 14a" in out, out

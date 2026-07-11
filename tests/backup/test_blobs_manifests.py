@@ -135,6 +135,9 @@ def test_v9_flip_nas_db_lands_incomplete_not_bare_exit(
 
     assert rc != 0, out
     assert (dest / f"INCOMPLETE-{stamp}").is_dir(), out
+    assert not (dest / f"INCOMPLETE-{stamp}" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / f".incomplete-{stamp}").exists(), (
         f"fail_incomplete 必须把半成品改名走，不能同时留 .incomplete-* 和 INCOMPLETE-*: {out}"
     )
@@ -161,6 +164,9 @@ def test_v9_unlink_nas_db_before_readback_lands_incomplete(
 
     assert rc != 0, out
     assert (dest / f"INCOMPLETE-{stamp}").is_dir(), out
+    assert not (dest / f"INCOMPLETE-{stamp}" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert not (dest / f".incomplete-{stamp}").exists(), out
     assert not list(dest.glob("cass-*")), out
     assert "readback" in out.lower(), out
@@ -484,6 +490,9 @@ def test_v13c_nas_pool_blob_truncated_to_zero_caught_by_st_size(
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-v13c-second").is_dir(), out2
+    assert not (dest / "INCOMPLETE-v13c-second" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert "st_size" in out2, out2
 
 
@@ -512,6 +521,9 @@ def test_v13c2_nas_pool_blob_same_length_wrong_content_caught_by_blake3(
 
     assert rc2 != 0, out2
     assert (dest / "INCOMPLETE-v13c2-second").is_dir(), out2
+    assert not (dest / "INCOMPLETE-v13c2-second" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert "st_size 不符" not in out2, f"同长度篡改不应触发 st_size 判据: {out2}"
     assert "BLAKE3" in out2, out2
 
@@ -539,6 +551,9 @@ def test_v13d_path_traversal_blob_relative_path_shape_fails_no_fs_side_effect(
 
     assert rc != 0, out
     assert (dest / "INCOMPLETE-v13d").is_dir(), out
+    assert not (dest / "INCOMPLETE-v13d" / "COMPLETE").exists(), (
+        "INCOMPLETE-* 内永无 COMPLETE（spec §6.6 不变式，codex R2-P2 回归线）"
+    )
     assert "形状不符" in out, out
     assert pathlib.Path("/etc/passwd").stat().st_mtime == passwd_mtime_before, (
         "blob_relative_path 绝不能参与任何文件系统操作"
