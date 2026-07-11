@@ -54,10 +54,12 @@ RETENTION_RESET="${CASS_BACKUP_RETENTION_RESET:-}"
 RETENTION_RESET_REASON="${CASS_BACKUP_RETENTION_RESET_REASON:-}"
 
 ALERT_FLAG=0        # step 4 的 RECOVERABLE 救援会置 1；即使备份本身成功也要 exit 非零（DEV-6）
-TRAP_INCOMPLETE=""   # step 10 起指向 $DEST/.incomplete-$STAMP；非空时 EXIT trap 会 rm -rf
-                      # 它——覆盖「没走 fail_incomplete 就意外退出」的路径（SIGTERM/未预料
-                      # 的 set -e 击杀）。fail_incomplete 改名前、以及临时成功出口前都必须
-                      # 先清空它，否则刚保下来的东西会被这里删掉（spec §6.6 实现注意）。
+TRAP_INCOMPLETE=""   # step 10 起指向 $DEST/.incomplete-$STAMP；非空时 EXIT trap 会处理
+                      # 它——覆盖「没走 fail_incomplete/fail_recoverable 就意外退出」的
+                      # 路径（SIGTERM/未预料的 set -e 击杀）。trap 自己认 COMPLETE（codex
+                      # R3-P1）：含 COMPLETE → 改名 RECOVERABLE-*（绝不删），不含 → rm -rf。
+                      # fail_incomplete/fail_recoverable 改名前、以及成功出口前都必须先清空
+                      # 它（spec §6.6 实现注意）。
 STG=""               # step 2 通过后赋值为本轮 staging 工作目录
 
 cleanup() {
@@ -66,8 +68,18 @@ cleanup() {
   if [ -n "$STG" ]; then
     rm -rf "$STG" 2>/dev/null || true
   fi
-  if [ -n "$TRAP_INCOMPLETE" ]; then
-    rm -rf "$TRAP_INCOMPLETE" 2>/dev/null || true
+  if [ -n "$TRAP_INCOMPLETE" ] && [ -d "$TRAP_INCOMPLETE" ]; then
+    if [ -e "$TRAP_INCOMPLETE/COMPLETE" ]; then
+      # 含 COMPLETE = 已全量校验的可恢复载荷，绝不删（spec §6 step 4；codex R3-P1：
+      # `touch COMPLETE` 之后任何裸失败——如紧随其后的 sync 被 set -e 直接打出——
+      # 根本走不到 fail_recoverable，只有 trap 自己认 COMPLETE 才兜得住，逐失败点
+      # 打补丁挂一漏万）。fail_recoverable（显式路径）仍保留——已知失败点走它，
+      # 告警文案更精准；这里是最后兜底网。
+      echo "[backup] ALERT: EXIT trap found COMPLETE payload — preserved as RECOVERABLE (needs human review)"
+      mv -T "$TRAP_INCOMPLETE" "${TRAP_INCOMPLETE/.incomplete-/RECOVERABLE-}" 2>/dev/null || true
+    else
+      rm -rf "$TRAP_INCOMPLETE" 2>/dev/null || true
+    fi
   fi
 }
 trap cleanup EXIT
@@ -739,6 +751,14 @@ sync
 
 touch "$INCOMPLETE_DIR/COMPLETE"
 sync
+
+# DEV-7 故障注入（codex R3-P1）：模拟「touch COMPLETE 之后的 sync 失败」——
+# `false` 被 set -e 直接打出（与真 sync 失败同一条退出路径），根本走不到
+# fail_recoverable。EXIT trap 必须自己认 COMPLETE，把已全量校验的载荷保成
+# RECOVERABLE-*，绝不 rm -rf（spec §6 step 4）。
+if [ "$FAULT" = "fail-sync-after-complete" ]; then
+  false
+fi
 
 # DEV-7 故障注入：`touch COMPLETE` 已完成、`mv -T` 尚未执行（V15l）——下一轮
 # step 4 必须把它当 RECOVERABLE 救援，不能当垃圾清掉（它是完整且已全部校验

@@ -458,6 +458,74 @@ def test_v15l_kill_after_complete_marker_becomes_recoverable_next_run(
 
 
 # ---------------------------------------------------------------------------
+# codex R3-P1：touch COMPLETE 之后的裸失败（sync 被 set -e 打出）——EXIT trap
+# 必须自己认 COMPLETE，把已全量校验的载荷保成 RECOVERABLE-*，绝不 rm -rf。
+# 修复前复现：fake-sync 第二次失败 → set -e 打出 → 走不到 fail_recoverable →
+# trap 仍持 TRAP_INCOMPLETE → rm -rf 把完整备份静默丢弃（DEST 只剩 raw-mirror/
+# sessions/state，.incomplete/INCOMPLETE/RECOVERABLE/cass 一个都没有）。
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_r3_sync_failure_after_complete_trap_preserves_recoverable(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """`CASS_BACKUP_FAULT=fail-sync-after-complete`：`touch COMPLETE` 后注入
+    `false`（与真 sync 失败同一条 set -e 退出路径，绕过 fail_recoverable）→
+    EXIT trap 兜底：载荷改名 `RECOVERABLE-<stamp>`（含 COMPLETE + 完整载荷），
+    exit 非零，无裸删、无 INCOMPLETE-*、无发布。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    stamp = "r3-sync"
+
+    rc, out = _run(
+        tmp_home, run_backup, synth_dd, cass_stub, dest, staging, stamp,
+        extra_env={"CASS_BACKUP_FAULT": "fail-sync-after-complete"},
+    )
+
+    assert rc != 0, out
+    recoverable = dest / f"RECOVERABLE-{stamp}"
+    assert recoverable.is_dir(), f"trap 必须把 COMPLETE 载荷保成 RECOVERABLE，不能裸删: {out}"
+    assert (recoverable / "COMPLETE").is_file()
+    # 载荷完整（已全量校验过的那一份，一件不少）：
+    for artifact in ("db", "db.sha256", "census.tsv", "sessions.tsv",
+                     "manifests.sha256sum", "digest.json"):
+        assert (recoverable / artifact).is_file(), f"载荷缺 {artifact}: {out}"
+    assert (recoverable / "manifests").is_dir()
+    assert not (dest / f".incomplete-{stamp}").exists(), out
+    assert not (dest / f"INCOMPLETE-{stamp}").exists(), (
+        "COMPLETE 载荷绝不能变成 INCOMPLETE-*（spec §6.6 不变式）"
+    )
+    assert not list(dest.glob("cass-*")), f"sync 失败当晚不得发布: {out}"
+    assert "EXIT trap found COMPLETE payload" in out, out
+
+
+@requires_cass
+def test_r3_success_path_trap_does_not_touch_published(
+    tmp_home, run_backup, synth_dd, cass_stub, tmp_path
+):
+    """对照回归：正常成功路径 `TRAP_INCOMPLETE` 在发布后已清空——EXIT trap 不碰
+    已发布的 `cass-*/`，也不凭空产出 RECOVERABLE-*/INCOMPLETE-*。"""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    staging = tmp_path / "staging"
+    stamp = "r3-ok"
+
+    rc, out = _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, stamp)
+
+    assert rc == 0, out
+    published = dest / f"cass-{stamp}"
+    assert published.is_dir(), out
+    assert (published / "COMPLETE").is_file()
+    assert (published / "digest.json").is_file()
+    assert not list(dest.glob("RECOVERABLE-*")), out
+    assert not list(dest.glob("INCOMPLETE-*")), out
+    assert not list(dest.glob(".incomplete-*")), out
+    assert "EXIT trap found COMPLETE payload" not in out, out
+
+
+# ---------------------------------------------------------------------------
 # 14a e2e carry-forward（Task 10 遗留）：corrupt-manifest-after-snapshot
 # ---------------------------------------------------------------------------
 
