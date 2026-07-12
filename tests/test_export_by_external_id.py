@@ -160,3 +160,25 @@ def test_parse_argv_equal_form_accepts_double_dash_value():
     assert export.parse_argv(["--external-id=--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", "outdir"]) == \
         (None, "--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", ["outdir"], False)
     assert export.parse_argv(["--conv=--weird"]) == ("--weird", None, [], False)
+
+
+def test_parse_argv_unknown_flag_fails_loud():
+    """未知 --flag（含 selector 拼写错误）一律 fail-loud——第三种静默滑批量形态（codex 联审 P1-1）。"""
+    for argv in (["--external_id=eid-x"], ["--Conv", "7"], ["--extra-flag", "outdir"]):
+        with pytest.raises(ValueError):
+            export.parse_argv(argv)
+    assert export.parse_argv(["--backfill"]) == (None, None, [], True)  # 唯一合法裸 flag 不受影响
+
+
+def test_parse_argv_space_form_double_dash_value_fails_loud():
+    """空格形 + -- 开头值 → raise（负例钉死，防未来把坏路径放回静默 batch；codex 联审 P2-2）。"""
+    with pytest.raises(ValueError):
+        export.parse_argv(["--external-id", "--home-x--/y.jsonl", "outdir"])
+
+
+def test_parse_argv_space_form_empty_string_policy():
+    """空格形空串值当前语义 = 接受空串（export_one miss → total=0 → skipped 路径，无害不滑批量）；
+    等号形空串 = 缺值 raise。钉死两者差异（codex 联审 P2-1 显式化）。"""
+    assert export.parse_argv(["--external-id", "", "outdir"]) == (None, "", ["outdir"], False)
+    with pytest.raises(ValueError):
+        export.parse_argv(["--external-id="])

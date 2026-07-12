@@ -262,7 +262,12 @@ def parse_argv(argv):
     本意是单条导出却因缺值悄悄跑成批量 backfill、推进水位线。selector flag 出现本身就表达了
     "单条导出"意图，此时缺值只可能是操作者失误，不该被静默吞成"当作没给"。F3 机器调用路径
     永远带值，不受此收紧影响。
-    二者同给 → raise（选择器互斥，fail-loud）。"""
+    二者同给 → raise（选择器互斥，fail-loud）。
+
+    未知 `--*` flag（含拼写错误，如 `--external_id=` 下划线误用 `--external-id`）一律 raise，
+    不再静默忽略——静默忽略会让打错字的 selector 悄悄滑进批量 run_feed（codex 联审 P1-1，
+    第三种静默滑批量形态，继上面两种缺值 / 等号形之后）。唯一例外是 `--backfill`：它在函数末尾
+    单独按 `"--backfill" in argv` 判定，不受此分支影响，继续被忽略（即不会落进 unknown-flag 分支）。"""
     conv, eid, positionals, skip_next = None, None, [], False
     conv_seen = eid_seen = False
     for i, a in enumerate(argv):
@@ -292,7 +297,9 @@ def parse_argv(argv):
             eid = a.split("=", 1)[1] or None
             continue
         if a.startswith("--"):
-            continue
+            if a == "--backfill":     # 唯一合法裸 flag（末尾按 "--backfill" in argv 判定）
+                continue
+            raise ValueError(f"parse_argv: unknown flag {a!r}")
         positionals.append(a)
     if conv_seen and conv is None:
         raise ValueError("parse_argv: --conv/--external-id requires a value")
