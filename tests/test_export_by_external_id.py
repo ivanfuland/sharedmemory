@@ -1,6 +1,9 @@
 # tests/test_export_by_external_id.py
 # adapter 按 external_id（稳定键）导出。全合成数据（PUBLIC 仓隐私）。TDD：先失败。
+import os
+import re
 import sqlite3
+import sys
 
 import pytest
 
@@ -55,6 +58,16 @@ def test_get_by_external_id_duplicate_fails_loud(tmp_path):
         reader.get_conversation_by_external_id(dbp, "eid-dup")
 
 
+def test_get_by_external_id_duplicate_with_zero_msg_row_fails_loud(tmp_path):
+    """P2-1（codex fresh 审）：判重必须在 JOIN messages 之前。旧实现按 JOIN 后的
+    len(rows) 判重——0 消息的一条会被 INNER JOIN messages 过滤掉，同 external_id
+    一条 0 消息、一条有消息时，>1 fail-loud 边界失效，函数会静默选中有消息那条。"""
+    dbp = str(tmp_path / "c.db")
+    _mk_db_eid(dbp, [(1, "codex", "eid-dup", 1000_000, 0), (2, "codex", "eid-dup", 2000_000, 5)])
+    with pytest.raises(RuntimeError, match="eid-dup"):
+        reader.get_conversation_by_external_id(dbp, "eid-dup")
+
+
 def test_get_by_external_id_legacy_schema_fails_loud(tmp_path):
     """老/合成 schema 无 external_id 列 → 显式 raise，不静默返回 None。"""
     dbp = str(tmp_path / "legacy.db")
@@ -78,6 +91,11 @@ def test_export_one_by_external_id_writes_transcript(tmp_path):
     rep = export.export_one(dbp, out, external_id="eid-ccc", min_chars=10)
     assert len(rep["written"]) == 1 and rep["errors"] == []
     assert rep["exported_ts"] == 3000_000
+    # 身份锚（codex fresh 审 P2-2a）：防"选错会话仍绿"——written 的文件必须真是
+    # eid-ccc 那条会话的 transcript，不是同名巧合或误选的别的会话。
+    fn = rep["written"][0][0]
+    text = open(os.path.join(out, fn), encoding="utf-8").read()
+    assert "external_id: eid-ccc" in text.splitlines()
 
 
 def test_export_one_by_external_id_miss_is_skipped_shape(tmp_path):
@@ -106,6 +124,22 @@ def test_parse_argv_external_id_forms():
 def test_parse_argv_conv_and_eid_mutually_exclusive():
     with pytest.raises(ValueError):
         export.parse_argv(["--conv", "7", "--external-id", "eid-x"])
+
+
+def test_export_main_cli_stdout_three_line_contract(tmp_path, monkeypatch, capsys):
+    """CLI stdout 契约锚（codex fresh 审 P2-2b）：下游 Inngest F3 靠这三行 stdout 解析
+    out_dir / written-skipped-errors-total / exported_ts。钉死格式，防止 main() 改动
+    悄悄破坏下游解析。"""
+    dbp = str(tmp_path / "c.db"); out_dir = str(tmp_path / "out")
+    _mk_db_eid(dbp, [(7, "codex", "eid-ccc", 3000_000, 6)])
+    monkeypatch.setenv("CASS_CANON_DB", dbp)
+    monkeypatch.setattr(sys, "argv", ["prog", "--external-id", "eid-ccc", str(out_dir)])
+    export.main()
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"out_dir={out_dir}"
+    assert re.match(r"^written=\d+  skipped=\d+  errors=\d+  of \d+ selected$", lines[1])
+    assert lines[1].startswith("written=1  ")  # 长会话过 min_chars=2000 默认门，确认真 written
+    assert lines[2].startswith("exported_ts=")
 
 
 def test_parse_argv_valueless_selector_fails_loud():
