@@ -253,35 +253,51 @@ def run_feed(db_path, out_dir, cap, state_path, backfill=False):
 def parse_argv(argv):
     """拆 argv → (conv, external_id, positionals, backfill)。
     --conv 与 --external-id 均支持空格形与等号形（等号形不识别会静默走批量 run_feed，codex 复审 P2 同类）；
-    尾随 flag 无值、或下一 token 是另一个 flag（`--`开头）→ 均视为缺值 None，不吞下一个 flag（codex PR-D R1 P1：
-    否则会把下一个 flag 当值吃掉，让选择器互斥检查被静默绕过）；positional 按位置排除 flag 的值。
+    positional 按位置排除 flag 的值。
+
+    selector flag（--conv / --external-id）出现但取不到值 → 一律 raise ValueError（fail-loud，
+    Ivan 裁决 2026-07-12，取代此前"缺值→None"的旧语义）。覆盖三种形态：尾随无值
+    （`["--conv"]`）、下一 token 是另一个 flag（`["--external-id","--conv","7"]`）、等号空值
+    （`["--conv="]`）。理由：缺值→None 会静默改道——例如 `--external-id --backfill /out`
+    本意是单条导出却因缺值悄悄跑成批量 backfill、推进水位线。selector flag 出现本身就表达了
+    "单条导出"意图，此时缺值只可能是操作者失误，不该被静默吞成"当作没给"。F3 机器调用路径
+    永远带值，不受此收紧影响。
     二者同给 → raise（选择器互斥，fail-loud）。"""
     conv, eid, positionals, skip_next = None, None, [], False
+    conv_seen = eid_seen = False
     for i, a in enumerate(argv):
         if skip_next:
             skip_next = False
             continue
         if a == "--conv":
+            conv_seen = True
             nxt = argv[i + 1] if i + 1 < len(argv) else None
-            # 下一 token 是 flag（`--`开头）→ 视为缺值，不吞它（codex PR-D R1 P1：否则会把
-            # 下一个 flag 当成 conv 的值吃掉，让选择器互斥检查被静默绕过）。
+            # 下一 token 是 flag（`--`开头）→ 视为缺值；不吞它（否则会把下一个 flag 当成
+            # conv 的值吃掉，让选择器互斥检查被静默绕过）。
             conv = None if (nxt is not None and nxt.startswith("--")) else nxt
             skip_next = conv is not None
             continue
         if a.startswith("--conv="):
+            conv_seen = True
             conv = a.split("=", 1)[1] or None
             continue
         if a == "--external-id":
+            eid_seen = True
             nxt = argv[i + 1] if i + 1 < len(argv) else None
             eid = None if (nxt is not None and nxt.startswith("--")) else nxt
             skip_next = eid is not None
             continue
         if a.startswith("--external-id="):
+            eid_seen = True
             eid = a.split("=", 1)[1] or None
             continue
         if a.startswith("--"):
             continue
         positionals.append(a)
+    if conv_seen and conv is None:
+        raise ValueError("parse_argv: --conv/--external-id requires a value")
+    if eid_seen and eid is None:
+        raise ValueError("parse_argv: --conv/--external-id requires a value")
     if conv is not None and eid is not None:
         raise ValueError("parse_argv: --conv and --external-id are mutually exclusive")
     return conv, eid, positionals, ("--backfill" in argv)

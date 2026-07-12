@@ -108,7 +108,10 @@ def test_parse_argv_conv_and_eid_mutually_exclusive():
         export.parse_argv(["--conv", "7", "--external-id", "eid-x"])
 
 
-def test_parse_argv_missing_value_does_not_swallow_next_flag():
-    """selector flag 缺值时不得吞掉下一个 flag（codex PR-D R1 P1：互斥绕过）。"""
-    assert export.parse_argv(["--external-id", "--conv", "7"]) == ("7", None, [], False)
-    assert export.parse_argv(["--conv", "--external-id", "eid-x"]) == (None, "eid-x", [], False)
+def test_parse_argv_valueless_selector_fails_loud():
+    """selector flag 出现但无值 → fail-loud（Ivan 裁决：缺值静默改道比报错更危险）。"""
+    for argv in (["--conv"], ["--external-id"], ["--conv="], ["--external-id="],
+                 ["--external-id", "--conv", "7"], ["--conv", "--backfill"],
+                 ["--conv", "--external-id", "eid-x"]):
+        with pytest.raises(ValueError):
+            export.parse_argv(argv)
