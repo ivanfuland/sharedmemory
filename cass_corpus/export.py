@@ -196,13 +196,17 @@ def export(db_path, out_dir, limit=20, agents=None,
             "total": len(convs), "max_cursor": max_cursor}
 
 
-def export_one(db_path, out_dir, conv_id, min_chars=2000, pruner=None):
-    """单条精确导出(Inngest F3 逐条驱动用;不碰 cursor)。选一条 → 读 → 清洗 → 渲染 → 原子写。
+def export_one(db_path, out_dir, conv_id=None, min_chars=2000, pruner=None, *, external_id=None):
+    """单条精确导出(Inngest F3 逐条驱动用;不碰 cursor)。选择器二选一：
+    conv_id（rowid，兼容/调试）或 external_id（稳定键，F3 生产驱动——rowid 跨 CASS 重建会全量重发号）。
     返回 report 含 exported_ts = 实际读到消息的 max created_at(文件真实内容版本,codex R5 P1-2/R6 P2-A)。"""
+    if (conv_id is None) == (external_id is None):
+        raise ValueError("export_one: exactly one of conv_id / external_id is required")
     pruner = pruner or DeterministicPruner()
     _assert_no_legacy_names(out_dir)
     os.makedirs(out_dir, exist_ok=True)
-    meta = reader.get_conversation(db_path, conv_id)
+    meta = (reader.get_conversation(db_path, conv_id) if conv_id is not None
+            else reader.get_conversation_by_external_id(db_path, external_id))
     if meta is None:
         return {"written": [], "skipped": [], "errors": [], "total": 0, "exported_ts": None}
     written, skipped, errors = [], [], []
@@ -247,35 +251,51 @@ def run_feed(db_path, out_dir, cap, state_path, backfill=False):
 
 
 def parse_argv(argv):
-    """拆 argv → (conv, positionals, backfill)。
-    支持 `--conv 1898` 与 `--conv=1898`（codex 复审 P2：等号形不识别会静默走批量 run_feed 推进水位线）；
-    尾随 `--conv` 无值 → conv=None（不 IndexError）；positional 按**位置**排除 --conv 的值
-    （不按值排除，避免 out_dir 字符串恰等于 conv-id 时被误吞）。未知 --flag 忽略。"""
-    conv, positionals, skip_next = None, [], False
+    """拆 argv → (conv, external_id, positionals, backfill)。
+    --conv 与 --external-id 均支持空格形与等号形（等号形不识别会静默走批量 run_feed，codex 复审 P2 同类）；
+    尾随 flag 无值、或下一 token 是另一个 flag（`--`开头）→ 均视为缺值 None，不吞下一个 flag（codex PR-D R1 P1：
+    否则会把下一个 flag 当值吃掉，让选择器互斥检查被静默绕过）；positional 按位置排除 flag 的值。
+    二者同给 → raise（选择器互斥，fail-loud）。"""
+    conv, eid, positionals, skip_next = None, None, [], False
     for i, a in enumerate(argv):
         if skip_next:
             skip_next = False
             continue
         if a == "--conv":
-            conv = argv[i + 1] if i + 1 < len(argv) else None
-            skip_next = conv is not None  # 跳过它的值 token（若有）
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            # 下一 token 是 flag（`--`开头）→ 视为缺值，不吞它（codex PR-D R1 P1：否则会把
+            # 下一个 flag 当成 conv 的值吃掉，让选择器互斥检查被静默绕过）。
+            conv = None if (nxt is not None and nxt.startswith("--")) else nxt
+            skip_next = conv is not None
             continue
         if a.startswith("--conv="):
             conv = a.split("=", 1)[1] or None
             continue
+        if a == "--external-id":
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            eid = None if (nxt is not None and nxt.startswith("--")) else nxt
+            skip_next = eid is not None
+            continue
+        if a.startswith("--external-id="):
+            eid = a.split("=", 1)[1] or None
+            continue
         if a.startswith("--"):
-            continue  # 其它 flag（如 --backfill）不进 positional
+            continue
         positionals.append(a)
-    return conv, positionals, ("--backfill" in argv)
+    if conv is not None and eid is not None:
+        raise ValueError("parse_argv: --conv and --external-id are mutually exclusive")
+    return conv, eid, positionals, ("--backfill" in argv)
 
 
 def main():
-    conv, args, backfill = parse_argv(sys.argv[1:])
+    conv, eid, args, backfill = parse_argv(sys.argv[1:])
     db = os.environ.get("CASS_CANON_DB",
                         os.path.expanduser("~/.local/share/coding-agent-search/agent_search.db"))
     out = args[0] if len(args) > 0 else os.path.expanduser("~/.local/share/gbrain/cass-transcripts-poc")
     if conv is not None:
         rep = export_one(db, out, int(conv))
+    elif eid is not None:
+        rep = export_one(db, out, external_id=eid)
     else:
         cap = int(args[1]) if len(args) > 1 else 200
         rep = run_feed(db, out, cap=cap, state_path=_state.default_state_path(), backfill=backfill)

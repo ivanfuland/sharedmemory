@@ -181,6 +181,39 @@ def get_conversation(db_path, conv_id):
     return dict(row) if row else None
 
 
+# 按 external_id（稳定键）精确取一条会话 meta。WHERE 换列，其余与 _GET_ONE_SQL 一致。
+_GET_BY_EID_SQL = """
+SELECT c.id AS id, a.slug AS agent, c.title AS title, w.path AS workspace,
+       c.source_path AS source_path,{idcols}
+       COALESCE(c.started_at, c.last_message_created_at) AS started_at,
+       c.last_message_created_at AS last_ts,
+       COUNT(m.id) AS turns, c.primary_model AS model
+FROM conversations c
+JOIN agents a ON a.id = c.agent_id
+LEFT JOIN workspaces w ON w.id = c.workspace_id
+JOIN messages m ON m.conversation_id = c.id
+WHERE c.external_id = ?
+GROUP BY c.id
+"""
+
+
+def get_conversation_by_external_id(db_path, external_id):
+    """按 external_id（稳定键，Inngest F3 驱动用）取会话 meta。
+    命中 0 → None（与 conv 缺失同路径 → selected=0 → skipped）；
+    命中 >1 → raise（external_id 唯一性只有实测无 DB 约束，绝不静默选一个）；
+    库无 external_id 列（老/合成 schema）→ raise（legacy 库不支持稳定键导出，宁 loud 勿 silent）。"""
+    with closing(_connect(db_path)) as db:
+        have = {r["name"] for r in db.execute("PRAGMA table_info(conversations)")}
+        if "external_id" not in have:
+            raise RuntimeError("get_conversation_by_external_id: schema has no external_id column")
+        rows = db.execute(_GET_BY_EID_SQL.format(idcols=_idcols_sql(db)), (str(external_id),)).fetchall()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise RuntimeError(f"external_id not unique: {external_id!r} matched {len(rows)} conversations")
+    return dict(rows[0])
+
+
 def max_message_ts(db_path, conv_id):
     """该会话消息的 max(created_at)(= 文件真实内容版本;canonical messages.created_at 是毫秒 epoch)。
     read_messages 只返 Msg(idx,role,content) 无 created_at,故 export_one 靠这个取内容版本(codex R7 P1)。"""
