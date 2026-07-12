@@ -70,3 +70,39 @@ def test_get_by_external_id_legacy_schema_fails_loud(tmp_path):
     db.commit(); db.close()
     with pytest.raises(RuntimeError, match="external_id"):
         reader.get_conversation_by_external_id(dbp, "eid-x")
+
+
+def test_export_one_by_external_id_writes_transcript(tmp_path):
+    dbp = str(tmp_path / "c.db"); out = str(tmp_path / "out")
+    _mk_db_eid(dbp, [(7, "codex", "eid-ccc", 3000_000, 6)])
+    rep = export.export_one(dbp, out, external_id="eid-ccc", min_chars=10)
+    assert len(rep["written"]) == 1 and rep["errors"] == []
+    assert rep["exported_ts"] == 3000_000
+
+
+def test_export_one_by_external_id_miss_is_skipped_shape(tmp_path):
+    dbp = str(tmp_path / "c.db"); out = str(tmp_path / "out")
+    _mk_db_eid(dbp, [(7, "codex", "eid-ccc", 3000_000, 6)])
+    rep = export.export_one(dbp, out, external_id="eid-nope", min_chars=10)
+    assert rep == {"written": [], "skipped": [], "errors": [], "total": 0, "exported_ts": None}
+
+
+def test_export_one_selector_exclusive(tmp_path):
+    dbp = str(tmp_path / "c.db"); out = str(tmp_path / "out")
+    _mk_db_eid(dbp, [(7, "codex", "eid-ccc", 3000_000, 6)])
+    with pytest.raises(ValueError):
+        export.export_one(dbp, out, 7, external_id="eid-ccc")
+    with pytest.raises(ValueError):
+        export.export_one(dbp, out)
+
+
+def test_parse_argv_external_id_forms():
+    assert export.parse_argv(["--external-id", "eid-x", "outdir"]) == (None, "eid-x", ["outdir"], False)
+    assert export.parse_argv(["--external-id=eid-y"]) == (None, "eid-y", [], False)
+    assert export.parse_argv(["--conv", "7"]) == ("7", None, [], False)
+    assert export.parse_argv(["out", "20"]) == (None, None, ["out", "20"], False)
+
+
+def test_parse_argv_conv_and_eid_mutually_exclusive():
+    with pytest.raises(ValueError):
+        export.parse_argv(["--conv", "7", "--external-id", "eid-x"])
