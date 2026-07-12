@@ -576,7 +576,14 @@ def leg4(
 
     for table in TABLES_FOR_LEG4:
         prev_entry = prev_tables.get(table) if prev_tables is not None else None
-        prev_max_id = prev_entry["max_id"] if prev_entry is not None else None
+        # rebaseline 下不读旧基线的 max_id（spec §12 B10）：rebaseline 整体丢弃旧基线、
+        # 以当前 db 重建，与 prev 的单调性/前缀比对已被下方 `if not rebaseline` 跳过，
+        # digest_at_prev_max 也算了不用；旧 digest 缺 `max_id` 键时无条件下标会 KeyError
+        # → 经 _safe 变成假 [leg 4] FAIL，误拒合法 rebaseline。置 None 即避开且零行为变化。
+        prev_max_id = (
+            None if rebaseline
+            else (prev_entry["max_id"] if prev_entry is not None else None)
+        )
 
         digest_at_prev_max, digest_at_cur_max, cur_max, cnt = prefix_digests(
             con, table, prev_max_id
@@ -848,7 +855,13 @@ def main(argv: list[str] | None = None) -> int:
     if baseline_error is None and prev_name is not None and not rebaseline:
         baseline_error = _validate_baseline(dest, prev_name, prev_digest)
 
-    if prev_name is None or baseline_error is not None:
+    # rebaseline 下**根本不物化旧基线**（spec §12 B10，完整修）：rebaseline 的语义就是
+    # 丢弃旧基线、以当前 db 重建，腿 3/4 的 rebaseline 分支本就跳过与 prev 的一切比对。
+    # `_validate_rebaseline_target` 只查目录/COMPLETE/tip，不查 digest 内容良构——半成品
+    # 旧基线（缺 census.tsv / `tables` 非 dict / 缺 max_id 键）若被物化，`_read_census_tsv`
+    # 会在下方 `_safe` 之外直接抛（CLI 裸崩），或喂进腿 3/4 触发假 FAIL，误拒合法 rebaseline。
+    # 全置 None 一次根治整类（prev_name 仍保留用于 chain/审计留痕，在别处消费）。
+    if prev_name is None or baseline_error is not None or rebaseline:
         prev_census: dict[str, int | str] | None = None
         prev_fingerprint: str | None = None
         prev_tables: dict[str, dict] | None = None
