@@ -61,9 +61,8 @@ def read_message(row, extra_cols: list[str]) -> dict:
 
     # ⚠️ 绝不在此回落 idx+1（codex R0 P0#3）：created_at 是 ms epoch（1751961600300），
     # idx+1 是小整数（1,2,3）。同一会话混用两种量纲后，batching 的
-    # `want = max(ts, last+1)` 会把小值抬到十七亿，total_skew 瞬间超 max_skew_ms
-    # -> 整条会话被误 quarantine。
-    # 缺失的 ts 留 0，由 `batching.ensure_unique_timestamps` 统一顺延填补（不计 skew）。
+    # `want = max(ts, last+1)` 会把小值抬到十七亿，真实时序被大幅扭曲而无人察觉。
+    # 缺失的 ts 留 0，由 `batching.ensure_unique_timestamps` 统一顺延填补（不当真实 epoch 处理）。
     ts = int(row["created_at"] or 0)
 
     tcid = ex.get("tool_call_id")
