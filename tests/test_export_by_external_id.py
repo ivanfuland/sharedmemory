@@ -151,3 +151,12 @@ def test_parse_argv_valueless_selector_fails_loud():
                  ["--conv", "--external-id", "eid-x"]):
         with pytest.raises(ValueError):
             export.parse_argv(argv)
+
+
+def test_parse_argv_equal_form_accepts_double_dash_value():
+    """等号形对以 -- 开头的合法 external_id 免疫（pi/xagent 会话的 external_id 形如
+    --home-...--/... ——空格形会被 fail-loud 拒绝（值形似 flag），机器调用方（Inngest F3）
+    必须用等号形传参；本用例钉死等号形通道永远畅通。"""
+    assert export.parse_argv(["--external-id=--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", "outdir"]) == \
+        (None, "--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", ["outdir"], False)
+    assert export.parse_argv(["--conv=--weird"]) == ("--weird", None, [], False)
