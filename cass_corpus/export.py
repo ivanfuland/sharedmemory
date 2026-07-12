@@ -253,21 +253,27 @@ def run_feed(db_path, out_dir, cap, state_path, backfill=False):
 def parse_argv(argv):
     """拆 argv → (conv, external_id, positionals, backfill)。
     --conv 与 --external-id 均支持空格形与等号形（等号形不识别会静默走批量 run_feed，codex 复审 P2 同类）；
-    尾随 flag 无值 → None；positional 按位置排除 flag 的值。二者同给 → raise（选择器互斥，fail-loud）。"""
+    尾随 flag 无值、或下一 token 是另一个 flag（`--`开头）→ 均视为缺值 None，不吞下一个 flag（codex PR-D R1 P1：
+    否则会把下一个 flag 当值吃掉，让选择器互斥检查被静默绕过）；positional 按位置排除 flag 的值。
+    二者同给 → raise（选择器互斥，fail-loud）。"""
     conv, eid, positionals, skip_next = None, None, [], False
     for i, a in enumerate(argv):
         if skip_next:
             skip_next = False
             continue
         if a == "--conv":
-            conv = argv[i + 1] if i + 1 < len(argv) else None
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            # 下一 token 是 flag（`--`开头）→ 视为缺值，不吞它（codex PR-D R1 P1：否则会把
+            # 下一个 flag 当成 conv 的值吃掉，让选择器互斥检查被静默绕过）。
+            conv = None if (nxt is not None and nxt.startswith("--")) else nxt
             skip_next = conv is not None
             continue
         if a.startswith("--conv="):
             conv = a.split("=", 1)[1] or None
             continue
         if a == "--external-id":
-            eid = argv[i + 1] if i + 1 < len(argv) else None
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            eid = None if (nxt is not None and nxt.startswith("--")) else nxt
             skip_next = eid is not None
             continue
         if a.startswith("--external-id="):

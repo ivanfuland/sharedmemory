@@ -106,3 +106,9 @@ def test_parse_argv_external_id_forms():
 def test_parse_argv_conv_and_eid_mutually_exclusive():
     with pytest.raises(ValueError):
         export.parse_argv(["--conv", "7", "--external-id", "eid-x"])
+
+
+def test_parse_argv_missing_value_does_not_swallow_next_flag():
+    """selector flag 缺值时不得吞掉下一个 flag（codex PR-D R1 P1：互斥绕过）。"""
+    assert export.parse_argv(["--external-id", "--conv", "7"]) == ("7", None, [], False)
+    assert export.parse_argv(["--conv", "--external-id", "eid-x"]) == (None, "eid-x", [], False)
