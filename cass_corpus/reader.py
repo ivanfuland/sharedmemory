@@ -201,15 +201,25 @@ def get_conversation_by_external_id(db_path, external_id):
     """按 external_id（稳定键，Inngest F3 驱动用）取会话 meta。
     命中 0 → None（与 conv 缺失同路径 → selected=0 → skipped）；
     命中 >1 → raise（external_id 唯一性只有实测无 DB 约束，绝不静默选一个）；
-    库无 external_id 列（老/合成 schema）→ raise（legacy 库不支持稳定键导出，宁 loud 勿 silent）。"""
+    库无 external_id 列（老/合成 schema）→ raise（legacy 库不支持稳定键导出，宁 loud 勿 silent）。
+
+    判重必须在 JOIN messages 之前（codex fresh 审 P2-1）：`_GET_BY_EID_SQL` 用 INNER JOIN
+    messages，0 消息的会话行会被 JOIN 过滤掉。若只靠 JOIN 后的 len(rows) 判重，同 external_id
+    一条 0 消息、一条有消息时，0 消息那行被过滤 → len(rows)==1 → >1 fail-loud 边界失效，
+    函数会静默选中有消息的那条。故先对 conversations 原表做无 JOIN 的 COUNT(*) 判重。"""
     with closing(_connect(db_path)) as db:
         have = {r["name"] for r in db.execute("PRAGMA table_info(conversations)")}
         if "external_id" not in have:
             raise RuntimeError("get_conversation_by_external_id: schema has no external_id column")
+        dup_count = db.execute(
+            "SELECT COUNT(*) AS n FROM conversations WHERE external_id = ?", (str(external_id),)
+        ).fetchone()["n"]
+        if dup_count > 1:
+            raise RuntimeError(f"external_id not unique: {external_id!r} matched {dup_count} conversations")
         rows = db.execute(_GET_BY_EID_SQL.format(idcols=_idcols_sql(db)), (str(external_id),)).fetchall()
     if not rows:
         return None
-    if len(rows) > 1:
+    if len(rows) > 1:  # 双保险：理论上 count 已挡住，留作防御
         raise RuntimeError(f"external_id not unique: {external_id!r} matched {len(rows)} conversations")
     return dict(rows[0])
 
