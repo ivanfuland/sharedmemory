@@ -114,13 +114,17 @@ def test_export_one_selector_exclusive(tmp_path):
 
 
 def test_parse_argv_external_id_forms():
-    assert export.parse_argv(["--external-id", "eid-x", "outdir"]) == (None, "eid-x", ["outdir"], False)
-    assert export.parse_argv(["--external-id=eid-y"]) == (None, "eid-y", [], False)
-    assert export.parse_argv(["--conv", "7"]) == ("7", None, [], False)
-    assert export.parse_argv(["out", "20"]) == (None, None, ["out", "20"], False)
+    assert export.parse_argv(["--external-id", "eid-x", "outdir"]) == ("eid-x", ["outdir"], False)
+    assert export.parse_argv(["--external-id=eid-y"]) == ("eid-y", [], False)
+    # --conv 已退役（2026-07-12）：不再是 selector，落进 unknown-flag fail-loud 分支。
+    with pytest.raises(ValueError):
+        export.parse_argv(["--conv", "7"])
+    assert export.parse_argv(["out", "20"]) == (None, ["out", "20"], False)
 
 
-def test_parse_argv_conv_and_eid_mutually_exclusive():
+def test_parse_argv_conv_and_eid_together_fails_loud():
+    """--conv 已退役：与 --external-id 同给时，--conv 本身即 unknown flag → raise
+    （不再是"选择器互斥"语义，但仍是 fail-loud 负例，保留钉住）。"""
     with pytest.raises(ValueError):
         export.parse_argv(["--conv", "7", "--external-id", "eid-x"])
 
@@ -145,7 +149,9 @@ def test_export_main_cli_stdout_three_line_contract(tmp_path, monkeypatch, capsy
 
 
 def test_parse_argv_valueless_selector_fails_loud():
-    """selector flag 出现但无值 → fail-loud（Ivan 裁决：缺值静默改道比报错更危险）。"""
+    """selector flag 出现但无值 → fail-loud（Ivan 裁决：缺值静默改道比报错更危险）。
+    `--conv`/`--conv=` 项已退役（2026-07-12），保留作为负例：现在经 unknown-flag 分支
+    同样 raise，断言不变。"""
     for argv in (["--conv"], ["--external-id"], ["--conv="], ["--external-id="],
                  ["--external-id", "--conv", "7"], ["--conv", "--backfill"],
                  ["--conv", "--external-id", "eid-x"]):
@@ -158,8 +164,10 @@ def test_parse_argv_equal_form_accepts_double_dash_value():
     --home-...--/... ——空格形会被 fail-loud 拒绝（值形似 flag），机器调用方（Inngest F3）
     必须用等号形传参；本用例钉死等号形通道永远畅通。"""
     assert export.parse_argv(["--external-id=--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", "outdir"]) == \
-        (None, "--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", ["outdir"], False)
-    assert export.parse_argv(["--conv=--weird"]) == ("--weird", None, [], False)
+        ("--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", ["outdir"], False)
+    # --conv= 已退役：等号形同样落进 unknown-flag fail-loud 分支。
+    with pytest.raises(ValueError):
+        export.parse_argv(["--conv=--weird"])
 
 
 def test_parse_argv_unknown_flag_fails_loud():
@@ -167,7 +175,7 @@ def test_parse_argv_unknown_flag_fails_loud():
     for argv in (["--external_id=eid-x"], ["--Conv", "7"], ["--extra-flag", "outdir"]):
         with pytest.raises(ValueError):
             export.parse_argv(argv)
-    assert export.parse_argv(["--backfill"]) == (None, None, [], True)  # 唯一合法裸 flag 不受影响
+    assert export.parse_argv(["--backfill"]) == (None, [], True)  # 唯一合法裸 flag 不受影响
 
 
 def test_parse_argv_space_form_double_dash_value_fails_loud():
@@ -179,6 +187,6 @@ def test_parse_argv_space_form_double_dash_value_fails_loud():
 def test_parse_argv_space_form_empty_string_policy():
     """空格形空串值当前语义 = 接受空串（export_one miss → total=0 → skipped 路径，无害不滑批量）；
     等号形空串 = 缺值 raise。钉死两者差异（codex 联审 P2-1 显式化）。"""
-    assert export.parse_argv(["--external-id", "", "outdir"]) == (None, "", ["outdir"], False)
+    assert export.parse_argv(["--external-id", "", "outdir"]) == ("", ["outdir"], False)
     with pytest.raises(ValueError):
         export.parse_argv(["--external-id="])

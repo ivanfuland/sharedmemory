@@ -251,44 +251,38 @@ def run_feed(db_path, out_dir, cap, state_path, backfill=False):
 
 
 def parse_argv(argv):
-    """拆 argv → (conv, external_id, positionals, backfill)。
-    --conv 与 --external-id 均支持空格形与等号形（等号形不识别会静默走批量 run_feed，codex 复审 P2 同类）；
-    positional 按位置排除 flag 的值。
+    """拆 argv → (external_id, positionals, backfill)。
+    --external-id 支持空格形与等号形（等号形对以 `--` 开头的值免疫；空格形遇下一 token 是
+    另一个 flag 时视为缺值，不吞它）。positional 按位置排除 flag 的值。
 
-    selector flag（--conv / --external-id）出现但取不到值 → 一律 raise ValueError（fail-loud，
+    selector flag（--external-id）出现但取不到值 → 一律 raise ValueError（fail-loud，
     Ivan 裁决 2026-07-12，取代此前"缺值→None"的旧语义）。覆盖三种形态：尾随无值
-    （`["--conv"]`）、下一 token 是另一个 flag（`["--external-id","--conv","7"]`）、等号空值
-    （`["--conv="]`）。理由：缺值→None 会静默改道——例如 `--external-id --backfill /out`
-    本意是单条导出却因缺值悄悄跑成批量 backfill、推进水位线。selector flag 出现本身就表达了
-    "单条导出"意图，此时缺值只可能是操作者失误，不该被静默吞成"当作没给"。F3 机器调用路径
-    永远带值，不受此收紧影响。
-    二者同给 → raise（选择器互斥，fail-loud）。
+    （`["--external-id"]`）、下一 token 是另一个 flag、等号空值（`["--external-id="]`）。
+    理由：缺值→None 会静默改道——例如 `--external-id --backfill /out` 本意是单条导出却因
+    缺值悄悄跑成批量 backfill、推进水位线。selector flag 出现本身就表达了"单条导出"意图，
+    此时缺值只可能是操作者失误，不该被静默吞成"当作没给"。F3 机器调用路径永远带值，不受此
+    收紧影响。
 
     未知 `--*` flag（含拼写错误，如 `--external_id=` 下划线误用 `--external-id`）一律 raise，
     不再静默忽略——静默忽略会让打错字的 selector 悄悄滑进批量 run_feed（codex 联审 P1-1，
-    第三种静默滑批量形态，继上面两种缺值 / 等号形之后）。唯一例外是 `--backfill`：它在函数末尾
-    单独按 `"--backfill" in argv` 判定，不受此分支影响，继续被忽略（即不会落进 unknown-flag 分支）。"""
-    conv, eid, positionals, skip_next = None, None, [], False
-    conv_seen = eid_seen = False
+    第三种静默滑批量形态）。唯一例外是 `--backfill`：它在函数末尾单独按 `"--backfill" in argv`
+    判定，不受此分支影响，继续被忽略（即不会落进 unknown-flag 分支）。
+
+    `--conv`/`--conv=` CLI 入口已于 2026-07-12 退役（Ivan 拍板）：rowid 跨 CASS 重建会全量
+    重发号，不再可作外部驱动键，现在一律落进 unknown-flag fail-loud 分支。rowid 调试需求
+    改走：先查出对应的 external_id 后用 `--external-id=` CLI 入口；或在代码里直接调用
+    `export_one(conv_id=...)` 函数（该入口保留，供测试与内部调试用）。"""
+    eid, positionals, skip_next = None, [], False
+    eid_seen = False
     for i, a in enumerate(argv):
         if skip_next:
             skip_next = False
             continue
-        if a == "--conv":
-            conv_seen = True
-            nxt = argv[i + 1] if i + 1 < len(argv) else None
-            # 下一 token 是 flag（`--`开头）→ 视为缺值；不吞它（否则会把下一个 flag 当成
-            # conv 的值吃掉，让选择器互斥检查被静默绕过）。
-            conv = None if (nxt is not None and nxt.startswith("--")) else nxt
-            skip_next = conv is not None
-            continue
-        if a.startswith("--conv="):
-            conv_seen = True
-            conv = a.split("=", 1)[1] or None
-            continue
         if a == "--external-id":
             eid_seen = True
             nxt = argv[i + 1] if i + 1 < len(argv) else None
+            # 下一 token 是 flag（`--`开头）→ 视为缺值；不吞它（否则会把下一个 flag 当成
+            # external-id 的值吃掉）。
             eid = None if (nxt is not None and nxt.startswith("--")) else nxt
             skip_next = eid is not None
             continue
@@ -301,23 +295,17 @@ def parse_argv(argv):
                 continue
             raise ValueError(f"parse_argv: unknown flag {a!r}")
         positionals.append(a)
-    if conv_seen and conv is None:
-        raise ValueError("parse_argv: --conv/--external-id requires a value")
     if eid_seen and eid is None:
-        raise ValueError("parse_argv: --conv/--external-id requires a value")
-    if conv is not None and eid is not None:
-        raise ValueError("parse_argv: --conv and --external-id are mutually exclusive")
-    return conv, eid, positionals, ("--backfill" in argv)
+        raise ValueError("parse_argv: --external-id requires a value")
+    return eid, positionals, ("--backfill" in argv)
 
 
 def main():
-    conv, eid, args, backfill = parse_argv(sys.argv[1:])
+    eid, args, backfill = parse_argv(sys.argv[1:])
     db = os.environ.get("CASS_CANON_DB",
                         os.path.expanduser("~/.local/share/coding-agent-search/agent_search.db"))
     out = args[0] if len(args) > 0 else os.path.expanduser("~/.local/share/gbrain/cass-transcripts-poc")
-    if conv is not None:
-        rep = export_one(db, out, int(conv))
-    elif eid is not None:
+    if eid is not None:
         rep = export_one(db, out, external_id=eid)
     else:
         cap = int(args[1]) if len(args) > 1 else 200
