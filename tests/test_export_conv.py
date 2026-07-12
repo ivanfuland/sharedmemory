@@ -1,5 +1,6 @@
 # tests/test_export_conv.py
-# export --conv <id> 单条精确导出（Inngest F3 逐条驱动用）。TDD：先失败。
+# export_one(conv_id=...) 单条精确导出函数入口（保留供测试/内部调试用；CLI `--conv` 已于
+# 2026-07-12 退役，见下方 CLI arg parsing 区块的负例）。
 # 全合成数据（PUBLIC 仓隐私）。messages 带 created_at（毫秒 epoch）以验 max_message_ts / exported_ts。
 import os
 import sqlite3
@@ -77,33 +78,35 @@ def test_export_one_too_short_is_skipped(tmp_path):
 
 
 # --- CLI arg parsing (codex 复审 P2 + adapter reviewer coverage gap) ---
+# `--conv` CLI 入口已于 2026-07-12 退役（Ivan 拍板：rowid 跨 CASS 重建会全量重发号，不再可
+# 作外部驱动键）。以下用例迁移为负例——`--conv`/`--conv=` 一律落进 unknown-flag fail-loud
+# 分支，断言统一 raises。`export_one(conv_id=...)` 函数入口本身保留（测试见上方各 test_export_one_*）。
 
 def test_parse_argv_space_form():
-    conv, eid, pos, bf = export.parse_argv(["/out", "--conv", "1898"])
-    assert conv == "1898" and pos == ["/out"] and bf is False
+    with pytest.raises(ValueError):
+        export.parse_argv(["/out", "--conv", "1898"])
 
 
 def test_parse_argv_equals_form():
-    # codex 复审 P2：等号形必须识别（否则静默走批量 run_feed 推进水位线）
-    conv, eid, pos, bf = export.parse_argv(["/out", "--conv=1898"])
-    assert conv == "1898" and pos == ["/out"]
+    with pytest.raises(ValueError):
+        export.parse_argv(["/out", "--conv=1898"])
 
 
 def test_parse_argv_no_conv_is_batch():
-    conv, eid, pos, bf = export.parse_argv(["/out", "50", "--backfill"])
-    assert conv is None and pos == ["/out", "50"] and bf is True
+    eid, pos, bf = export.parse_argv(["/out", "50", "--backfill"])
+    assert eid is None and pos == ["/out", "50"] and bf is True
 
 
 def test_parse_argv_trailing_conv_no_value():
-    # 尾随无值 → fail-loud（Ivan 裁决：缺值静默改道比报错更危险）
+    # --conv 已退役：尾随无值同样 fail-loud（经 unknown-flag 分支，非旧"缺值"分支）。
     with pytest.raises(ValueError):
         export.parse_argv(["/out", "--conv"])
 
 
 def test_parse_argv_out_dir_equal_conv_value():
-    # 按位置排除 --conv 值：out_dir 字符串恰等于 conv-id 也不被误吞
-    conv, eid, pos, bf = export.parse_argv(["1898", "--conv", "1898"])
-    assert conv == "1898" and pos == ["1898"]
+    # --conv 已退役：out_dir 字符串恰等于旧 conv-id 值时同样 fail-loud（unknown flag）。
+    with pytest.raises(ValueError):
+        export.parse_argv(["1898", "--conv", "1898"])
 
 
 # ── 迁移守卫:拒绝把新命名刷进含旧 rowid 命名的目录（codex PR#41 P1）──
