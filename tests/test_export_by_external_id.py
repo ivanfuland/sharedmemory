@@ -1,7 +1,6 @@
 # tests/test_export_by_external_id.py
 # adapter 按 external_id（稳定键）导出。全合成数据（PUBLIC 仓隐私）。TDD：先失败。
 import os
-import re
 import sqlite3
 import sys
 
@@ -137,9 +136,12 @@ def test_export_main_cli_stdout_three_line_contract(tmp_path, monkeypatch, capsy
     export.main()
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == f"out_dir={out_dir}"
-    assert re.match(r"^written=\d+  skipped=\d+  errors=\d+  of \d+ selected$", lines[1])
-    assert lines[1].startswith("written=1  ")  # 长会话过 min_chars=2000 默认门，确认真 written
-    assert lines[2].startswith("exported_ts=")
+    assert lines[1] == "written=1  skipped=0  errors=0  of 1 selected"
+    assert lines[2] == "exported_ts=3000000"  # 合成会话 last_ts=3000_000，恰是 max message ts
+    # written 明细行契约（F3 靠它解析文件名）：written>0 时每个文件一行，两空格缩进 + .md 文件名。
+    assert len(lines) == 4
+    assert lines[3].startswith("  ")
+    assert ".md" in lines[3]
 
 
 def test_parse_argv_valueless_selector_fails_loud():
