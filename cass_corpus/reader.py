@@ -9,6 +9,20 @@ import msgpack
 
 from cass_corpus.pruner import Msg
 
+# 公开 API：extra 解析三件套(extra_dict / EXTRA_COLS / coerce_tool_call_id)供 EverOS adapter
+# 及未来消费者 import;其余为既有公开会话读取函数。
+__all__ = [
+    "extra_dict",
+    "EXTRA_COLS",
+    "coerce_tool_call_id",
+    "select_conversations",
+    "max_conversation_cursor",
+    "read_messages",
+    "get_conversation",
+    "get_conversation_by_external_id",
+    "max_message_ts",
+]
+
 # 注:CASS 的 user_message_count/assistant_message_count 列普遍未填(NULL),
 # 故用 COUNT(m.id) 真实消息数做轻量"实质性"floor;日期用 started_at,空则回退 last_message_created_at。
 # 不按 agent 筛(归一化=统一格式;"值不值得记"交 gbrain 显著性闸逐会话判,agent 仅作 provenance 元数据)。
@@ -36,6 +50,9 @@ LIMIT ?
 # 二者互斥。只读 extra_json 会漏掉全部真实配对信息(实测真库 129734 条 tool 类消息里
 # `extra_json LIKE '%tool_call_id%'` 命中 0 条,而解 extra_bin 拿到 126680 条 = 97.6%)。
 _EXTRA_COLS = ("extra_bin", "extra_json")
+
+# 公开名:schema 探测助手(消费者据此判库里有哪些 extra 列)。
+EXTRA_COLS = _EXTRA_COLS
 
 # 稳定会话身份的来源列。老/合成 schema(既有 export_conv / incremental fixture)没有这两列
 # → 探测后不选,render 走 legacy 回退(codex plan R0 P0:不得因缺列崩)。
@@ -78,6 +95,18 @@ def _extra_dict(row, extra_cols):
         if isinstance(d, dict):
             return d
     return None
+
+
+# 公开名:_extra_dict 的实现别名(既有内部调用仍用 _extra_dict,不破)。
+extra_dict = _extra_dict
+
+
+def coerce_tool_call_id(tcid) -> "str | None":
+    """把 extra 里的 tool_call_id 收紧成 Optional[str](codex 复审 P2)。
+    Msg 契约是 Optional[str];非字符串(bytes/int)或空串 → None
+    (否则 render 会把它渲染成 `[#b'abc']`,宁可当没有)。"""
+    return tcid if isinstance(tcid, str) and tcid else None
+
 
 # 按 id 精确取一条会话 meta（export_one 单条导出用）。列映射与 _SELECT_SQL 一致；
 # JOIN messages + GROUP BY → 0 消息/不存在会话返回无行（None）。不设 min_turns floor（显著性交 min_chars）。
@@ -163,10 +192,8 @@ def read_messages(db_path, conv_id):
     parsed = []
     for r in rows:
         d = _extra_dict(r, extra_cols) or {}
-        # 类型收紧(codex 复审 P2)：Msg 契约是 Optional[str]。
-        # `tool_call_id` 非字符串(bytes/int) → render 会渲染成 `[#b'abc']`，宁可当没有。
-        tcid = d.get("tool_call_id")
-        parsed.append((r, tcid if isinstance(tcid, str) and tcid else None))
+        # 类型收紧(codex 复审 P2)：Msg 契约是 Optional[str]。见 coerce_tool_call_id。
+        parsed.append((r, coerce_tool_call_id(d.get("tool_call_id"))))
 
     call_ids = {t for r, t in parsed if r["role"] == "tool_call" and t}
     return [Msg(idx=r["idx"], role=r["role"], content=r["content"] or "", tool_call_id=t,
