@@ -507,6 +507,44 @@ def test_baseline_rebaseline_escape_hatch_bypasses_validation(gate_baseline, tmp
     assert gate["rebaselined_from"] == "cass-baseline"
 
 
+@requires_cass
+def test_rebaseline_with_halfbaked_prev_baseline_not_falsely_rejected_b10(
+    gate_baseline, tmp_path
+):
+    """B10 完整修（codex adversarial-review 补，超出 spec §12 B10 的窄描述）：
+    `_validate_rebaseline_target` 只查目录/COMPLETE/tip，**不查 digest 内容良构**，
+    故一份半成品旧基线（这里删掉 `census.tsv`，generation/COMPLETE/tip 仍合法）能过
+    target 校验。修复前 `main()` 在 rebaseline 下仍物化旧基线——`_read_census_tsv(...)`
+    在顶层 `_safe` **之外**直接抛 `FileNotFoundError` → CLI 裸崩（rc≠0），**误拒一次
+    合法 rebaseline**（rebaseline 的全部意义就是丢弃旧基线）。
+
+    根因修：rebaseline 下不物化旧基线（`main()` 把 prev_census/fingerprint/tables/
+    watermarks 全置 None，只留 prev_name 审计）。断言：缺 `census.tsv` 的旧基线 + 合法
+    当前 db 的 rebaseline 照常跑通（rc==0、五腿 PASS、`rebaselined_from` 落盘），不崩不误 FAIL。
+
+    与 `test_baseline_rebaseline_escape_hatch_bypasses_validation` 的区别：那条删的是
+    digest **内部**一个键（prev 仍是完整可读结构，修前也 PASS）；本条删的是**整个
+    census.tsv 文件**（触发 `_read_census_tsv` 的 _safe 外崩溃，修前 rc≠0）。
+    """
+    db, dest = gate_baseline
+    (dest / "cass-baseline" / "census.tsv").unlink()
+
+    out_census = tmp_path / "census2.tsv"
+    out_gate = tmp_path / "gate2.json"
+    rc, out, err = _run_cli(
+        db, dest, out_census, out_gate,
+        rebaseline="cass-baseline",
+        rebaseline_reason="半成品旧基线（缺 census.tsv）逃生门回归 B10",
+    )
+
+    assert rc == 0, f"合法 rebaseline 不该被半成品旧基线误拒/崩溃\nstdout={out}\nstderr={err}"
+    assert "[baseline] FAIL" not in out, out
+    for i in range(5):
+        assert f"[leg {i}] PASS" in out, out
+    gate = json.loads(out_gate.read_bytes())
+    assert gate["rebaselined_from"] == "cass-baseline"
+
+
 # ---------------------------------------------------------------------------
 # codex R4-P0：基线选择 strict——真实 tip 不可读时绝不静默退回更老基线放行。
 # ---------------------------------------------------------------------------

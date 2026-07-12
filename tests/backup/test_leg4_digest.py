@@ -719,3 +719,56 @@ def test_leg4_parse_uint_rejects_dollar_anchor_edge_cases_v5d2():
 
 def test_required_watermark_keys_matches_fixture_factory_list():
     assert set(REQUIRED_LEG4_WATERMARK_KEYS) == set(fixture_factory.REQUIRED_META_KEYS)
+
+
+# ---------------------------------------------------------------------------
+# B10（codex R10-P2，fail-closed 误拒）：rebaseline 下不该读旧基线的 tables.*.max_id
+# ---------------------------------------------------------------------------
+
+
+@requires_cass
+def test_rebaseline_prev_tables_missing_max_id_does_not_falsely_fail_b10(synth_dd):
+    """rebaseline 模式下，旧基线 `digest.json` 的 `tables[表]` entry 缺 `max_id` 键
+    （老格式 / 半成品 digest）时，`leg4` 曾无条件 `prev_entry["max_id"]` 下标 → KeyError
+    → 经 `_safe` 变成假 `[leg 4] FAIL`，**误拒一次合法 rebaseline**。而 rebaseline 的
+    全部意义就是丢弃旧基线、以当前 db 重建，本就不该读旧基线的 max_id（与 prev 的
+    单调性/前缀比对已被 `if not rebaseline` 跳过）。
+
+    修法（spec §12 B10）：rebaseline 下 `prev_max_id` 置 `None`。断言：给一份缺 `max_id`
+    的 prev + `rebaseline=True`，`leg4` 不抛异常且 `ok is True`（gap 自检与必需水位键
+    存在照跑，只是与旧基线的比对整体跳过）；今晚的 tables 摘要照常算出。
+
+    与 `test_baseline_digest_missing_tables_messages_fails` 的区别：那条是**非 rebaseline**
+    且**整表 entry 缺失**（`.get()`→None，须被 baseline 结构校验拦下）；本条是 entry 存在
+    但缺 `max_id` 键、且在 rebaseline 模式（合法放行，不是拦截）。
+    """
+    db = synth_dd / "agent_search.db"
+
+    con = sqlite3.connect(str(db))
+    try:
+        baseline = leg4(con, prev_tables=None, prev_watermarks=None)
+    finally:
+        con.close()
+    assert baseline.ok is True, f"前置：干净合成库首晚登记应 PASS: {baseline.detail}"
+
+    # 模拟老/残缺基线：每张表 entry 挖掉 `max_id` 键（entry 仍在）。
+    prev_tables_no_max_id = {
+        table: {k: v for k, v in entry.items() if k != "max_id"}
+        for table, entry in baseline.tables.items()
+    }
+    assert all("max_id" not in e for e in prev_tables_no_max_id.values())
+
+    con = sqlite3.connect(str(db))
+    try:
+        # 修复前：line 579 `prev_entry["max_id"]` 直接抛 KeyError（此直调不经 _safe）。
+        result = leg4(
+            con,
+            prev_tables_no_max_id,
+            baseline.meta_watermarks,
+            rebaseline=True,
+        )
+    finally:
+        con.close()
+
+    assert result.ok is True, f"合法 rebaseline 不该被误拒: {result.detail}"
+    assert result.tables == baseline.tables, "rebaseline 仍应算出今晚全量 tables 摘要"
