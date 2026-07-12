@@ -95,8 +95,9 @@ def test_parse_argv_no_conv_is_batch():
 
 
 def test_parse_argv_trailing_conv_no_value():
-    conv, eid, pos, bf = export.parse_argv(["/out", "--conv"])  # 尾随无值 → None，不崩
-    assert conv is None and pos == ["/out"]
+    # 尾随无值 → fail-loud（Ivan 裁决：缺值静默改道比报错更危险）
+    with pytest.raises(ValueError):
+        export.parse_argv(["/out", "--conv"])
 
 
 def test_parse_argv_out_dir_equal_conv_value():
