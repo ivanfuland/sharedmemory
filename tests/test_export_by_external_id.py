@@ -1,6 +1,8 @@
 # tests/test_export_by_external_id.py
 # adapter 按 external_id（稳定键）导出。全合成数据（PUBLIC 仓隐私）。TDD：先失败。
+import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -55,6 +57,16 @@ def test_get_by_external_id_duplicate_fails_loud(tmp_path):
         reader.get_conversation_by_external_id(dbp, "eid-dup")
 
 
+def test_get_by_external_id_duplicate_with_zero_msg_row_fails_loud(tmp_path):
+    """P2-1（codex fresh 审）：判重必须在 JOIN messages 之前。旧实现按 JOIN 后的
+    len(rows) 判重——0 消息的一条会被 INNER JOIN messages 过滤掉，同 external_id
+    一条 0 消息、一条有消息时，>1 fail-loud 边界失效，函数会静默选中有消息那条。"""
+    dbp = str(tmp_path / "c.db")
+    _mk_db_eid(dbp, [(1, "codex", "eid-dup", 1000_000, 0), (2, "codex", "eid-dup", 2000_000, 5)])
+    with pytest.raises(RuntimeError, match="eid-dup"):
+        reader.get_conversation_by_external_id(dbp, "eid-dup")
+
+
 def test_get_by_external_id_legacy_schema_fails_loud(tmp_path):
     """老/合成 schema 无 external_id 列 → 显式 raise，不静默返回 None。"""
     dbp = str(tmp_path / "legacy.db")
@@ -78,6 +90,11 @@ def test_export_one_by_external_id_writes_transcript(tmp_path):
     rep = export.export_one(dbp, out, external_id="eid-ccc", min_chars=10)
     assert len(rep["written"]) == 1 and rep["errors"] == []
     assert rep["exported_ts"] == 3000_000
+    # 身份锚（codex fresh 审 P2-2a）：防"选错会话仍绿"——written 的文件必须真是
+    # eid-ccc 那条会话的 transcript，不是同名巧合或误选的别的会话。
+    fn = rep["written"][0][0]
+    text = open(os.path.join(out, fn), encoding="utf-8").read()
+    assert "external_id: eid-ccc" in text.splitlines()
 
 
 def test_export_one_by_external_id_miss_is_skipped_shape(tmp_path):
@@ -108,7 +125,60 @@ def test_parse_argv_conv_and_eid_mutually_exclusive():
         export.parse_argv(["--conv", "7", "--external-id", "eid-x"])
 
 
-def test_parse_argv_missing_value_does_not_swallow_next_flag():
-    """selector flag 缺值时不得吞掉下一个 flag（codex PR-D R1 P1：互斥绕过）。"""
-    assert export.parse_argv(["--external-id", "--conv", "7"]) == ("7", None, [], False)
-    assert export.parse_argv(["--conv", "--external-id", "eid-x"]) == (None, "eid-x", [], False)
+def test_export_main_cli_stdout_three_line_contract(tmp_path, monkeypatch, capsys):
+    """CLI stdout 契约锚（codex fresh 审 P2-2b）：下游 Inngest F3 靠这三行 stdout 解析
+    out_dir / written-skipped-errors-total / exported_ts。钉死格式，防止 main() 改动
+    悄悄破坏下游解析。"""
+    dbp = str(tmp_path / "c.db"); out_dir = str(tmp_path / "out")
+    _mk_db_eid(dbp, [(7, "codex", "eid-ccc", 3000_000, 6)])
+    monkeypatch.setenv("CASS_CANON_DB", dbp)
+    monkeypatch.setattr(sys, "argv", ["prog", "--external-id", "eid-ccc", str(out_dir)])
+    export.main()
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"out_dir={out_dir}"
+    assert lines[1] == "written=1  skipped=0  errors=0  of 1 selected"
+    assert lines[2] == "exported_ts=3000000"  # 合成会话 last_ts=3000_000，恰是 max message ts
+    # written 明细行契约（F3 靠它解析文件名）：written>0 时每个文件一行，两空格缩进 + .md 文件名。
+    assert len(lines) == 4
+    assert lines[3].startswith("  ")
+    assert ".md" in lines[3]
+
+
+def test_parse_argv_valueless_selector_fails_loud():
+    """selector flag 出现但无值 → fail-loud（Ivan 裁决：缺值静默改道比报错更危险）。"""
+    for argv in (["--conv"], ["--external-id"], ["--conv="], ["--external-id="],
+                 ["--external-id", "--conv", "7"], ["--conv", "--backfill"],
+                 ["--conv", "--external-id", "eid-x"]):
+        with pytest.raises(ValueError):
+            export.parse_argv(argv)
+
+
+def test_parse_argv_equal_form_accepts_double_dash_value():
+    """等号形对以 -- 开头的合法 external_id 免疫（pi/xagent 会话的 external_id 形如
+    --home-...--/... ——空格形会被 fail-loud 拒绝（值形似 flag），机器调用方（Inngest F3）
+    必须用等号形传参；本用例钉死等号形通道永远畅通。"""
+    assert export.parse_argv(["--external-id=--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", "outdir"]) == \
+        (None, "--home-x--/2026-04-26T23-27-34-625Z_abc.jsonl", ["outdir"], False)
+    assert export.parse_argv(["--conv=--weird"]) == ("--weird", None, [], False)
+
+
+def test_parse_argv_unknown_flag_fails_loud():
+    """未知 --flag（含 selector 拼写错误）一律 fail-loud——第三种静默滑批量形态（codex 联审 P1-1）。"""
+    for argv in (["--external_id=eid-x"], ["--Conv", "7"], ["--extra-flag", "outdir"]):
+        with pytest.raises(ValueError):
+            export.parse_argv(argv)
+    assert export.parse_argv(["--backfill"]) == (None, None, [], True)  # 唯一合法裸 flag 不受影响
+
+
+def test_parse_argv_space_form_double_dash_value_fails_loud():
+    """空格形 + -- 开头值 → raise（负例钉死，防未来把坏路径放回静默 batch；codex 联审 P2-2）。"""
+    with pytest.raises(ValueError):
+        export.parse_argv(["--external-id", "--home-x--/y.jsonl", "outdir"])
+
+
+def test_parse_argv_space_form_empty_string_policy():
+    """空格形空串值当前语义 = 接受空串（export_one miss → total=0 → skipped 路径，无害不滑批量）；
+    等号形空串 = 缺值 raise。钉死两者差异（codex 联审 P2-1 显式化）。"""
+    assert export.parse_argv(["--external-id", "", "outdir"]) == (None, "", ["outdir"], False)
+    with pytest.raises(ValueError):
+        export.parse_argv(["--external-id="])
