@@ -82,6 +82,12 @@ def test_recorded_sig_b_parses_to_known_shape():
         ),
         pytest.param("ok\nok\n", "", 0, "FAIL", id="sig-a-extra-lines-fails"),
         pytest.param("", "", 0, "FAIL", id="empty-stdout-fails"),
+        # 承重回归门（勿动，勿加 B2）：B 形状 stdout（全 `Page N: never used`）+ 干净 stderr
+        # + exit 0 → **必须 FAIL**。`Page N: never used` 不是无条件良性——它也可能是某表
+        # sqlite_master 目录项被删后数据页不可达（真数据丢失，见
+        # test_gate_cli.py::test_attack1_meta_missing_v4 的 writable_schema 攻击）。签名 B
+        # 要求 malformed stderr 正是把这形态 fail-closed。2026-07-14 曾试图加 B2 放行此形态，
+        # codex 对抗审判为 P0（会把 attack1 翻成 leg1 PASS），已撤销。见 spec 2026-07-14。
         pytest.param(
             _SIG_B_STDOUT, "", 0, "FAIL", id="sig-b-shape-clean-stderr-fails"
         ),
@@ -140,3 +146,29 @@ def test_leg0_fails_when_conversations_emptied(synth_dd):
 def test_run_integrity_check_on_synth_dd_is_signature_a(synth_dd):
     stdout, stderr, exit_code = run_integrity_check(synth_dd / "agent_search.db")
     assert classify_integrity(stdout, stderr, exit_code) == "A"
+
+
+def test_run_integrity_check_uses_raised_error_cap(monkeypatch, tmp_path):
+    """回归门（2026-07-14 事故根因）：`run_integrity_check` 必须显式抬高 integrity_check
+    错误上限，绕开 SQLite 默认 100 上限的截断——泄漏页 ≥100 时默认上限会在 integrity_check
+    走到 fts_messages_config 的 malformed abort **之前**截断，把良性库误判成「干净 never
+    used」而 FAIL。pin 住 PRAGMA 参数，防有人回退成裸 `PRAGMA integrity_check`。hermetic：
+    monkeypatch `subprocess.run` 抓 argv，不真跑 sqlite3。"""
+    import cass_backup_gate as g
+
+    captured: dict = {}
+
+    class _Res:
+        stdout, stderr, returncode = "ok\n", "", 0
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _Res()
+
+    monkeypatch.setattr(g.subprocess, "run", _fake_run)
+    db = tmp_path / "x.db"
+    db.write_bytes(b"")  # 存在即可；run 被 mock，不真读
+    g.run_integrity_check(db)
+
+    assert g._INTEGRITY_CHECK_MAX_ERRORS >= 100_000, "上限必须远超 SQLite 默认 100"
+    assert captured["cmd"][-1] == f"PRAGMA integrity_check({g._INTEGRITY_CHECK_MAX_ERRORS});"
