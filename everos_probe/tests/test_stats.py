@@ -145,6 +145,32 @@ def test_compute_overall_falls_back_to_bootstrap_for_small_stratum():
     assert out["ci_lower"] <= out["weighted_pass_rate"] <= out["ci_upper"]
 
 
+def test_compute_overall_bootstrap_ci_has_nonzero_width_on_mixed_sample():
+    # STAT-CRITICAL 反证:退化 bootstrap fixture(全 pass 或全 fail)无论 bootstrap_ci 是否
+    # 真在重抽样都会塌缩成同一个点估计,测不出"重抽样行是否真的在重抽样"。这里用单层、
+    # 有 pass 也有 fail 的混合样本(4 pass / 4 fail,n=8 < floor=9 触发 bootstrap 分支),
+    # 断言 CI 严格正宽度 + 数值对照参考实现(同一份"公式已验算正确"的 stats.py 跑出的
+    # 期望值,容差覆盖浮点/百分位取整的合理抖动)。若 bootstrap_ci 里的重抽样行被误改成
+    # 不重采样(如 `resample = list(obs)`),lo/hi 会双双塌缩到 p_hat=0.5,本测试会变红——
+    # 这正是本测试要守住的回归。
+    outcomes = (
+        [{"stratum": "a", "status": "passed"}] * 4
+        + [{"stratum": "a", "status": "structural_reject"}] * 4
+    )
+    w_raw = {"a": 1.0}
+    out = stats.compute_overall(outcomes, w_raw, floor=9)   # n_a=8 < floor(9)
+    assert out["ci_method"] == "bootstrap"
+    width = out["ci_upper"] - out["ci_lower"]
+    assert width > 0.0
+    # 参考实现(当前 stats.py,固定 seed=20260713,n_boot=2000)手算得到的期望值：
+    # p_hat=0.5, ci_lower≈0.125, ci_upper≈0.875, width≈0.75。容差 0.05 吸收无关的实现
+    # 细节抖动，但远小于"塌缩成点估计"(width=0)与"真在重抽样"(width≈0.75)之间的差距。
+    assert out["weighted_pass_rate"] == pytest.approx(0.5, abs=0.05)
+    assert out["ci_lower"] == pytest.approx(0.125, abs=0.05)
+    assert out["ci_upper"] == pytest.approx(0.875, abs=0.05)
+    assert width == pytest.approx(0.75, abs=0.1)
+
+
 def test_aggregate_fed_outcomes_raises_on_unrecognized_status():
     # 未知/拼写错的 status（既不在 FED_STATUSES 也不在 UNOBSERVED_STATUSES）曾被静默跳过
     # ——喂料层的一个 typo 就会让样本悄悄消失而不报错。必须 fail-loud。
@@ -160,6 +186,17 @@ def test_compute_overall_raises_on_stratum_label_not_in_w_raw():
     outcomes = [{"stratum": "claude_code|typo-bucket", "status": "passed"}]
     w_raw = {"claude_code|<3": 1.0}
     with pytest.raises(ValueError):
+        stats.compute_overall(outcomes, w_raw, floor=5)
+
+
+def test_compute_overall_raises_on_zero_weight_stratum_with_observations():
+    # w_raw[s]==0 = "库中本就不存在该层"，理论上不该收到任何 fed 观测(spec §4)；若真收到了
+    # (n>0)，多半是 sampling↔classification 两层各自独立判定"这条属于哪层"时的 stratum
+    # 标签漂移。曾被 reweight_for_zero_observed 静默按权重 0 丢样本(既不算 coverage gap，
+    # 也不报错)——跟 unknown_strata 的 fail-loud 纪律不对称。必须 fail-loud。
+    outcomes = [{"stratum": "b", "status": "passed"}]
+    w_raw = {"a": 1.0, "b": 0.0}   # b 在库中权重为 0，却收到了观测
+    with pytest.raises(ValueError, match="w_raw==0"):
         stats.compute_overall(outcomes, w_raw, floor=5)
 
 

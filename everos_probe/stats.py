@@ -166,6 +166,18 @@ def compute_overall(outcomes: list, w_raw: dict, floor: int = 5) -> dict:
             f"stratum label(s) present in outcomes but not in w_raw: {sorted(unknown_strata)} "
             f"(w_raw keys: {sorted(w_raw)}) — fix the stratum string upstream, do not silently drop"
         )
+    # w_raw[s]==0 格代表"库中本就不存在该层"，理论上不该收到任何 fed 观测（spec §4）。
+    # 若真的收到了(n>0)，多半是 sampling↔classification 之间 stratum 字符串标签漂移
+    # （两层各自独立判定"这条属于哪层"，标签不一致）。跟 unknown_strata 同等纪律：
+    # 不静默把这些样本按权重 0 丢掉、悄悄从 rate 里消失，fail-loud 逼上游查漂移。
+    zero_weight_but_observed = sorted(s for s in n if w_raw.get(s, 0) == 0 and n[s] > 0)
+    if zero_weight_but_observed:
+        raise ValueError(
+            f"stratum label(s) {zero_weight_but_observed} have w_raw==0 (library says this "
+            f"stratum does not exist) but received fed observations (n>0) — this indicates a "
+            f"sampling/classification stratum-label drift upstream; fix the stratum string, "
+            f"do not silently drop these observations by letting them collapse to weight 0"
+        )
     n_full = {s: n.get(s, 0) for s in w_raw}
     k_full = {s: k.get(s, 0) for s in w_raw}
     gap = coverage_gap_strata(w_raw, n_full)
