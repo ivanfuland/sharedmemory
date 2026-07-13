@@ -129,15 +129,11 @@ def test_compute_quotas_no_remainder_loss_when_one_stratum_caps_out():
 
 
 def test_compute_quotas_nine_strata_long_tail_sums_to_min_population_target():
-    """Controller 裁决 C2 锚定测试(b)：9 格(3 源 × 3 桶)长尾场景，其中一格总量
-    (claude_code|3-5=6)略高于 floor=5、其余格总量远大于 target_n。总体 population
-    (1094) 远超 target_n(90)，因此正确实现必须精确吃满 target_n，不允许因某格提前
-    封顶而悄悄少发。"""
-    sizes = {
-        "claude_code|<3": 500, "claude_code|3-5": 6, "claude_code|6+": 40,
-        "codex|<3": 300, "codex|3-5": 20, "codex|6+": 5,
-        "openclaw|<3": 200, "openclaw|3-5": 15, "openclaw|6+": 8,
-    }
+    """Controller 裁决 C2 锚定测试(b)：9 格长尾场景,多格总量略高于 floor=5(6/7/6/8/7/6/8)、
+    两格较大(40/20)。总体 population(148)大于 target_n(90),正确实现必须精确吃满
+    target_n。此输入经验证会让原「整数截断+stall_guard」buggy 实现悄悄少发
+    (86 而非 90——由随机 fuzz 搜出的真实反例,不是凑出来的巧合数字，见 self-review)。"""
+    sizes = {"s0": 40, "s1": 6, "s2": 7, "s3": 6, "s4": 8, "s5": 7, "s6": 20, "s7": 6, "s8": 8}
     target_n = 90
     quotas = sampling.compute_quotas(sizes, target_n=target_n, floor=5)
     total_pop = sum(sizes.values())
