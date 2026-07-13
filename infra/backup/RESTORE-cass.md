@@ -73,9 +73,9 @@ infra/backup/restore-cass.sh --data-dir <新目录> --backup cass-20260712-16275
 真灾难收尾：把恢复出的目录切成 canonical（移开损坏库后 `mv`/symlink），核对 `cass search` / `cass-mcp` 指向新库。
 `cass mirror prune` 后缺失的 blob 只能从更早备份找回（脚本不 prune）。
 
-## 演练验收（V21–V26，spec §9.4 — **deferred，下次约时间跑**）
+## 演练验收（V21–V26，spec §9.4 — **✅ 2026-07-13 全绿，DoD 达成**）
 
-演练要停 cass-mcp 持锁数小时（Tier2 semantic 重建 ≈2h），须约时间窗口。届时验：
+2026-07-13 分两段真跑（① `--skip-semantic` 快速冒烟 → ② 完整 semantic 演练），恢复到 `/tmp` 暂存目录，实测停 cass-mcp **97min**（全程）。各项：
 
 - **V21** 跑 `restore-cass.sh`（持锁 wrapper）；preflight 的 `uv run python -c "import blake3"` 必须真跑（裸 `python3` 会 FATAL）。
 - **V22** 演练全程另一 shell 的 `flock -n` 必须**失败**（锁被持有）。
@@ -85,4 +85,6 @@ infra/backup/restore-cass.sh --data-dir <新目录> --backup cass-20260712-16275
 - **V25** 全程零生产改动（生产 `data_dir` 的 mtime 不变；用 `--data-dir /tmp/...`、不 `--sessions-into-source`）。
 - **V26** 造一个**非空** stale `-wal` 放恢复出的 db 旁边，观察并记录后果（NAS 上 7-04 那份 `-wal` 是 0 字节，证明不了，别用作夹具）。
 
-> **实测耗时**（V24 回填）：_lexical ___ s / semantic ___ min（演练后填）_
+> **实测耗时**（2026-07-13 完整演练回填，2677 conv / 244711 msg）：**lexical ~21s / semantic ~85min（全程 restore 97min）**。
+> step8 semantic 验证用生产路由 `--mode semantic --daemon --model bge-m3 --rerank` 命中 3 条；V25 生产 `data_dir` mtime 全程零变。
+> 停 cass-mcp 期间 hourly index-pull 靠 `flock -n` 干净 skip（`exit 0`，无告警、无丢数据；新会话下个 hourly 补齐）。
