@@ -155,6 +155,13 @@ def compute_overall(outcomes: list, w_raw: dict, floor: int = 5) -> dict:
     固定为 `"undefined"`。decide() 必须先检查 coverage_gap_strata（非空即
     §11 强制 HOLD）再碰 ci_lower/ci_upper，不能反过来先比较 CI 再查缺口——
     否则会在 None 上做数值比较，TypeError。任何后续改动都不得打破这条顺序契约。
+
+    退化边缘（零正权重层）：本不变式假设 w_raw 至少有 1 个权重 > 0 的层。若 w_raw
+    全部为 0（或为空），该假设 vacuously 满足于左边（ci=None 仍成立）但右边落空——
+    coverage_gap_strata 只收 wᵢ>0 且 nᵢ=0 的层，零正权重层时天然为空列表，不会
+    "覆盖"任何东西。这种输入在生产环境不现实，但为防止 decide() 在此退化边缘上对
+    None 做数值比较而 cryptic TypeError，decide() 额外直接判 ci_lower/ci_upper
+    是否为 None 并兜底 HOLD，不完全依赖本不变式。
     """
     n, k = aggregate_fed_outcomes(outcomes)
     unknown_strata = set(n) - set(w_raw)

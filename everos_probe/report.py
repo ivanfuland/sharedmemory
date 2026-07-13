@@ -51,9 +51,23 @@ def decide(ci_lower, ci_upper, faithfulness, cost, sample_incomplete, coverage_g
     比较——因为 compute_overall 在全部有权重的层都零观测时，ci_lower/ci_upper 为
     None 且 coverage_gap_strata 必非空；HOLD 分支提前 return 保证不会在 None 上做
     数值比较（否则 `None >= 0.15` TypeError）。不得调换这两段的先后顺序。
+
+    Belt-and-suspenders（opus 对抗审实测洞）：compute_overall 的 None-safety 不变式
+    （"ci None ⟺ coverage_gap_strata 覆盖全部正权重层"）在**零正权重层**输入（w_raw
+    全 0、或 w_raw 为空）下 vacuously true——左边 ci=None 成立，右边 coverage_gap_strata
+    却是空列表（因为它只收 wᵢ>0 且 nᵢ=0 的层，没有正权重层就没有东西可收）。这类退化
+    输入在生产环境不现实（真实 CASS 库不会全部分层占比为 0），但 decide() 不该依赖
+    "至少一个正权重层"这个未在类型层强制的上游前提而 cryptic TypeError——所以额外直接
+    判 ci_lower/ci_upper 是否为 None，任何一个 None 都直接 HOLD，不管 coverage_gap_strata
+    是否为空。
     """
-    if sample_incomplete or coverage_gap_strata:
-        reason = "sample-incomplete (cap-stop)" if sample_incomplete else "coverage-insufficient"
+    if sample_incomplete or coverage_gap_strata or ci_lower is None or ci_upper is None:
+        if sample_incomplete:
+            reason = "sample-incomplete (cap-stop)"
+        elif coverage_gap_strata:
+            reason = "coverage-insufficient"
+        else:
+            reason = "ci-undefined (degenerate input: no positive-weight strata observed)"
         return {"verdict": "HOLD", "reason": reason, "coverage_gap_strata": list(coverage_gap_strata)}
 
     cost_ok = cost.cost_per_card is not None and cost.cost_per_card <= COST_PER_CARD_THRESHOLD
@@ -84,7 +98,7 @@ def decide(ci_lower, ci_upper, faithfulness, cost, sample_incomplete, coverage_g
 
     return {
         "verdict": "marginal",
-        "reason": f"CI [{ci_lower:.4f}, {ci_upper:.4f}] straddles {PASS_RATE_THRESHOLD} — 交 Ivan 二次判",
+        "reason": f"CI [{ci_lower:.4f}, {ci_upper:.4f}] straddles {PASS_RATE_THRESHOLD} — 交人工二次判",
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
     }
