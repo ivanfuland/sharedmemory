@@ -71,6 +71,17 @@ _SIG_B_STDERR = "Error: stepping, database disk image is malformed (11)"
 # 同族硬化——彻底关掉「`$` 匹配到 trailing newline 之前」这一类 foot-gun，行为不变。
 _SIG_B_LINE_RE = re.compile(r"(\*\*\* in database main \*\*\*|Page \d+: never used)")
 
+# `PRAGMA integrity_check` 默认只报前 100 个错误就停（SQLite 硬默认）。该库的良性泄漏页
+# （`Page N: never used`）一旦 ≥100，默认上限会先被撞满 → integrity_check 报满 100 就停
+# （exit 0 / stderr 空），**永远走不到** fts_messages_config 的 malformed abort → 输出被截断
+# 成「签名 B 形状但干净 stderr」的伪 clean-exit，既非 A 又非 B 而误 FAIL（2026-07-14 生产
+# 事故：泄漏页 90→109 越过 100 阈值）。抬到远超任何现实良性泄漏页数、又远低于失控的上限：
+# 不再被 SQLite 默认 100 错误上限截断（若在后续 malformed abort 之前出现任何非良性行，仍
+# FAIL）。⚠ 注意 abort（fts_messages_config）**之后**的对象仍不可见——那是签名 B 的既有边界
+# （非本改动引入，codex R2-P2），由 leg2/3/4 兜底，不是本腿的承诺。海量损坏由 60s timeout +
+# 非良性行即 FAIL 兜（fail-closed）。见 spec 2026-07-14。
+_INTEGRITY_CHECK_MAX_ERRORS = 1_000_000
+
 
 def classify_integrity(stdout: str, stderr: str, exit_code: int) -> Literal["A", "B", "FAIL"]:
     """PASS 当且仅当精确匹配签名 A 或签名 B；其余一切 FAIL（未知输出形态 = FAIL，不是 warn）。
@@ -79,6 +90,19 @@ def classify_integrity(stdout: str, stderr: str, exit_code: int) -> Literal["A",
     - 签名 B：stdout 每一行都匹配 `*** in database main ***` 或 `Page N: never used`
       （至少一行），且 stderr 恰好是「database disk image is malformed」那一行。
       **签名 B 不看 exit code。**
+
+    ⚠ 为什么「stdout 全是 `Page N: never used` 但 stderr 干净、exit 0」必须仍判 FAIL
+    （**不要**新增 B2 之类签名去放行它——2026-07-14 曾试过，codex 对抗审揪出是 P0）：
+    `Page N: never used` **不是无条件良性**。它既可能是良性泄漏空闲页，也可能是**某表的
+    sqlite_master 目录项被删后、其数据页变得不可达**（真数据丢失）——见
+    `test_gate_cli.py::test_attack1_meta_missing_v4`：`writable_schema` 删表正是产生
+    「干净 stderr + `Page N: never used`」。签名 B 要求 malformed stderr，正是把「干净跑完
+    只见 never used」这一形态 fail-closed 的**承重条款**，不能去掉。
+
+    本库夜备之所以仍能 PASS，是因为它真有 fts_messages_config 的 malformed abort：
+    `run_integrity_check` 抬高错误上限，保证 integrity_check 枚举完泄漏页后**走到那个
+    abort**（走进签名 B）。默认 100 上限会在泄漏页 ≥100 时提前截断、走不到 abort，把良性
+    库误判成「干净 never used」而 FAIL——即 2026-07-14 事故根因。见 spec 2026-07-14。
     """
     stdout_lines = stdout.splitlines()
 
@@ -96,11 +120,13 @@ def classify_integrity(stdout: str, stderr: str, exit_code: int) -> Literal["A",
 
 
 def run_integrity_check(db_path) -> tuple[str, str, int]:
-    """以 `immutable=1` URI 打开快照，经 sqlite3 CLI 子进程跑 `PRAGMA integrity_check`，
-    返回 `(stdout, stderr, exit_code)` 三元组喂 `classify_integrity`。"""
+    """以 `immutable=1` URI 打开快照，经 sqlite3 CLI 子进程跑 `PRAGMA integrity_check(N)`，
+    返回 `(stdout, stderr, exit_code)` 三元组喂 `classify_integrity`。`N` =
+    `_INTEGRITY_CHECK_MAX_ERRORS`（显式抬高错误上限，绕开 SQLite 默认 100 上限的截断，
+    见该常量处注释）。"""
     uri = f"file:{db_path}?immutable=1"
     result = subprocess.run(
-        ["sqlite3", uri, "PRAGMA integrity_check;"],
+        ["sqlite3", uri, f"PRAGMA integrity_check({_INTEGRITY_CHECK_MAX_ERRORS});"],
         capture_output=True,
         text=True,
         timeout=60,
