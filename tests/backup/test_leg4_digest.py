@@ -183,6 +183,79 @@ def test_attack2_content_cleared_breaks_prefix_digest_v5(synth_dd):
 
 
 # ---------------------------------------------------------------------------
+# conversations 前缀摘要只哈希不可变身份列（2026-07-13 生产首夜 cron 误 FAIL，codex R10-leg4）
+# ---------------------------------------------------------------------------
+def test_conversations_mutable_tail_change_does_not_fail_leg4(synth_dd):
+    """`conversations` 有可变尾部/rollup 列（`ended_at` / `last_message_idx` /
+    `last_message_created_at` / token 计数…），旧会话被续写时 CASS 增量 pull 会更新它们——
+    **合法活动、非篡改**。leg4 曾对 conversations 做「**全列**逐字节前缀不变」检查，故生产首夜
+    cron（00:30 对 16:27 基线）因 4 行旧会话只有这 3 个尾部列前进而误 FAIL、备份停摆。
+
+    修法（Ivan 定 B，2026-07-13）：conversations 前缀摘要**只哈希不可变身份列**
+    （`LEG4_PREFIX_COLUMNS`），排除可变 rollup/尾部列；conversations 仍在 leg4（gap/单调性 + 身份前缀）。
+
+    自校验：证 mutation **不改变** conversations 身份前缀摘要（可变列已排除），再断言 leg4 放行。
+    """
+    db = synth_dd / "agent_search.db"
+    con = sqlite3.connect(str(db))
+    baseline = leg4(con, prev_tables=None, prev_watermarks=None)
+    assert baseline.ok is True, baseline.detail
+    first_conv = con.execute("SELECT id FROM conversations ORDER BY id LIMIT 1").fetchone()[0]
+    conv_max = con.execute("SELECT MAX(id) FROM conversations").fetchone()[0]
+    pre_digest = prefix_digests(con, "conversations", conv_max)[1]
+    con.close()
+
+    # 模拟旧会话被续写：只动可变尾部列（不删行、不改 id/身份列）
+    con = sqlite3.connect(str(db))
+    con.execute(
+        "UPDATE conversations SET last_message_idx = 999999, ended_at = 999999,"
+        " last_message_created_at = 999999 WHERE id = ?",
+        (first_conv,),
+    )
+    con.commit()
+    post_digest = prefix_digests(con, "conversations", conv_max)[1]
+    assert pre_digest == post_digest, "可变尾部列不该进入 conversations 身份前缀摘要（否则会误 FAIL）"
+    result = leg4(con, baseline.tables, baseline.meta_watermarks)
+    con.close()
+
+    assert result.ok is True, f"conversations 可变尾部列变化不该 FAIL leg4（生产误 FAIL 根因）: {result.detail}"
+    assert "conversations" in result.tables, "conversations 仍在 leg4（只是前缀只哈希身份列）"
+
+
+def test_conversations_identity_rewrite_still_fails_leg4(synth_dd):
+    """负例（codex R10-leg4 验证：整表移除 conversations 会漏这个）：删历史 conversation +
+    同 id 补插、改写**不可变身份列** `external_id` → 行数/max_id/gap 全复原（leg3 放行），
+    但**身份前缀摘要变** → leg4 必须 FAIL。证明 B（只哈希身份列）仍守「历史会话身份被改写」。
+    """
+    db = synth_dd / "agent_search.db"
+    con = sqlite3.connect(str(db))
+    baseline = leg4(con, prev_tables=None, prev_watermarks=None)
+    assert baseline.ok is True, baseline.detail
+    cols = [r[1] for r in con.execute('PRAGMA table_info("conversations")')]
+    first_conv = con.execute("SELECT id FROM conversations ORDER BY id LIMIT 1").fetchone()[0]
+    row = list(con.execute("SELECT * FROM conversations WHERE id = ?", (first_conv,)).fetchone())
+    con.close()
+
+    # 攻击：DELETE + 同 id 补插，只改写身份列 external_id（内容替换、行数/max_id/gap 全复原）
+    row[cols.index("external_id")] = "ATTACKER-REWRITTEN-EXTID"
+    con = sqlite3.connect(str(db))
+    con.execute("DELETE FROM conversations WHERE id = ?", (first_conv,))
+    con.execute(
+        f"INSERT INTO conversations ({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
+        row,
+    )
+    con.commit()
+    result = leg4(con, baseline.tables, baseline.meta_watermarks)
+    con.close()
+
+    assert result.ok is False, "历史会话身份（external_id）被改写必须 FAIL（leg3 行数不变抓不住）"
+    assert '"conversations"' in result.detail and "前缀摘要不符" in result.detail, result.detail
+    assert result.tables["conversations"]["count"] == baseline.tables["conversations"]["count"], (
+        "前置：行数应不变（证明 leg3 抓不住、必须靠 leg4 身份前缀）"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step 2：攻击④——只改 author，全列版抓到；劣化的「前 4 列」版失明（V5b）
 # ---------------------------------------------------------------------------
 
