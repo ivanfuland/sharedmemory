@@ -21,6 +21,30 @@ def test_classify_log_window_detects_semantic_filter():
     assert attribution.classify_log_window(log) == attribution.SEMANTIC_REJECT
 
 
+def test_classify_log_window_detects_agent_case_skipped_no_assistant():
+    # everos.memory.strategies.extract_agent_case：memcell 里没有任何 assistant
+    # 发言人，structlog event（真跑经 ConsoleRenderer 渲染后仍是可搜的独立子串，
+    # 前后 ANSI 着色不影响 .search()）。语义上是结构性拒 -> structural_reject。
+    log = (
+        "2026-07-13T11:34:34.009496Z [warning  ] agent_case_skipped_no_assistant "
+        "memcell_id=mc_test_1 session_id=sess_test_1"
+    )
+    assert attribution.classify_log_window(log) == attribution.STRUCTURAL_REJECT
+
+
+def test_classify_log_window_detects_empty_task_intent():
+    # everalgo.agent_memory.case._compress_experience 第 626 行：LLM 抽取阶段判定
+    # 无有效任务意图而跳过 -> 语义门拒。
+    log = "INFO LLM returned empty 'task_intent', skipping"
+    assert attribution.classify_log_window(log) == attribution.SEMANTIC_REJECT
+
+
+def test_classify_log_window_detects_empty_approach():
+    # 同上第 629 行，approach 分支（warning 级）。
+    log = "WARNING LLM returned empty 'approach', skipping"
+    assert attribution.classify_log_window(log) == attribution.SEMANTIC_REJECT
+
+
 def test_classify_log_window_no_signal_returns_empty():
     log = "INFO memcell pre-trim total_tokens=500, message_count=10"
     assert attribution.classify_log_window(log) == ""
