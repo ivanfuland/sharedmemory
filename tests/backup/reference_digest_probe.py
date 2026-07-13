@@ -28,15 +28,26 @@ def enc(v):
     d=bytes(v);              return b'b'+struct.pack('>Q',len(d))+d
 
 
+# 前缀摘要按表选列（spec §5.5 / §2.13 ERRATUM，2026-07-13）：`conversations` 只哈希**不可变身份列**
+# （排除可变 rollup/尾部列 `ended_at`/`last_message_idx`/… 否则旧会话续写会误 FAIL）；其余表（messages）
+# 全列。这里独立硬编码同一子集，与 `cass_backup_gate.LEG4_PREFIX_COLUMNS` 相互印证。
+_PREFIX_COLS = {
+    "conversations": ("id", "external_id", "started_at", "source_id", "agent_id", "workspace_id"),
+}
+
+
 def compute_digest(db: str, table: str, maxid: int) -> str:
     """逐字对应 spec 附录 A 的探针脚本主体（打开只读快照、算 header、逐行喂 `enc()`）。"""
     con = sqlite3.connect(f"file:{db}?immutable=1", uri=True)
-    cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+    all_cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+    sel = _PREFIX_COLS.get(table)
+    cols = all_cols if sel is None else ['id'] + [c for c in sel if c != 'id']  # id 置首
+    collist = ",".join(f'"{c}"' for c in cols)
     h = hashlib.sha256()
     h.update(struct.pack('>Q', len(cols)))                 # header 也走长度前缀，不用 '|'.join
     for c in cols:
         d = c.encode('utf-8'); h.update(struct.pack('>Q', len(d))); h.update(d)
-    for row in con.execute(f'SELECT * FROM "{table}" WHERE id<=? ORDER BY id', (maxid,)):
+    for row in con.execute(f'SELECT {collist} FROM "{table}" WHERE id<=? ORDER BY id', (maxid,)):
         h.update(struct.pack('>Q', len(row)))
         for v in row: h.update(enc(v))
     con.close()

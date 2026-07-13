@@ -390,8 +390,26 @@ def leg3(
 # rebaseline 出口见 spec §5.7。
 # ---------------------------------------------------------------------------
 
-# 覆盖对象：仅 messages 与 conversations（append-only，id 主键，spec §5.5 逐字）。
+# 覆盖对象：messages 与 conversations（都做 gap/max_id/count 单调性 + 前缀摘要）。
 TABLES_FOR_LEG4: tuple[str, ...] = ("messages", "conversations")
+
+# leg4 前缀摘要**按表选列**（Ivan 定 B，2026-07-13；codex R10-leg4）。前缀摘要 = 「历史行逐字节
+# 不可变」判据，只对**真不可变的列**成立。`messages` 全列都不可变（写入后不改，新消息取新 id）——
+# 不在此表 = 用全列。`conversations` **有可变尾部/rollup 列**（`ended_at`/`last_message_idx`/
+# `last_message_created_at`/token 计数/title…），旧会话被续写时 CASS 增量 pull 会更新它们——合法活动、
+# 非篡改，全列哈希会每晚误 FAIL（2026-07-13 生产首夜 cron 实证）。故 conversations 的前缀摘要**只哈希
+# 不可变身份列**（创建时定、此后不改），既避免误 FAIL、又保住「历史会话被删+同 id 补插改写身份」的检测
+# （codex 验证过整表移除会漏这个负例）。可变 rollup/尾部列一律排除。
+# ⚠ 改此定义 = 前缀摘要变 → 需对生产库做**一次性 rebaseline**（旧全列基线失效）。
+# 【已知边界，非本次回归（codex R2-[high]，Ivan 接受+backlog B14）】：这里哈希的是 conversations
+# **表内**身份（含 FK 代理 id `agent_id`/`workspace_id`——能抓「会话原地 relink 到别的 agent/workspace
+# 记录」），但**不覆盖跨表语义身份的原地改写**：`agents.slug`/`workspaces.path`（真正的 agent/workspace
+# 名，经 FK JOIN 读）被原地 UPDATE 时，conversations 行不变 → 本摘要不变 → 门放行。旧全列 leg4 同样
+# 只哈希 agent_id、从不碰 slug，故这是**继承的盲区**（同 §1.4/U12「删尾+等量补插」那类不承诺区分）。
+# 展开保护（把 slug/path JOIN 进摘要或纳 agents/workspaces 入 leg4）另有 agent 改名误 FAIL 反噬，见 backlog B14。
+LEG4_PREFIX_COLUMNS: dict[str, tuple[str, ...]] = {
+    "conversations": ("id", "external_id", "started_at", "source_id", "agent_id", "workspace_id"),
+}
 
 # spec §5.5(a) 必需水位键硬编码清单——缺任一即 FAIL，rebaseline 也不豁免
 # （与硬编码不变式的比对永不可关，spec §5.7）。
@@ -426,18 +444,40 @@ def _enc(v):
     d = bytes(v);            return b"b" + struct.pack(">Q", len(d)) + d
 
 
+def _leg4_prefix_cols(con, table):
+    """leg4 前缀摘要哈希的列（**有序**，含 `id` 且置首——边界判定用 row[0]）。
+    `LEG4_PREFIX_COLUMNS` 未列的表 = 全列（messages：真不可变）；列了的表 = 只哈希该**不可变
+    身份列**子集（conversations：排除可变 rollup/尾部列，见 §2.13 ERRATUM / codex R10-leg4）。
+    allowlist 里的列必须都在表里，缺任一 ⇒ fail-closed（防 schema 漂移悄悄漏掉身份列、静默弱化）。"""
+    all_cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+    sel = LEG4_PREFIX_COLUMNS.get(table)
+    if sel is None:
+        return all_cols
+    missing = [c for c in sel if c not in all_cols]
+    if missing:
+        # **RuntimeError 不是 SystemExit**（codex R2-[medium]）：main() 的 `_safe` 网是 `except Exception`，
+        # 接不住 BaseException 系的 SystemExit → 会击穿「单腿崩溃降级为 FAIL + 无论 PASS/FAIL 都写
+        # census.tsv/gate.json」的落盘契约、留下半截 SUSPECT。故抛普通异常，让 `_safe` 记结构化 leg4 FAIL。
+        raise RuntimeError(
+            f"leg4 前缀列 allowlist 中的列在 {table} 不存在（schema 漂移？）: {missing}"
+        )
+    return ["id"] + [c for c in sel if c != "id"]      # id 置首，保证 row[0]==id
+
+
 def prefix_digests(con, table, prev_max_id):
     """单遍流：返回 (digest_at_prev_max, digest_at_cur_max, cur_max, cur_count)。
     hashlib .copy() 在越过 prev_max_id 边界时留存前缀摘要 —— messages 4 s 只跑一遍。
 
     spec §5.5 逐字（= 附录 A 探针同构，见 `tests/backup/reference_digest_probe.py`）。
+    列选择见 `_leg4_prefix_cols`：messages 全列；conversations 仅不可变身份列子集。
     """
-    cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+    cols = _leg4_prefix_cols(con, table)
+    collist = ",".join(f'"{c}"' for c in cols)
     h = hashlib.sha256(); h.update(struct.pack(">Q", len(cols)))
     for c in cols:
         d = c.encode("utf-8"); h.update(struct.pack(">Q", len(d))); h.update(d)
     h_pre, cur_max, cnt = None, 0, 0
-    for row in con.execute(f'SELECT * FROM "{table}" ORDER BY id'):
+    for row in con.execute(f'SELECT {collist} FROM "{table}" ORDER BY id'):
         if prev_max_id is not None and h_pre is None and row[0] > prev_max_id:
             h_pre = h.copy()                      # 越过基线边界，留存前缀摘要
         h.update(struct.pack(">Q", len(row)))

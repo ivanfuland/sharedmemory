@@ -148,6 +148,31 @@ def test_first_night_no_baseline_passes_and_writes_artifacts(synth_dd, tmp_path)
 
 
 @requires_cass
+def test_leg4_missing_allowlist_column_fails_cleanly_with_artifacts(synth_dd, tmp_path):
+    """codex R2-[medium]：conversations 缺一个 leg4 身份 allowlist 列（schema 漂移）时，
+    `_leg4_prefix_cols` 必须走**结构化 FAIL** 路径（经 `_safe`）——rc=1 且 census.tsv/gate.json
+    **都要写**（SUSPECT 取证需完整画像）。修复前它 `raise SystemExit`，绕过 `except Exception`
+    的 `_safe` 网 → 击穿落盘契约、留半截 SUSPECT。"""
+    db = synth_dd / "agent_search.db"
+    con = sqlite3.connect(str(db))
+    con.execute("ALTER TABLE conversations DROP COLUMN workspace_id")  # 掉一个身份 allowlist 列（未被索引）
+    con.commit()
+    con.close()
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    out_census = tmp_path / "census.tsv"
+    out_gate = tmp_path / "gate.json"
+    rc, out, err = _run_cli(db, dest, out_census, out_gate)
+
+    assert rc == 1, f"缺 allowlist 列应 FAIL（rc=1），非崩溃/rc=0：\nstdout={out}\nstderr={err}"
+    assert "[leg 4] FAIL" in out, f"应走 leg4 结构化 FAIL，stdout={out}\nstderr={err}"
+    # 落盘契约：无论 PASS/FAIL 都写产物（SystemExit 会击穿它）
+    assert out_census.exists(), "census.tsv 必须写（落盘契约被 SystemExit 击穿则不写）"
+    assert out_gate.exists(), "gate.json 必须写"
+
+
+@requires_cass
 def test_first_night_bad_watermark_format_fails_gate_r9(synth_dd, tmp_path):
     """codex R9-P0（首晚复现）：全新 DEST（无基线，首晚登记模式）+ `last_scan_ts`
     改「同数字 + 尾随 \\n」→ gate CLI 必须 exit 1、`[leg 4] FAIL`。修复前水位格式
