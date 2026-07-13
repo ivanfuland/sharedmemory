@@ -30,3 +30,26 @@ print('6-A: _clamp 可用 -> PrunerClamper' if hasattr(P, '_clamp')
 （这条防御是 `test_make_clamper_falls_back_when_pruner_lacks_clamp` 专门覆盖的场景）。
 
 无需偿还技术债——当前环境本就没有走 6-B 路径。
+
+## Task 7：命令分布测量（$0 只读，为 RTK 决策备料）
+
+**状态**：脚本 + 单测已实现并 GREEN（`scripts/measure_command_distribution.py` +
+`everos_adapter/tests/test_measure_command_distribution.py`，10 passed，含合成
+`:memory:`/`tmp_path` sqlite fixture 对 `collect()` 本身的配对 + 分类断言）。
+
+**注意**：`--limit` 只限制第二趟 `tool_result` 查询；第一趟 `tool_call` 全量加载
+是无界的（`collect()` 里 `calls` dict 一次性读完整表）。对着大候选库跑之前先给
+DB 做体积上限或窄化范围，不要指望 `--limit` 能省下第一趟的内存/IO。
+
+**Step 5（对候选库 `~/.local/share/coding-agent-search.new-6role/agent_search.db`
+真跑一次只读测量）本次未执行**——按本次任务的编排指令明确列为 out of scope：
+彼时有并发 session 正在使用真实 CASS 库（写入中），且该库属于「候选/生产库」，
+不在本 M1a TDD 任务的写权限范围内。脚本已具备 `mode=ro` 只读打开能力，命令行
+入口就绪：
+
+```bash
+uv run python scripts/measure_command_distribution.py \
+  --db ~/.local/share/coding-agent-search.new-6role/agent_search.db
+```
+
+留待后续单独一步执行，并把输出补进本节，作为 spec §5.2 RTK 决策的依据。
