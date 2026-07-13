@@ -59,7 +59,7 @@ def prepare_session(
     """纯函数：不发任何 HTTP（但需要 clamper —— 被吸收的 orphan 必须在 append 前压好，
     codex R1 P1#1）。不含结构门预筛：是否喂给 everalgo 由 EverOS 自己判定，本函数只做
     absorb/split/ts 的格式整理。`ensure_unique_timestamps` 永不抛出（skew-quarantine
-    机制已删除，Ivan 2026-07-13 定：不丢数据），故 `should_feed` 为 False 的唯一情形是
+    机制已删除，2026-07-13 项目决策：不丢数据），故 `should_feed` 为 False 的唯一情形是
     `feedable` 为空（如整会话被 absorb/hold 后无内容）。"""
     clamper = clamper or make_clamper()
     mapped = map_to_add_messages(read_conversation(rows, _EXTRA_COLS), agent_id, user_sender)

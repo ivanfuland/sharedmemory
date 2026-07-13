@@ -17,13 +17,6 @@ class _HeadCap:
         return content[:cap]
 
 
-class _TailCap:
-    IS_TECHNICAL_DEBT = False
-
-    def clamp(self, content, cap):
-        return content[-cap:]
-
-
 def _capture(monkeypatch):
     seen = []
 

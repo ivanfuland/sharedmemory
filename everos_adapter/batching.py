@@ -3,7 +3,7 @@
 EverOS 的 `message_id` = `m_<session>_<ts>_<idx>`，`idx` 每批重置 -> 同 ts 消息跨页可撞。
 故给一会话内消息赋单调唯一 ts（next-free-ms）。**任何输入都不丢消息**——即便数百条消息
 共享同一 ms-epoch，或时间戳乱序，一律归一化为严格递增、互不相同的 `int > 0` ts 后原样喂入。
-不存在「skew 超限 quarantine」这类会整会话丢弃的机制（Ivan 2026-07-13 定：不丢数据，永远排队入）。
+不存在「skew 超限 quarantine」这类会整会话丢弃的机制（2026-07-13 项目决策：不丢数据，永远排队入）。
 
 DTO 硬约束（实测）：`messages` <=500/批；`timestamp: int > 0`。
 """

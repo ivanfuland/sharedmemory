@@ -17,6 +17,7 @@ APP_ID, PROJECT_ID = "default", "default"
 
 # 被降级成 synthetic assistant 的 tool 消息仍携带完整未截断的 tool 输出，
 # 必须一并过 cap（真实 tool_result 均长 3421）。
+# 注：独立的 [reasoning] synthetic 有意不列入——reasoning 是散文，与 assistant 文本同等忠实保留。
 _CAPPABLE_PREFIXES = ("[tool_result]", "[tool_call]")
 
 
