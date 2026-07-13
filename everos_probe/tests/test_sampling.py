@@ -44,7 +44,7 @@ def test_normalize_source_three_targets_and_openclaw_subagents():
     assert sampling.normalize_source("codex") == "codex"
     assert sampling.normalize_source("openclaw") == "openclaw"
     assert sampling.normalize_source("openclaw/main") == "openclaw"
-    assert sampling.normalize_source("openclaw/wood") == "openclaw"
+    assert sampling.normalize_source("openclaw/sub1") == "openclaw"
 
 
 def test_normalize_source_rejects_non_target_agents():
