@@ -29,6 +29,9 @@ case "${1:?setup|start|stop|status}" in
       EVEROS_EMBEDDING__MODEL="${EVEROS_EMBED_MODEL:?env.sh 需补 EVEROS_EMBED_MODEL(M1b 用 bge-m3,以副本 everos.toml 现值核实)}" \
       EVEROS_EMBEDDING__API_KEY="${EVEROS_EMBED_API_KEY:-dummy}" \
       EVEROS_RERANK__PROVIDER=vllm EVEROS_RERANK__BASE_URL="$INFINITY_BASE" \
+      EVEROS_LLM__MODEL="${EVEROS_LLM_MODEL:?env.sh 缺 EVEROS_LLM_MODEL}" \
+      EVEROS_LLM__API_KEY="${EVEROS_M1B_KEY:?env.sh 缺 EVEROS_M1B_KEY}" \
+      EVEROS_LLM__BASE_URL="${LITELLM_LLM_BASE:?env.sh 缺 LITELLM_LLM_BASE}" \
       EVEROS_RERANK__MODEL="${EVEROS_RERANK_MODEL:?env.sh 需补 EVEROS_RERANK_MODEL(以副本 everos.toml/Infinity 模型清单核实)}" \
       setsid bash -c 'echo $$ > "$1/server.pid"; exec "$2" server start --root "$3"' _ "$WORK" "$EVEROS_BIN" "$ROOT" \
         > "$WORK/server.log" 2>&1 &
