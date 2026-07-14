@@ -15,7 +15,7 @@ from everos_eval.corpus import load_all_cards, load_entries
 from everos_eval.judge_io import build_foresight_jobs, build_l1_jobs, build_top5_jobs, parse_verdicts
 from everos_eval.queryset import (first_user_messages, load_snapshot_eids, raw_baseline,
                                   scan_complex_candidates, select_candidates)
-from everos_eval.retrieve import merge_top5, search
+from everos_eval.retrieve import canonical_id, merge_top5, search
 from everos_eval.stats import QueryOutcome, band_verdict, compute_metrics
 from everos_probe.sampling import fetch_rows  # ro 行读取复用
 from datetime import datetime, timedelta, timezone
@@ -67,6 +67,8 @@ def cmd_retrieve(a):
             resp = search(a.base, "everos-m1b-probe", qtext)
             data = resp["data"]
             top5 = merge_top5(data.get("agent_cases", []), data.get("agent_skills", []))
+            for it in top5:  # 归一为 canonical entry id(与 L1 gold 同一 id 空间;raw 留在 payload)
+                it["id"] = canonical_id(it["id"], it["mem_type"])
             _append(rp, {"query_id": q["query_id"], "variant": variant,
                          "top5": top5, "raw_response": data})
     print(f"retrieval ledger: {rp}")
