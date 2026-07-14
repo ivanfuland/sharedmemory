@@ -108,6 +108,24 @@ def test_read_rows_conv_not_found(tmp_path):
     assert rows == [] and payload_max is None and found is False
 
 
+def test_read_rows_ignores_null_created_at(tmp_path):
+    """终审 Minor-1:adapter 层容忍 NULL created_at,feeder 的 max() 不该因此 TypeError。
+    混合 (1000, None, 3000) → payload_max 取非 None 中的最大值;全 None → payload_max is None。"""
+    db = _mk_cass(tmp_path, created=(1000, None, 3000))
+    rows, payload_max, found = _read_rows(db, "s1")
+    assert len(rows) == 3
+    assert payload_max == 3000
+    assert found is True
+
+    sub = tmp_path / "allnull"
+    sub.mkdir()
+    db_all_null = _mk_cass(sub, created=(None, None))
+    rows2, payload_max2, found2 = _read_rows(db_all_null, "s1")
+    assert len(rows2) == 2
+    assert payload_max2 is None
+    assert found2 is True
+
+
 def test_wait_terminal_returns_ids_when_case_appears(tmp_path):
     md = tmp_path / "agents" / "a" / ".cases"
     md.mkdir(parents=True)

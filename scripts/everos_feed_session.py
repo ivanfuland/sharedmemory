@@ -118,7 +118,7 @@ def _read_rows(cass_db: str, external_id: str):
         rows = [dict(r) for r in con.execute(_ROW_SQL, (convs[0]["id"],)).fetchall()]
     finally:
         con.close()
-    payload_max = max(r["created_at"] for r in rows) if rows else None
+    payload_max = max((r["created_at"] for r in rows if r["created_at"] is not None), default=None)
     return rows, payload_max, True
 
 
@@ -154,7 +154,7 @@ def main() -> None:
     rows, payload_max, found = _read_rows(cass_db, a.external_id)
     if not rows:
         _emit("skipped", detail="adapter_skipped:no_feedable" if found else "conv_not_found_in_cass")
-    if payload_max > a.claim_msg_ts:
+    if payload_max is not None and payload_max > a.claim_msg_ts:
         _emit("stale", payload_max=payload_max)  # 喂中出现新消息:零 /add,worker CAS 清租约回 pending
 
     # ── /add 观测钩子 + 退避(仅首个 /add 成功前;codex R7)──

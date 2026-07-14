@@ -24,7 +24,8 @@ _fingerprint() {  # 两因子:源码 git SHA + venv 依赖冻结哈希(抓 git �
   [ -x "$PY" ] || { echo "FATAL: venv python missing: $PY" >&2; return 1; }
   freeze="$("$PY" -m pip freeze 2>/dev/null)" || { echo "FATAL: pip freeze failed" >&2; return 1; }
   [ -n "$freeze" ] || { echo "FATAL: pip freeze empty" >&2; return 1; }
-  echo "git_sha=$(git -C "$SRC" rev-parse HEAD)"
+  sha="$(git -C "$SRC" rev-parse HEAD)" || { echo "FATAL: git rev-parse failed in $SRC" >&2; return 1; }
+  echo "git_sha=$sha"
   echo "venv_freeze_sha256=$(printf '%s' "$freeze" | sha256sum | cut -d' ' -f1)"
 }
 
@@ -51,15 +52,19 @@ case "${1:?setup|pin|run|smoke|status}" in
     echo "pinned:"; cat "$PIN_FILE"
     ;;
   run)  # systemd 入口:PIN 校验 fail-closed,不匹配拒绝启动(防绕过校准集回归门的静默漂移)
-    [ -f "$PIN_FILE" ] || { echo "FATAL: $PIN_FILE 不存在——先跑 pin(首次)或升级门"; exit 1; }
+    [ -s "$PIN_FILE" ] || { echo "FATAL: $PIN_FILE 不存在或为空——先跑 pin(首次)或升级门"; exit 1; }
     SRC="${EVEROS_SRC_DIR:?env 缺 EVEROS_SRC_DIR}"
     # 含未跟踪文件(R2-P1-2):editable install 下未跟踪的新模块 git SHA 和 pip freeze 都抓不到,
     # 却直接可 import——只 allowlist 已知非代码产物 .codegraph/。
-    dirty="$(git -C "$SRC" status --porcelain --untracked-files=all | grep -vE '^\?\? \.codegraph(/|$)' || true)"
+    # 先拿 git 输出再过滤(终审 Minor-2):git 自身失败不许被 `|| true` 吞掉。
+    porcelain="$(git -C "$SRC" status --porcelain --untracked-files=all)" || { echo "FATAL: git status failed in $SRC" >&2; exit 1; }
+    dirty="$(printf '%s\n' "$porcelain" | grep -vE '^\?\? \.codegraph(/|$)' || true)"
+    dirty="${dirty#$'\n'}"   # 空 porcelain 时 printf 产生的孤行清掉
     if [ -n "$dirty" ]; then
       echo "FATAL: EverOS 工作树不干净(未提交/未跟踪都会绕过版本钉死),拒绝启动:"; echo "$dirty"; exit 1
     fi
-    if ! diff <(_fingerprint) "$PIN_FILE" >&2; then
+    fp="$(_fingerprint)" || { echo "FATAL: fingerprint failed at run time"; exit 1; }
+    if ! diff <(printf '%s\n' "$fp") "$PIN_FILE" >&2; then
       echo "FATAL: EverOS 版本指纹 ≠ PIN——先过升级门(runbook ④)再更新 PIN"; exit 1
     fi
     exec "${EVEROS_BIN:?env 缺 EVEROS_BIN}" server start --root "$ROOT"
