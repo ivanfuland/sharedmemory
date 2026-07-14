@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """M1c Phase 1 评估编排(操作性,不进 pytest)。子命令:
   build-queryset --db <cass.db> --snapshot <snapshot.json> --out <dir>
-  retrieve       --queryset <queryset.jsonl> --base http://127.0.0.1:8010 --out <dir>
+  retrieve       --queryset <queryset.jsonl> --base <http://127.0.0.1:PORT> --out <dir>
   make-jobs      --stage {l1,top5,foresight} --workdir <dir> --instance <pro-instance 副本>
   assemble       --workdir <dir>     # verdicts -> QueryOutcome -> metrics.json
-台账全落 --out/--workdir(默认 ~/everos-m1b-data/m1c-eval/),不进 git。
+台账全落 --out/--workdir(路径由调用方指定,不硬编码本机拓扑),不进 git。
 """
 from __future__ import annotations
 import argparse, json, sys
@@ -60,6 +60,8 @@ def cmd_build_queryset(a):
 def cmd_retrieve(a):
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     rp = out / "retrieval.jsonl"
+    if rp.exists():
+        sys.exit(f"{rp} 已存在(台账冻结);要重跑先手动 trash")
     for line in Path(a.queryset).read_text(encoding="utf-8").splitlines():
         q = json.loads(line)
         assert q["query"], f"{q['query_id']} 缺生成查询,先回填再检索"
@@ -121,7 +123,17 @@ def cmd_assemble(a):
     retr = {}
     for line in (wd / "retrieval.jsonl").read_text(encoding="utf-8").splitlines():
         r = json.loads(line)
-        retr.setdefault(r["query_id"], {})[r["variant"]] = r["top5"]
+        qid, variant = r["query_id"], r["variant"]
+        bucket = retr.setdefault(qid, {})
+        if variant in bucket:
+            sys.exit(f"retrieval.jsonl 有重复记录: {qid}/{variant}")
+        bucket[variant] = r["top5"]
+    qids = [json.loads(x)["query_id"]
+            for x in (wd / "queryset.jsonl").read_text(encoding="utf-8").splitlines()]
+    for qid in qids:
+        missing = {"synthetic", "raw"} - retr.get(qid, {}).keys()
+        if missing:
+            sys.exit(f"retrieval.jsonl 缺 {qid} 的 {sorted(missing)} 记录")
     outcomes = []
     for line in (wd / "queryset.jsonl").read_text(encoding="utf-8").splitlines():
         q = json.loads(line); qid = q["query_id"]

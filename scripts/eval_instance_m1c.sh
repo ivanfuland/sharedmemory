@@ -2,13 +2,16 @@
 # M1c Phase 1 评估实例生命周期。用法: eval_instance_m1c.sh {setup|start|stop|status}
 # 铁律: 原始 pro-instance 只读;admin key 绝不注入 EverOS 进程(env -i 白名单)。
 set -euo pipefail
-DATA=~/everos-m1b-data
+# 本机拓扑一律从私有 env 文件取,不硬编码(PUBLIC 仓铁律)。
+ENVSH="${EVEROS_EVAL_ENV:?set EVEROS_EVAL_ENV to your private env file}"
+# shellcheck disable=SC1090
+source "$ENVSH"
+DATA="${M1B_DATA_DIR:?env 缺 M1B_DATA_DIR}"
 WORK="$DATA/m1c-eval"
 ROOT="$WORK/eval-workdir"
-ENVSH="$DATA/env.sh"
-PORT=8010
+PORT="${EVEROS_EVAL_PORT:?env 缺 EVEROS_EVAL_PORT}"
 # everos CLI 不在 PATH(2026-07-14 实测),用 EverOS 源码环境的入口。
-EVEROS_BIN="$HOME/projects/EverOS/.venv/bin/everos"
+EVEROS_BIN="${EVEROS_BIN:?env 缺 EVEROS_BIN}"
 
 case "${1:?setup|start|stop|status}" in
   setup)
@@ -20,8 +23,7 @@ case "${1:?setup|start|stop|status}" in
     echo "copied. manifest: $WORK/pro-instance.sha256 ($(wc -l < "$WORK/pro-instance.sha256") files)"
     ;;
   start)
-    # shellcheck disable=SC1090
-    source "$ENVSH"   # 只为取变量;下面 env -i 白名单注入,admin key 不进白名单
+    # ENVSH 已在顶部 source 过(只为取变量);下面 env -i 白名单注入,admin key 不进白名单
     env -i HOME="$HOME" PATH="$PATH" \
       EVEROS_ROOT="$ROOT" \
       EVEROS_API__HOST=127.0.0.1 EVEROS_API__PORT=$PORT \
