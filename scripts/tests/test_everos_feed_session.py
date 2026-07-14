@@ -272,3 +272,77 @@ def test_e2e_first_add_422_backoff_absorbed(tmp_path):
     assert out["status"] == "completed", (out, p.stderr)
     assert any(h.endswith("#422") for h in _Fake422ThenOkEverOS.hits)          # 真吃过一次 422
     assert any(h.endswith("/memory/flush") for h in _Fake422ThenOkEverOS.hits)  # 退避后走完全程
+
+
+# ── T2 review follow-up:main 状态机盲区补测(控制面增补,非 brief verbatim) ──
+
+
+def test_e2e_skipped_no_terminal_within_window(tmp_path):
+    """正常 completed 场景的装配(/add+/flush 全 200)但不预埋 case 文件、终态窗口极短
+    (EVEROS_TERMINAL_WINDOW_S=2) → 真喂到底(/add + /flush 都打了)但终态窗口空手而归,
+    落 skipped/no_terminal_within_window(非 completed,也非 conv_not_found 那种早退 skipped)。"""
+    db = _mk_cass(tmp_path)
+    _FakeEverOS.hits = []
+    srv = HTTPServer(("127.0.0.1", 0), _FakeEverOS)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        p = _run_feeder({
+            "EVEROS_CASS_DB": db,
+            "EVEROS_PROD_BASE_URL": f"http://127.0.0.1:{srv.server_port}",
+            "EVEROS_PROD_MD_ROOT": str(tmp_path / "md"),  # 不预埋 case
+            "EVEROS_TERMINAL_WINDOW_S": "2",
+        })
+    finally:
+        srv.shutdown()
+    assert p.returncode == 0, p.stderr
+    out = _json.loads(p.stdout.strip().splitlines()[-1])
+    assert out["status"] == "skipped"
+    assert out["detail"] == "no_terminal_within_window"
+    assert out["case_entry_ids"] == []
+    assert any(h.endswith("/memory/add") for h in _FakeEverOS.hits)     # 真喂了
+    assert any(h.endswith("/memory/flush") for h in _FakeEverOS.hits)   # 喂完了,只是超窗未出卡
+
+
+class _Fake500ThenOkEverOS(_FakeEverOS):
+    """首个 /add 返 500(语义不明,既不属 pre-add 可退避集也不属零副作用集)——
+    不应重试,一次定性为 error;其后即使转 200 也不该被打到(不该有第二次 /add 请求)。"""
+    rejected = False
+
+    def do_POST(self):
+        if self.path.endswith("/memory/add") and not type(self).rejected:
+            type(self).rejected = True
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            type(self).hits.append(self.path + "#500")
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_POST()
+
+
+def test_e2e_first_add_500_error_keeps_ambiguity(tmp_path):
+    """首个 /add 返 500 → `_is_pre_add_transient`/`_is_no_side_effect` 均判 False(5xx 语义
+    不明,可能已部分处理)→ 不重试,一次定性为 error(worker 保持 running 归 nightly)。
+    这是 `_is_pre_add_transient`/`_is_no_side_effect` 表驱动单测(422/ConnectError 走可退避
+    或零副作用分支)在 main 状态机里唯一未覆盖的「不退避不 no_side_effect,直接 error」分岔。"""
+    db = _mk_cass(tmp_path)
+    _Fake500ThenOkEverOS.hits = []
+    _Fake500ThenOkEverOS.rejected = False
+    srv = HTTPServer(("127.0.0.1", 0), _Fake500ThenOkEverOS)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        p = _run_feeder({
+            "EVEROS_CASS_DB": db,
+            "EVEROS_PROD_BASE_URL": f"http://127.0.0.1:{srv.server_port}",
+            "EVEROS_PROD_MD_ROOT": str(tmp_path / "md"),
+            "EVEROS_TERMINAL_WINDOW_S": "5",
+        })
+    finally:
+        srv.shutdown()
+    assert p.returncode == 0, p.stderr
+    out = _json.loads(p.stdout.strip().splitlines()[-1])
+    assert out["status"] == "error"
+    assert "add_ok=0" in out["detail"]
+    add_hits = [h for h in _Fake500ThenOkEverOS.hits if "/memory/add" in h]
+    assert len(add_hits) == 1  # 一次定性为 error,不许有第二次 /add 请求
