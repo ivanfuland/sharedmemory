@@ -23,6 +23,9 @@ from datetime import datetime, timedelta, timezone
 # M1b 快照截止(Asia/Shanghai)对应的毫秒 epoch;CASS created_at 是毫秒整数
 CUTOFF_MS = int(datetime(2026, 7, 13, 23, 59, 59,
                          tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
+# 评估开工日排除线(spec R6):当天起的会话是评估自身产生的(subagent/审查),入选即自指污染
+EVAL_DAY_MS = int(datetime(2026, 7, 14, 0, 0, 0,
+                           tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
 
 
 def _append(path: Path, rec: dict):
@@ -34,6 +37,9 @@ def _append(path: Path, rec: dict):
 def cmd_build_queryset(a):
     import sqlite3
     cands = scan_complex_candidates(Path(a.db))
+    n_all = len(cands)
+    cands = [c for c in cands if c.first_ts_ms < EVAL_DAY_MS]  # spec R6 排除线
+    print(f"R6 排除评估开工日后的会话: {n_all} -> {len(cands)}")
     eids = load_snapshot_eids(Path(a.snapshot))
     chosen, tier = select_candidates(cands, eids, CUTOFF_MS, target=30)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
