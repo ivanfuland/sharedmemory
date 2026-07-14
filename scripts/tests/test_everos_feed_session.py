@@ -1,8 +1,10 @@
 """feeder 纯逻辑件测试。fixture 全合成(PUBLIC 仓铁律)。"""
+import sqlite3 as _sqlite3
+
 import httpx
 import pytest
 
-from scripts.everos_feed_session import _AddCountingHttpx, _is_pre_add_transient
+from scripts.everos_feed_session import _AddCountingHttpx, _is_pre_add_transient, _read_rows, _wait_terminal
 
 
 class _FakeResp:
@@ -74,3 +76,48 @@ def test_is_pre_add_transient(exc, add_ok, expected):
 def test_is_no_side_effect(exc, add_ok, expected):
     from scripts.everos_feed_session import _is_no_side_effect
     assert _is_no_side_effect(exc, add_ok) is expected
+
+
+def _mk_cass(tmp_path, external_id="s1", created=(1000, 2000, 3000)):
+    """最小合成 CASS 库:conversations + messages 两表(只含 feeder 用到的列)。"""
+    db = tmp_path / "cass.db"
+    con = _sqlite3.connect(db)
+    con.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, external_id TEXT)")
+    con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INT, idx INT,"
+                " role TEXT, content TEXT, created_at INT, extra_bin BLOB, extra_json TEXT)")
+    con.execute("INSERT INTO conversations VALUES (1, ?)", (external_id,))
+    for i, ts in enumerate(created):
+        con.execute("INSERT INTO messages VALUES (NULL, 1, ?, 'user', 'hello', ?, NULL, '{}')", (i, ts))
+    con.commit()
+    con.close()
+    return str(db)
+
+
+def test_read_rows_returns_rows_and_payload_max(tmp_path):
+    db = _mk_cass(tmp_path)
+    rows, payload_max, found = _read_rows(db, "s1")
+    assert len(rows) == 3
+    assert payload_max == 3000
+    assert found is True
+    assert rows[0]["role"] == "user"
+
+
+def test_read_rows_conv_not_found(tmp_path):
+    db = _mk_cass(tmp_path)
+    rows, payload_max, found = _read_rows(db, "missing")
+    assert rows == [] and payload_max is None and found is False
+
+
+def test_wait_terminal_returns_ids_when_case_appears(tmp_path):
+    md = tmp_path / "agents" / "a" / ".cases"
+    md.mkdir(parents=True)
+    (md / "agent_case-2026-07-14.md").write_text(
+        "<!-- entry:ac_1 -->\n## ac_1\n\n**session_id**: prod-abc\n<!-- /entry:ac_1 -->\n",
+        encoding="utf-8")
+    ids = _wait_terminal(str(tmp_path), "prod-abc", window_s=2, poll_s=1)
+    assert ids == ["ac_1"]
+
+
+def test_wait_terminal_times_out_empty(tmp_path):
+    ids = _wait_terminal(str(tmp_path), "prod-none", window_s=1, poll_s=1)
+    assert ids == []
