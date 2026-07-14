@@ -35,13 +35,22 @@ case "${1:?setup|start|stop|status}" in
       EVEROS_RERANK__MODEL="${EVEROS_RERANK_MODEL:?env.sh 需补 EVEROS_RERANK_MODEL(以副本 everos.toml/Infinity 模型清单核实)}" \
       setsid bash -c 'echo $$ > "$1/server.pid"; exec "$2" server start --root "$3"' _ "$WORK" "$EVEROS_BIN" "$ROOT" \
         > "$WORK/server.log" 2>&1 &
-    sleep 3
-    curl -sf "http://127.0.0.1:$PORT/docs" > /dev/null && echo "up on :$PORT" || { echo "启动失败,看 $WORK/server.log"; exit 1; }
+    # /docs 在本配置不存在(实证);轮询真实 search endpoint 探活,最多 60s(启动含 cascade 扫描)
+    for i in $(seq 1 30); do
+      sleep 2
+      if curl -sf -X POST "http://127.0.0.1:$PORT/api/v1/memory/search" -H 'Content-Type: application/json'         -d '{"agent_id":"everos-m1b-probe","query":"probe","method":"keyword","top_k":1,"enable_llm_rerank":false}' > /dev/null; then
+        echo "up on :$PORT (after $((i*2))s)"; break
+      fi
+      [ "$i" = 30 ] && { echo "启动失败(60s 未就绪),看 $WORK/server.log"; exit 1; }
+    done
     # 真实检索 smoke:embedding/rerank 组件 guard 缺配置会在这里 fail-loud(不能只看 /docs)
     curl -sf -X POST "http://127.0.0.1:$PORT/api/v1/memory/search" -H 'Content-Type: application/json' \
       -d '{"agent_id":"everos-m1b-probe","query":"smoke","method":"hybrid","top_k":5,"enable_llm_rerank":false}' \
       > /dev/null && echo "search smoke ok" || { echo "search smoke 失败(组件 guard/配置),看 $WORK/server.log"; exit 1; }
     ;;
   stop)   kill -TERM -- -"$(ps -o pgid= -p "$(cat "$WORK/server.pid")" | tr -d ' ')" && echo stopped ;;
-  status) curl -sf "http://127.0.0.1:$PORT/docs" >/dev/null && echo up || echo down ;;
+  status)
+    if kill -0 "$(cat "$WORK/server.pid" 2>/dev/null)" 2>/dev/null; then
+      curl -sf -X POST "http://127.0.0.1:$PORT/api/v1/memory/search" -H 'Content-Type: application/json'         -d '{"agent_id":"everos-m1b-probe","query":"probe","method":"keyword","top_k":1,"enable_llm_rerank":false}'         > /dev/null && echo "up (pid $(cat "$WORK/server.pid"))" || echo "process alive but api down"
+    else echo down; fi ;;
 esac
