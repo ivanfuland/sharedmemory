@@ -30,9 +30,9 @@ case "${1:?setup|start|stop|status}" in
       EVEROS_EMBEDDING__API_KEY="${EVEROS_EMBED_API_KEY:-dummy}" \
       EVEROS_RERANK__PROVIDER=vllm EVEROS_RERANK__BASE_URL="$INFINITY_BASE" \
       EVEROS_RERANK__MODEL="${EVEROS_RERANK_MODEL:?env.sh 需补 EVEROS_RERANK_MODEL(以副本 everos.toml/Infinity 模型清单核实)}" \
-      setsid "$EVEROS_BIN" server start --root "$ROOT" \
+      setsid bash -c 'echo $$ > "$1/server.pid"; exec "$2" server start --root "$3"' _ "$WORK" "$EVEROS_BIN" "$ROOT" \
         > "$WORK/server.log" 2>&1 &
-    echo $! > "$WORK/server.pid"; sleep 3
+    sleep 3
     curl -sf "http://127.0.0.1:$PORT/docs" > /dev/null && echo "up on :$PORT" || { echo "启动失败,看 $WORK/server.log"; exit 1; }
     # 真实检索 smoke:embedding/rerank 组件 guard 缺配置会在这里 fail-loud(不能只看 /docs)
     curl -sf -X POST "http://127.0.0.1:$PORT/api/v1/memory/search" -H 'Content-Type: application/json' \

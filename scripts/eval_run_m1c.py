@@ -158,8 +158,11 @@ def cmd_assemble(a):
 
 
 def _by_q(verdicts: dict, kind: str, qid: str):
+    # job_id 格式: l1 = "l1:{qid}:{card_id}"(maxsplit=2), top5 = "top5:{qid}:{rank}:{card_id}"(maxsplit=3)。
+    # card_id 是自由文本可能含半角冒号,不能用无限制 split(":") 切,否则静默切碎错配(codex review)。
+    maxsplit = {"l1": 2, "top5": 3}[kind]
     for k, v in verdicts.items():
-        parts = k.split(":")
+        parts = k.split(":", maxsplit)
         if parts[0] == kind and parts[1] == qid:
             v = dict(v); v["card_id"] = parts[-1]
             yield k, v
