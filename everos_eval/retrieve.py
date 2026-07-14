@@ -31,3 +31,15 @@ def search(base_url: str, agent_id: str, query: str, top_k: int = 20) -> dict:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:  # 报错先看 body(M1b 铁律)
         raise RuntimeError(f"search HTTP {e.code}: {e.read().decode()[:2000]}") from e
+
+
+AGENT_PREFIX = "everos-m1b-probe_"
+
+
+def canonical_id(result_id: str, mem_type: str) -> str:
+    """search 返回 id → canonical entry id(2026-07-14 sanity 实证):
+    agent_case 返回带 agent 前缀(everos-m1b-probe_ac_...),canonical 无前缀;
+    agent_skill 的 canonical frontmatter id 本就含前缀,原样返回。"""
+    if mem_type == "agent_case" and result_id.startswith(AGENT_PREFIX + "ac_"):
+        return result_id[len(AGENT_PREFIX):]
+    return result_id

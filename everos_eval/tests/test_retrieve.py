@@ -1,4 +1,4 @@
-from everos_eval.retrieve import merge_top5
+from everos_eval.retrieve import merge_top5, canonical_id
 
 
 def _it(i, s=None):
@@ -23,3 +23,9 @@ def test_merge_uses_array_order_not_score():
     cases = [_it("c1", 0.1), _it("c2", 0.99)]  # 数组顺序即类型内排名,分数刻意反着放
     skills = [_it("s1", 0.2)]
     assert [t["id"] for t in merge_top5(cases, skills)] == ["s1", "c1", "c2"]
+
+
+def test_canonical_id_mapping():
+    # sanity 实证:case 去 agent 前缀,skill 原样(frontmatter id 本就含前缀)
+    assert canonical_id("everos-m1b-probe_ac_20260713_00000003", "agent_case") == "ac_20260713_00000003"
+    assert canonical_id("everos-m1b-probe_TDD 基础件实现：先写完整测试再实现", "agent_skill") == "everos-m1b-probe_TDD 基础件实现：先写完整测试再实现"
