@@ -44,3 +44,4 @@ def test_compute_metrics_end_to_end():
     assert m["n_uncovered"] == 1
     assert m["uncovered_irrelevant_rate"] == 3 / 5
     assert m["go_with_guard"] is True  # 无关占比 3/5 = 0.6 ≥ 0.6 触发(spec §5;判无关不判相关)
+    assert math.isclose(m["covered_useful_hit_wilson_lo"], wilson_lower(1, 3))
