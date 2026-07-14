@@ -50,6 +50,8 @@ sed -E 's/^(export[[:space:]]+)?([A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|
 mv "$BASE/env.redacted.tmp" "$BASE/env.redacted"
 
 OUT="$DEST/everos-$STAMP.tar.gz"
+# 中途被杀不留孤儿(codex PR58-P2):.tmp 不进轮转 glob,会无限累积;成功路径 mv 之后 rm -f 是 no-op
+trap 'rm -f "$OUT.tmp" "$BASE/env.redacted.tmp"' EXIT INT TERM
 tar -C "$(dirname "$BASE")" --exclude="$BASENAME/env" --exclude="$BASENAME/env.redacted.tmp" \
   -czf "$OUT.tmp" "$BASENAME"
 tar -tzf "$OUT.tmp" > /dev/null            # 读回验证:archive 可枚举才算写成

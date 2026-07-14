@@ -153,7 +153,12 @@ def main() -> None:
     # ── 读 rows + 快照内冷却核对(零 /add 之前;codex R4-3/R5-4)──
     rows, payload_max, found = _read_rows(cass_db, a.external_id)
     if not rows:
-        _emit("skipped", detail="adapter_skipped:no_feedable" if found else "conv_not_found_in_cass")
+        if not found:
+            # conv 不在 CASS(codex PR58-P1):零 /add,但绝不能落 terminal skipped——配错库/台账-CASS
+            # 漂移会把整个 backlog 静默烧成 skipped。回 pending:配置修复后自愈;真消失的会话由
+            # 人工标 dead 收口(dead 的两个合法来源之一,spec §3)。
+            _emit("no_side_effect_error", detail="conv_not_found_in_cass")
+        _emit("skipped", detail="adapter_skipped:no_feedable")
     if payload_max is not None and payload_max > a.claim_msg_ts:
         _emit("stale", payload_max=payload_max)  # 喂中出现新消息:零 /add,worker CAS 清租约回 pending
 

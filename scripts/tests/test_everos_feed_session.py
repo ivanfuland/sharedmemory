@@ -292,6 +292,30 @@ def test_e2e_first_add_422_backoff_absorbed(tmp_path):
     assert any(h.endswith("/memory/flush") for h in _Fake422ThenOkEverOS.hits)  # 退避后走完全程
 
 
+def test_e2e_conv_not_found_returns_to_pending(tmp_path):
+    """codex PR58-P1:external_id 在 CASS 里找不到对应会话 → no_side_effect_error/
+    conv_not_found_in_cass 回 pending,而非 terminal skipped(配错库/台账-CASS 漂移
+    不许静默烧掉整个 backlog)。合成库正常但 --external-id 指向不存在的会话,
+    stub server 起着但零 HTTP 命中(冷却核对/conv 查找都在首个 /add 之前)。"""
+    db = _mk_cass(tmp_path)  # 只含 external_id="s1"
+    _FakeEverOS.hits = []
+    srv = HTTPServer(("127.0.0.1", 0), _FakeEverOS)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        p = _run_feeder({
+            "EVEROS_CASS_DB": db,
+            "EVEROS_PROD_BASE_URL": f"http://127.0.0.1:{srv.server_port}",
+            "EVEROS_PROD_MD_ROOT": str(tmp_path / "md"),
+        }, external_id="missing-one")
+    finally:
+        srv.shutdown()
+    assert p.returncode == 0, p.stderr
+    out = _json.loads(p.stdout.strip().splitlines()[-1])
+    assert out["status"] == "no_side_effect_error"
+    assert out["detail"] == "conv_not_found_in_cass"
+    assert _FakeEverOS.hits == []
+
+
 # ── T2 review follow-up:main 状态机盲区补测(控制面增补,非 brief verbatim) ──
 
 

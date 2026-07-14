@@ -6,8 +6,12 @@
 #       PIN 只能经升级门(校准集回归过了)更新——`pin` 子命令写,`run` 子命令验。
 set -euo pipefail
 ENVSH="${EVEROS_PROD_ENV:?set EVEROS_PROD_ENV to your private env file}"
+# set -a:source 出来的变量必须 export(codex PR58-P0)——systemd 只传 EVEROS_PROD_ENV 一个变量,
+# `run` 的 exec everos 子进程要靠这里导出的 EVEROS_API__*/EVEROS_LLM__* 等才能按生产配置起服。
+set -a
 # shellcheck disable=SC1090
 source "$ENVSH"
+set +a
 ROOT="${EVEROS_PROD_ROOT:?env 缺 EVEROS_PROD_ROOT}"
 PORT="${EVEROS_PROD_PORT:?env 缺 EVEROS_PROD_PORT}"
 TEMPLATE="${EVEROS_TEMPLATE_DIR:?env 缺 EVEROS_TEMPLATE_DIR}"
@@ -77,6 +81,10 @@ case "${1:?setup|pin|run|smoke|status}" in
     fi
     ;;
   status)
-    _search probe keyword && echo up || echo down
+    # down 时 exit 1(codex PR58-P2):自动化按退出码判活,down 不许 false-green
+    if _search probe keyword; then echo up; else echo down; exit 1; fi
+    ;;
+  *)
+    echo "usage: everos_prod_instance.sh {setup|pin|run|smoke|status}" >&2; exit 2
     ;;
 esac
