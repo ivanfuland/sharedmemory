@@ -16,11 +16,16 @@ BASE="$(dirname "$ROOT")"
 PIN_FILE="$BASE/PIN"
 
 _fingerprint() {  # 两因子:源码 git SHA + venv 依赖冻结哈希(抓 git 不变但 pip install 变的漂移)
+  # fail-loud(T5 评审 Important-2):venv python 缺失 / pip freeze 失败或为空时,若静默成空串,
+  # pin 与 run 两侧会算出同一个"空 freeze"哈希 → 假匹配,fail-closed 反转成 fail-open。
   SRC="${EVEROS_SRC_DIR:?env 缺 EVEROS_SRC_DIR}"
   BIN="${EVEROS_BIN:?env 缺 EVEROS_BIN}"
   PY="$(dirname "$BIN")/python"
+  [ -x "$PY" ] || { echo "FATAL: venv python missing: $PY" >&2; return 1; }
+  freeze="$("$PY" -m pip freeze 2>/dev/null)" || { echo "FATAL: pip freeze failed" >&2; return 1; }
+  [ -n "$freeze" ] || { echo "FATAL: pip freeze empty" >&2; return 1; }
   echo "git_sha=$(git -C "$SRC" rev-parse HEAD)"
-  echo "venv_freeze_sha256=$("$PY" -m pip freeze 2>/dev/null | sha256sum | cut -d' ' -f1)"
+  echo "venv_freeze_sha256=$(printf '%s' "$freeze" | sha256sum | cut -d' ' -f1)"
 }
 
 _search() {  # 真 search endpoint 探活(M1c 实证:/docs 在本配置不存在)
@@ -37,7 +42,12 @@ case "${1:?setup|pin|run|smoke|status}" in
     echo "fresh root ready: $ROOT(只拷两份 toml——生产从零喂,不带探针数据/探针 agent 分区)"
     ;;
   pin)  # 记录当前版本指纹。只允许两个场合调用:首次落地(Task 16)/升级门通过后(runbook ④)。
-    _fingerprint > "$PIN_FILE"
+    # tmp+mv:_fingerprint 半途失败不得留下空/半写 PIN(空 PIN 会让 run 侧永远 mismatch 还难诊断)。
+    # 先经命令替换拿到完整输出再落盘——直接 `_fingerprint > tmp` 会在函数执行前就先
+    # truncate/创建 tmp 文件,函数早退失败时也会留下一个空 .tmp 残留。
+    fp="$(_fingerprint)" || { echo "FATAL: fingerprint failed, PIN not written" >&2; exit 1; }
+    printf '%s\n' "$fp" > "$PIN_FILE.tmp"
+    mv "$PIN_FILE.tmp" "$PIN_FILE"
     echo "pinned:"; cat "$PIN_FILE"
     ;;
   run)  # systemd 入口:PIN 校验 fail-closed,不匹配拒绝启动(防绕过校准集回归门的静默漂移)
@@ -55,7 +65,11 @@ case "${1:?setup|pin|run|smoke|status}" in
     exec "${EVEROS_BIN:?env 缺 EVEROS_BIN}" server start --root "$ROOT"
     ;;
   smoke)
-    _search smoke hybrid && echo "search smoke ok" || { echo "search smoke 失败,看实例日志"; exit 1; }
+    if _search smoke hybrid; then
+      echo "search smoke ok"
+    else
+      echo "search smoke 失败,看实例日志"; exit 1
+    fi
     ;;
   status)
     _search probe keyword && echo up || echo down
