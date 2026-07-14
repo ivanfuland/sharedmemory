@@ -43,7 +43,10 @@ mkdir -p "$DEST"
 # env 缺失 = 备份不可恢复,fail-loud(R2-P2-2:不许出"没有 env.redacted 的绿备份");
 # 先写 .tmp 再 mv,防半写副本;tar 内强断言 redacted 存在,防 stale/漏打。
 [ -f "$BASE/env" ] || { echo "[backup] FATAL: $BASE/env missing; cannot create restorable backup"; exit 1; }
-sed -E 's/^([A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*)=.*/\1=REDACTED/' "$BASE/env" > "$BASE/env.redacted.tmp"
+# 标记词网放宽到常见凭证命名 + 容忍 export 前缀(T6 评审 Important:KEY|TOKEN|SECRET 三词漏
+# PASSWORD/AUTH 类;env 命名契约见 plan env 模板头注,双保险)
+sed -E 's/^(export[[:space:]]+)?([A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|AUTH|CREDENTIAL)[A-Za-z0-9_]*)=.*/\1\2=REDACTED/' \
+  "$BASE/env" > "$BASE/env.redacted.tmp"
 mv "$BASE/env.redacted.tmp" "$BASE/env.redacted"
 
 OUT="$DEST/everos-$STAMP.tar.gz"
