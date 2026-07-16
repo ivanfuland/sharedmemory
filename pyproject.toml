@@ -20,11 +20,16 @@ dev = [
     "blake3>=1.0.9",
     "pytest>=8.0",
 ]
+probe = [
+    "transformers>=4.40",
+    "tokenizers>=0.19",
+]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "everos_eval/tests"]
 markers = [
     "slow: long-running acceptance tests (real doctor / full NAS readback)",
     "realcass: requires the real cass binary on PATH",
     "nas: writes to a real NAS scratch dir (CASS_ACCEPT_NAS=1)",
+    "live: requires real probe-2b data via EVEROS_PROBE2B_DATA env var (skipped by default)",
 ]

@@ -6,7 +6,7 @@ import urllib.request
 
 def merge_top5(agent_cases, agent_skills, k: int = 5):
     """确定性交错(spec R5):skill/case 各按数组内部排名,skill 先,一侧耗尽另一侧补齐。
-    跨类型分数不可比(case=RRF fusion 分,skill=cross-encoder 分),score 只记账不排序。"""
+    跨类型分数不可比(case=vector_anchored 分,skill=cross-encoder 分),score 只记账不排序。"""
     def _wrap(items, mem_type):
         return [{"id": it["id"], "mem_type": mem_type, "score": it.get("score"), "payload": it}
                 for it in items]

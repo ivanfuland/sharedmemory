@@ -24,6 +24,16 @@ def build_foresight_jobs(entries):
             for c in entries]
 
 
+def build_sj_jobs(queries, candidates_by_qid, card_text_by_id):
+    """统一第二判(P3 §Task2):逐候选建 job,与 build_l1_jobs 同构字段,**无 rank、无 top5 语义**
+    (rank-blind 是本轮补判的核心协议要求——L1/top5 信息条件不同,混用引入 selection-context 偏差)。
+    candidates_by_qid:{query_id: [load_candidates() 产出的候选 dict, ...]}。"""
+    return [{"job_id": f"sj:{q['query_id']}:{c['canonical_card_id']}", "kind": "sj",
+             "query": q["query"], "card_id": c["canonical_card_id"], "card_type": c["mem_type"],
+             "card_text": card_text_by_id[c["canonical_card_id"]]}
+            for q in queries for c in candidates_by_qid.get(q["query_id"], [])]
+
+
 def _valid(v, kind) -> bool:
     if not isinstance(v.get("job_id"), str) or not isinstance(v.get("reason"), str):
         return False
@@ -34,7 +44,7 @@ def _valid(v, kind) -> bool:
     return not (v["useful"] and not v["relevant"])  # useful ⇒ relevant
 
 
-_KIND_PREFIX = {"l1": "l1", "top5": "top5", "foresight": "fs"}
+_KIND_PREFIX = {"l1": "l1", "top5": "top5", "foresight": "fs", "sj": "sj"}
 
 
 def parse_verdicts(path: Path, expected_kind: str, expected_job_ids: set | None = None):
