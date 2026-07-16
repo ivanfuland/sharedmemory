@@ -196,7 +196,12 @@ mkdir -p "$HOME/.local/share"
 exec 9>"$HOME/.local/share/.cass-write.lock"
 flock -w "$LOCK_WAIT" 9 || { echo "[backup] FATAL: cass write lock busy"; exit 1; }
 
-timeout "$DOCTOR_TIMEOUT" cass doctor --json --data-dir "$CASS_DATA_DIR" > "$STG/doctor.json" 9>&- 8>&- || true
+# Tier 0 门要求 doctor status='verified'(cass_manifest_census.py 硬判据),而 doctor 默认
+# bounded 模式在 manifest 数 > 256(内置上限)时整体转 'verification_deferred' → 门必红。
+# 本库 manifest 5000+,全量校验开关是门语义的一部分,必须显式携带——不依赖环境巧合
+# (2026-07-17 00:30 夜备实证:该开关一旦不在 ambient env,Tier 0 确定性 FATAL;
+#  历史绿备份如何拿到该 env 未定论,疑 pm2 缓存 env 于 07-16 --update-env 重启时被抹)。
+CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY=1 timeout "$DOCTOR_TIMEOUT" cass doctor --json --data-dir "$CASS_DATA_DIR" > "$STG/doctor.json" 9>&- 8>&- || true
 #   （doctor exit code 不可信；status/summary 的锁内快速检查：status 非 verified/warn 结构
 #   → exit 1 —— 这一判据由紧随其后的 cass_manifest_census.py 一并做出，见下方调用）
 timeout "$DB_TIMEOUT" sqlite3 "$CASS_DATA_DIR/agent_search.db" ".backup '$STG/db'" 9>&- 8>&- \
