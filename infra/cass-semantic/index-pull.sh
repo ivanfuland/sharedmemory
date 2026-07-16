@@ -21,16 +21,18 @@ curl -sf -m5 "$URL/health" >/dev/null || emit_fail "Infinity down" 2
 # 日志按 run 留存(keep 48 ≈ 2 天,含本次)。2026-07-16 教训:单文件每 run 覆盖,深夜两次
 # 异常全量回落的日志被后续 run 冲掉,根因无据可查。/tmp/cc-cass-pull.log 保留为指向最新
 # run 的 symlink(人类习惯路径;runner.ts 只读 stdout JSON,不读此日志,契约不变)。
-# codex R1 加固:#1 空目录 glob 不炸(ls 无匹配 rc=2,pipefail 下首跑必死死循环,已实测)
-# / #2 目录 0700+拒 symlink / #3 文件名带 pid 防同秒重试覆盖证据 / #5 先建本次再轮转,真 keep-48。
-LOG_DIR=/tmp/cc-cass-pull-logs
+# codex R1/R2 加固:#2 目录 0700+拒 symlink / #3 文件名带 pid 防同秒重试覆盖证据
+# / #5 先建本次再轮转,真 keep-48 / R2-Part1#1 轮转用 find(空目录 rc=0 天然安静,
+# 真实错误——权限/IO——照常非零 fail-loud,不像 `ls||true` 会把一切吞掉)。
+LOG_DIR="${CASS_PULL_LOG_DIR:-/tmp/cc-cass-pull-logs}"   # env 缝隙仅供测试隔离(不劫持生产 symlink)
 if [ -L "$LOG_DIR" ]; then emit_fail "log dir is a symlink: $LOG_DIR"; fi
 mkdir -p "$LOG_DIR"
 chmod 700 "$LOG_DIR"
 RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
 : > "$RUN_LOG"
-ln -sfn "$RUN_LOG" /tmp/cc-cass-pull.log
-(ls -1t "$LOG_DIR"/run-*.log 2>/dev/null || true) | tail -n +49 | xargs -r rm --
+ln -sfn "$RUN_LOG" "$LOG_DIR/latest.log"
+[ -n "${CASS_PULL_LOG_DIR:-}" ] || ln -sfn "$RUN_LOG" /tmp/cc-cass-pull.log
+find "$LOG_DIR" -maxdepth 1 -name 'run-*.log' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2- | tail -n +49 | xargs -r rm --
 
 # 快照 scan watermark；trap 在词法未完成（清退或 SIGTERM 超时）时回滚（SIGKILL 无法 trap）。
 WM=$(sqlite3 "$DB" "SELECT key||char(9)||value FROM meta WHERE key LIKE 'last_scan_ts:%';" 2>/dev/null || echo "")
@@ -52,12 +54,14 @@ lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败
 # 1b) 结构探针(2026-07-16 fsqlite 丢写事故哨兵):两类已知损坏签名的小时级检查(秒级只读)。
 #     命中即 fail-loud——1 小时内知道,而不是等 00:30 夜备五腿门(最坏 24h)。
 #     它同时是「≥0.1.16 再损坏 → 全迁 rusqlite」触发线的自动哨兵。
+#     codex R2-F1:外层再包 150s 硬超时(探针内部每查询另有 60s),绝不拖小时窗。
+#     codex R2-F3:日志追加 best-effort(磁盘满不得抢在 emit_fail 前死);JSON 转义先反斜杠后引号。
 PROBE="$(dirname "${BASH_SOURCE[0]}")/structure-probe.sh"
-if probe_out=$(bash "$PROBE" "$DB" 2>&1); then
+if probe_out=$(timeout 150 bash "$PROBE" "$DB" 2>&1); then
   :
 else
-  echo "$probe_out" >> "$RUN_LOG"
-  emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | sed 's/"/\\"/g')" 3
+  echo "$probe_out" >> "$RUN_LOG" 2>/dev/null || true
+  emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')" 3
 fi
 
 # 2) bge-m3 语义。先判语义是否已与 DB 一致（manifest fp 的 conv/msg == DB）——一致则跳过，
