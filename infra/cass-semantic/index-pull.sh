@@ -44,6 +44,17 @@ CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
 
+# 1b) 结构探针(2026-07-16 fsqlite 丢写事故哨兵):两类已知损坏签名的小时级检查(秒级只读)。
+#     命中即 fail-loud——1 小时内知道,而不是等 00:30 夜备五腿门(最坏 24h)。
+#     它同时是「≥0.1.16 再损坏 → 全迁 rusqlite」触发线的自动哨兵。
+PROBE="$(dirname "${BASH_SOURCE[0]}")/structure-probe.sh"
+if probe_out=$(bash "$PROBE" "$DB" 2>&1); then
+  :
+else
+  echo "$probe_out" >> "$RUN_LOG"
+  emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | sed 's/"/\\"/g')" 3
+fi
+
 # 2) bge-m3 语义。先判语义是否已与 DB 一致（manifest fp 的 conv/msg == DB）——一致则跳过，
 #    避免无新内容时每日 backfill 空转重 walk 整语料（~12min CPU；codex 之外的效率加固）。
 pub=""
