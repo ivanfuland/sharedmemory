@@ -18,6 +18,23 @@ exec 9>"$LOCK"; flock -n 9 || { echo '{"ok":false,"skipped":"another cass write 
 curl -sf -m5 "$URL/health" >/dev/null || emit_fail "Infinity down" 2
 [ -d "$CANON" ] || emit_fail "canonical missing: $CANON"
 
+# 日志按 run 留存(keep 48 ≈ 2 天,含本次)。2026-07-16 教训:单文件每 run 覆盖,深夜两次
+# 异常全量回落的日志被后续 run 冲掉,根因无据可查。/tmp/cc-cass-pull.log 保留为指向最新
+# run 的 symlink(人类习惯路径;runner.ts 只读 stdout JSON,不读此日志,契约不变)。
+# codex R1/R2 加固:#2 目录 0700+拒 symlink / #3 文件名带 pid 防同秒重试覆盖证据
+# / #5 先建本次再轮转,真 keep-48 / R2-Part1#1 轮转用 find(空目录 rc=0 天然安静,
+# 真实错误——权限/IO——照常非零 fail-loud,不像 `ls||true` 会把一切吞掉)。
+LOG_DIR="${CASS_PULL_LOG_DIR:-/tmp/cc-cass-pull-logs}"   # env 缝隙仅供测试隔离(不劫持生产 symlink)
+if [ -L "$LOG_DIR" ]; then emit_fail "log dir is a symlink: $LOG_DIR"; fi
+mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
+RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+: > "$RUN_LOG"
+ln -sfn "$RUN_LOG" "$LOG_DIR/latest.log"
+[ -n "${CASS_PULL_LOG_DIR:-}" ] || ln -sfn "$RUN_LOG" /tmp/cc-cass-pull.log
+# NUL 安全轮转(codex R3-P1:含空格路径下 \n+xargs 会拆词误删):全链 -z。
+find "$LOG_DIR" -maxdepth 1 -name 'run-*.log' -printf '%T@\t%p\0' | sort -rzn | cut -z -f2- | tail -zn +49 | xargs -0r rm --
+
 # 快照 scan watermark；trap 在词法未完成（清退或 SIGTERM 超时）时回滚（SIGKILL 无法 trap）。
 WM=$(sqlite3 "$DB" "SELECT key||char(9)||value FROM meta WHERE key LIKE 'last_scan_ts:%';" 2>/dev/null || echo "")
 lexical_ok=0
@@ -31,9 +48,23 @@ restore_wm() {
 trap restore_wm EXIT
 
 # 1) 词法 + DB 增量 index（不带 --semantic）。失败→trap 回滚水位。
-CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" index >/tmp/cc-cass-pull.log 2>&1 \
+CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
+
+# 1b) 结构探针(2026-07-16 fsqlite 丢写事故哨兵):两类已知损坏签名的小时级检查(秒级只读)。
+#     命中即 fail-loud——1 小时内知道,而不是等 00:30 夜备五腿门(最坏 24h)。
+#     它同时是「≥0.1.16 再损坏 → 全迁 rusqlite」触发线的自动哨兵。
+#     codex R2-F1:外层再包 150s 硬超时(探针内部每查询另有 60s),绝不拖小时窗。
+#     codex R2-F3:日志追加 best-effort(磁盘满不得抢在 emit_fail 前死);JSON 转义先反斜杠后引号。
+PROBE="$(dirname "${BASH_SOURCE[0]}")/structure-probe.sh"
+if probe_out=$(timeout --kill-after=10 150 bash "$PROBE" "$DB" 2>&1); then
+  :
+else
+  echo "$probe_out" >> "$RUN_LOG" 2>/dev/null || true
+  # 全部控制字符(\000-\037)一律清除(codex R3-P2:TAB/CR 也会打破末行 JSON 契约;换行已先转 ';')
+  emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')" 3
+fi
 
 # 2) bge-m3 语义。先判语义是否已与 DB 一致（manifest fp 的 conv/msg == DB）——一致则跳过，
 #    避免无新内容时每日 backfill 空转重 walk 整语料（~12min CPU；codex 之外的效率加固）。
@@ -72,7 +103,7 @@ else
     | while read -r p; do [ -f "$p" ] && { printf '%s' "$p"; break; }; done)
   if [ -n "$SENTINEL" ]; then
     if CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_INDEX_STALL_ABORT_SECS=0 \
-         "$BIN" index --semantic --embedder infinity --watch-once "$SENTINEL" >>/tmp/cc-cass-pull.log 2>&1; then
+         "$BIN" index --semantic --embedder infinity --watch-once "$SENTINEL" >>"$RUN_LOG" 2>&1; then
       # 追加"成功退出"不等于"追上了"——必须用指纹复核，否则会把陈旧索引当新的
       [ "$(sem_matches)" = yes ] && { pub=True; echo "semantic 增量追加完成"; }
     fi
@@ -85,7 +116,7 @@ else
   if [ "$pub" != "True" ]; then
     prev=-1
     for i in $(seq 1 200); do
-      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>/tmp/cc-cass-pull.log) \
+      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
         || emit_fail "backfill errored"
       read -r pub off < <(printf '%s' "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('published'),d.get('last_offset'))" 2>/dev/null) \
         || emit_fail "backfill parse"
