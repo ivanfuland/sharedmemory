@@ -24,5 +24,5 @@ for t in conversations messages; do
     fail=1
   fi
 done
-[ "$fail" = 0 ] && echo "structure probe clean"
+if [ "$fail" = 0 ]; then echo "structure probe clean"; fi
 exit "$fail"

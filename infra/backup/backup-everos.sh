@@ -67,11 +67,15 @@ if [ "$_tar_rc" -ge 2 ]; then
 elif [ "$_tar_rc" -eq 1 ]; then
   echo "[backup] WARN: tar exit 1 (file changed as we read it) — crash-consistent 设计内,继续"
 fi
-tar -tzf "$OUT.tmp" > /dev/null            # 读回验证:archive 可枚举才算写成
-if tar -tzf "$OUT.tmp" | grep -qx "$BASENAME/env"; then   # 防呆:明文 env 绝不入 tar
+# 读回验证:archive 可枚举才算写成(命令替换失败由 set -e 拦)。枚举一次、检查复用——
+# 并且 grep 不带 -q:pipefail 下 -q 早退会 SIGPIPE 掉上游 tar,把「匹配成功」翻成
+# 「管道失败」(codex R1#4,789 条目 archive 实测 PIPESTATUS=2,0):env.redacted 在场会被
+# 误判缺失拒发布,更糟的是 env 真泄漏时告警被跳过。printf+全量消费的 grep 无此坑。
+_entries=$(tar -tzf "$OUT.tmp")
+if printf '%s\n' "$_entries" | grep -x "$BASENAME/env" >/dev/null; then   # 防呆:明文 env 绝不入 tar
   rm -f "$OUT.tmp"; echo "[backup] FATAL: plaintext env leaked into archive"; exit 1
 fi
-tar -tzf "$OUT.tmp" | grep -qx "$BASENAME/env.redacted" || {   # 防呆:可恢复性载体必须在
+printf '%s\n' "$_entries" | grep -x "$BASENAME/env.redacted" >/dev/null || {   # 防呆:可恢复性载体必须在
   rm -f "$OUT.tmp"; echo "[backup] FATAL: env.redacted missing from archive"; exit 1; }
 mv "$OUT.tmp" "$OUT"
 echo "[backup] wrote $OUT ($(du -h "$OUT" | cut -f1))"

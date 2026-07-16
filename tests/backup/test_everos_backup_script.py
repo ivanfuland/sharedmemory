@@ -28,6 +28,11 @@ def _mk_instance(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pa
     (root / "skills" / "demo").mkdir(parents=True)
     (root / "skills" / "demo" / "SKILL.md").write_text("# demo\n")
     (root / "cases.md").write_text("case data\n")
+    # codex R1#4:大条目量给 tar|grep 管道加 SIGPIPE 压力(小 fixture 抓不到 -q 早退误判)
+    bulk = root / "bulk"
+    bulk.mkdir()
+    for i in range(1500):
+        (bulk / f"f{i:04d}.md").write_text("x\n")
     (base / "env").write_text(
         "EVEROS_API_KEY=super-secret\n"
         f"EVEROS_PROD_ROOT={root}\n"

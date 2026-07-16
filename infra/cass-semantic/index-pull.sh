@@ -18,14 +18,19 @@ exec 9>"$LOCK"; flock -n 9 || { echo '{"ok":false,"skipped":"another cass write 
 curl -sf -m5 "$URL/health" >/dev/null || emit_fail "Infinity down" 2
 [ -d "$CANON" ] || emit_fail "canonical missing: $CANON"
 
-# 日志按 run 留存(keep 48 ≈ 2 天)。2026-07-16 教训:单文件每 run 覆盖,深夜两次异常
-# 全量回落的日志被后续 run 冲掉,根因无据可查。/tmp/cc-cass-pull.log 保留为指向最新
+# 日志按 run 留存(keep 48 ≈ 2 天,含本次)。2026-07-16 教训:单文件每 run 覆盖,深夜两次
+# 异常全量回落的日志被后续 run 冲掉,根因无据可查。/tmp/cc-cass-pull.log 保留为指向最新
 # run 的 symlink(人类习惯路径;runner.ts 只读 stdout JSON,不读此日志,契约不变)。
+# codex R1 加固:#1 空目录 glob 不炸(ls 无匹配 rc=2,pipefail 下首跑必死死循环,已实测)
+# / #2 目录 0700+拒 symlink / #3 文件名带 pid 防同秒重试覆盖证据 / #5 先建本次再轮转,真 keep-48。
 LOG_DIR=/tmp/cc-cass-pull-logs
+if [ -L "$LOG_DIR" ]; then emit_fail "log dir is a symlink: $LOG_DIR"; fi
 mkdir -p "$LOG_DIR"
-RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
+chmod 700 "$LOG_DIR"
+RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+: > "$RUN_LOG"
 ln -sfn "$RUN_LOG" /tmp/cc-cass-pull.log
-ls -1t "$LOG_DIR"/run-*.log 2>/dev/null | tail -n +49 | xargs -r rm --
+(ls -1t "$LOG_DIR"/run-*.log 2>/dev/null || true) | tail -n +49 | xargs -r rm --
 
 # 快照 scan watermark；trap 在词法未完成（清退或 SIGTERM 超时）时回滚（SIGKILL 无法 trap）。
 WM=$(sqlite3 "$DB" "SELECT key||char(9)||value FROM meta WHERE key LIKE 'last_scan_ts:%';" 2>/dev/null || echo "")
