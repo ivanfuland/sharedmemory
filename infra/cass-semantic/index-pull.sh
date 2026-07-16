@@ -18,6 +18,15 @@ exec 9>"$LOCK"; flock -n 9 || { echo '{"ok":false,"skipped":"another cass write 
 curl -sf -m5 "$URL/health" >/dev/null || emit_fail "Infinity down" 2
 [ -d "$CANON" ] || emit_fail "canonical missing: $CANON"
 
+# 日志按 run 留存(keep 48 ≈ 2 天)。2026-07-16 教训:单文件每 run 覆盖,深夜两次异常
+# 全量回落的日志被后续 run 冲掉,根因无据可查。/tmp/cc-cass-pull.log 保留为指向最新
+# run 的 symlink(人类习惯路径;runner.ts 只读 stdout JSON,不读此日志,契约不变)。
+LOG_DIR=/tmp/cc-cass-pull-logs
+mkdir -p "$LOG_DIR"
+RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
+ln -sfn "$RUN_LOG" /tmp/cc-cass-pull.log
+ls -1t "$LOG_DIR"/run-*.log 2>/dev/null | tail -n +49 | xargs -r rm --
+
 # 快照 scan watermark；trap 在词法未完成（清退或 SIGTERM 超时）时回滚（SIGKILL 无法 trap）。
 WM=$(sqlite3 "$DB" "SELECT key||char(9)||value FROM meta WHERE key LIKE 'last_scan_ts:%';" 2>/dev/null || echo "")
 lexical_ok=0
@@ -31,7 +40,7 @@ restore_wm() {
 trap restore_wm EXIT
 
 # 1) 词法 + DB 增量 index（不带 --semantic）。失败→trap 回滚水位。
-CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" index >/tmp/cc-cass-pull.log 2>&1 \
+CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
 
@@ -72,7 +81,7 @@ else
     | while read -r p; do [ -f "$p" ] && { printf '%s' "$p"; break; }; done)
   if [ -n "$SENTINEL" ]; then
     if CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_INDEX_STALL_ABORT_SECS=0 \
-         "$BIN" index --semantic --embedder infinity --watch-once "$SENTINEL" >>/tmp/cc-cass-pull.log 2>&1; then
+         "$BIN" index --semantic --embedder infinity --watch-once "$SENTINEL" >>"$RUN_LOG" 2>&1; then
       # 追加"成功退出"不等于"追上了"——必须用指纹复核，否则会把陈旧索引当新的
       [ "$(sem_matches)" = yes ] && { pub=True; echo "semantic 增量追加完成"; }
     fi
@@ -85,7 +94,7 @@ else
   if [ "$pub" != "True" ]; then
     prev=-1
     for i in $(seq 1 200); do
-      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>/tmp/cc-cass-pull.log) \
+      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
         || emit_fail "backfill errored"
       read -r pub off < <(printf '%s' "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('published'),d.get('last_offset'))" 2>/dev/null) \
         || emit_fail "backfill parse"
