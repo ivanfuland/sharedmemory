@@ -56,8 +56,17 @@ cleanup() { rm -f "$OUT.tmp" "$BASE/env.redacted.tmp"; }
 trap cleanup EXIT
 trap 'cleanup; trap - EXIT; exit 130' INT
 trap 'cleanup; trap - EXIT; exit 143' TERM
+# tar 活目录:feeder 24/7 写实例文件,读中撞写时 GNU tar 报 "file changed as we read it"
+# 并 exit 1——crash-consistent 备份的设计内警告(见文件头注),不是失败;exit ≥2 才是真错。
+# 2026-07-16 实证:不区分会让备份被随机判死(试点补跑撞上 worker 写入,event 触发 FAIL)。
+_tar_rc=0
 tar -C "$(dirname "$BASE")" --exclude="$BASENAME/env" --exclude="$BASENAME/env.redacted.tmp" \
-  -czf "$OUT.tmp" "$BASENAME"
+  -czf "$OUT.tmp" "$BASENAME" || _tar_rc=$?
+if [ "$_tar_rc" -ge 2 ]; then
+  echo "[backup] FATAL: tar create failed rc=$_tar_rc"; exit 1
+elif [ "$_tar_rc" -eq 1 ]; then
+  echo "[backup] WARN: tar exit 1 (file changed as we read it) — crash-consistent 设计内,继续"
+fi
 tar -tzf "$OUT.tmp" > /dev/null            # 读回验证:archive 可枚举才算写成
 if tar -tzf "$OUT.tmp" | grep -qx "$BASENAME/env"; then   # 防呆:明文 env 绝不入 tar
   rm -f "$OUT.tmp"; echo "[backup] FATAL: plaintext env leaked into archive"; exit 1
