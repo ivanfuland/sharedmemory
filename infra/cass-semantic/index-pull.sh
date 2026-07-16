@@ -32,7 +32,8 @@ RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
 : > "$RUN_LOG"
 ln -sfn "$RUN_LOG" "$LOG_DIR/latest.log"
 [ -n "${CASS_PULL_LOG_DIR:-}" ] || ln -sfn "$RUN_LOG" /tmp/cc-cass-pull.log
-find "$LOG_DIR" -maxdepth 1 -name 'run-*.log' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2- | tail -n +49 | xargs -r rm --
+# NUL 安全轮转(codex R3-P1:含空格路径下 \n+xargs 会拆词误删):全链 -z。
+find "$LOG_DIR" -maxdepth 1 -name 'run-*.log' -printf '%T@\t%p\0' | sort -rzn | cut -z -f2- | tail -zn +49 | xargs -0r rm --
 
 # 快照 scan watermark；trap 在词法未完成（清退或 SIGTERM 超时）时回滚（SIGKILL 无法 trap）。
 WM=$(sqlite3 "$DB" "SELECT key||char(9)||value FROM meta WHERE key LIKE 'last_scan_ts:%';" 2>/dev/null || echo "")
@@ -57,11 +58,12 @@ lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败
 #     codex R2-F1:外层再包 150s 硬超时(探针内部每查询另有 60s),绝不拖小时窗。
 #     codex R2-F3:日志追加 best-effort(磁盘满不得抢在 emit_fail 前死);JSON 转义先反斜杠后引号。
 PROBE="$(dirname "${BASH_SOURCE[0]}")/structure-probe.sh"
-if probe_out=$(timeout 150 bash "$PROBE" "$DB" 2>&1); then
+if probe_out=$(timeout --kill-after=10 150 bash "$PROBE" "$DB" 2>&1); then
   :
 else
   echo "$probe_out" >> "$RUN_LOG" 2>/dev/null || true
-  emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')" 3
+  # 全部控制字符(\000-\037)一律清除(codex R3-P2:TAB/CR 也会打破末行 JSON 契约;换行已先转 ';')
+  emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')" 3
 fi
 
 # 2) bge-m3 语义。先判语义是否已与 DB 一致（manifest fp 的 conv/msg == DB）——一致则跳过，

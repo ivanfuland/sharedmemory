@@ -12,7 +12,7 @@ set -euo pipefail
 DB="${1:?usage: structure-probe.sh <agent_search.db>}"
 Q_TIMEOUT="${STRUCTURE_PROBE_QUERY_TIMEOUT:-60}"
 
-q() { timeout "$Q_TIMEOUT" sqlite3 -readonly "$DB" "$1"; }
+q() { timeout --kill-after=10 "$Q_TIMEOUT" sqlite3 -readonly "$DB" "$1"; }   # kill-after:TERM 被忽略也硬杀
 
 fail=0
 for t in conversations messages; do

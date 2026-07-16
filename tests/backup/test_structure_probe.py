@@ -120,9 +120,14 @@ def test_seek_invisible_signature_detected(tmp_path: pathlib.Path) -> None:
 
 
 def test_probe_query_timeout_fails_loud(tmp_path: pathlib.Path) -> None:
-    """codex R2-F1:查询超时 → 非 0/1 的探针自身故障退出,绝不静默当 clean。"""
+    """codex R2-F1/R3:查询超时 → GNU timeout 契约 rc=124 原样传播(set -e),绝不静默当 clean。
+    外层 150s timeout 与 --kill-after 属 GNU timeout 标准语义,自动化不真等 150s,不另测。"""
     db = _mk_multipage_db(tmp_path)
     env = {**os.environ, "STRUCTURE_PROBE_QUERY_TIMEOUT": "0.001"}
     r = subprocess.run(["bash", str(PROBE), str(db)], capture_output=True, text=True, timeout=30, env=env)
-    assert r.returncode not in (0,), f"超时不得报 clean:\n{r.stdout}{r.stderr}"
+    assert r.returncode == 124, f"应为 GNU timeout 契约 rc=124,实得 {r.returncode}:\n{r.stdout}{r.stderr}"
     assert "clean" not in r.stdout
+
+
+# 轮转 NUL 安全(codex R3-P1)在 test_index_pull_probe_wiring.py 里对真脚本+含空格目录验证,
+# 此处不复制脚本片段(片段复制会随脚本演进漂移成假绿)。

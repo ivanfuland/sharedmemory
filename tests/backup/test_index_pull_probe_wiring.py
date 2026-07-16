@@ -54,8 +54,9 @@ def test_probe_failure_emits_exit3_json(tmp_path: pathlib.Path) -> None:
     assert "seek-invisible" in payload["error"]
 
 
-def test_healthy_db_passes_probe_and_reaches_semantic_phase(tmp_path: pathlib.Path) -> None:
-    """健康库探针放行——脚本走过 1b 段(之后语义段行为不在本测试范围,只需非探针路径退出)。"""
+def test_healthy_db_passes_probe_and_rotation_is_nul_safe(tmp_path: pathlib.Path) -> None:
+    """健康库探针放行 + 轮转在**含空格目录**下 NUL 安全(codex R3-P1,跑真脚本真轮转):
+    预置 60 份旧日志,脚本跑完后 = 48 份(47 旧 + 本次),零拆词误删。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     _mk_multipage_db(tmp_path).rename(data_dir / "agent_search.db")
@@ -67,13 +68,22 @@ def test_healthy_db_passes_probe_and_reaches_semantic_phase(tmp_path: pathlib.Pa
     _stub(stub_bin, "curl", "exit 0")
     _stub(stub_bin, "cass-stub", "exit 0")
 
+    log_dir = tmp_path / "log dir with spaces"
+    log_dir.mkdir()
+    for i in range(60):
+        f = log_dir / f"run-2026071500{i:02d}00-9.log"
+        f.write_text("old")
+        os.utime(f, (1_000_000_000 + i, 1_000_000_000 + i))
+
     env = {
         "PATH": f"{stub_bin}:{os.environ['PATH']}",
         "HOME": str(home),
         "CASS_DATA_DIR": str(data_dir),
         "CASS_BIN": str(stub_bin / "cass-stub"),
-        "CASS_PULL_LOG_DIR": str(tmp_path / "logs"),
+        "CASS_PULL_LOG_DIR": str(log_dir),
     }
     r = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120, env=env)
     assert r.returncode != 3, f"健康库不得走探针失败路径:\n{r.stdout}\n{r.stderr}"
     assert "STRUCTURE_PROBE_FAIL" not in r.stdout
+    kept = sorted(log_dir.glob("run-*.log"))
+    assert len(kept) == 48, f"轮转应留 48 份(47 旧+本次),实得 {len(kept)}"
