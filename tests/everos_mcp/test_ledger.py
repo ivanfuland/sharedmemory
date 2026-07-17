@@ -69,6 +69,55 @@ def test_receipt_after_fsync_and_timeout_leaves_row_queued(tmp_path, monkeypatch
     assert json.loads(lines[1])["kind"] == "response_aborted"
 
 
+def test_submit_nowait_does_not_block_and_preserves_fifo(tmp_path):
+    """P2(R4 阻断项 #7):`submit_nowait` 是 fire-and-forget——排队立即返回,
+    不等待任何回执。用一个人为阻塞的 fsync 撑住 writer,验证:①调用本身
+    几乎瞬时返回(不像 `submit()` 那样卡到 timeout);②行最终仍然按 FIFO
+    顺序落盘(与前面已经排队的 `submit()` 行顺序一致,不会因为是 nowait 就
+    插队或乱序)。"""
+    writer = ledger.LedgerWriter(tmp_path / "ops.jsonl", "ops")
+
+    real_fsync = os.fsync
+    release = threading.Event()
+    entered_fsync = threading.Event()
+
+    def blocking_fsync(fd):
+        entered_fsync.set()
+        release.wait(timeout=10)
+        return real_fsync(fd)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(os, "fsync", blocking_fsync)
+    try:
+        row1 = {"rid": "r1", "kind": "started", "ts": 1.0}
+
+        def submit_row1():
+            writer.submit(row1, timeout=10)
+
+        t = threading.Thread(target=submit_row1)
+        t.start()
+        assert entered_fsync.wait(timeout=5)  # row1 已经在 writer 线程里卡住
+
+        row2 = {"rid": "r1", "kind": "response_aborted", "ts": 2.0}
+        t0 = time.monotonic()
+        writer.submit_nowait(row2)  # 不应该阻塞——writer 还卡在 row1 的 fsync 里
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0
+
+        release.set()
+        t.join(timeout=10)
+        assert not t.is_alive()
+    finally:
+        monkeypatch.undo()
+
+    writer.close(drain=True)
+
+    lines = (tmp_path / "ops.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["kind"] == "started"
+    assert json.loads(lines[1])["kind"] == "response_aborted"
+
+
 def test_write_failure_raises_immediately_not_timeout(tmp_path):
     writer = ledger.LedgerWriter(tmp_path / "accepted.jsonl", "accepted", fault_reason="accepted_write_fail")
     with pytest.raises(ledger.LedgerUnavailable):

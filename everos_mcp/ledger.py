@@ -541,6 +541,26 @@ class LedgerWriter:
         if item.error is not None:
             raise item.error
 
+    def submit_nowait(self, row: dict) -> None:
+        """P2(R4 阻断项 #7):fire-and-forget 提交——排队后立即返回,不等待任何
+        回执(既不阻塞,也不确认落盘)。仍然走同一条队列,FIFO 顺序与
+        `submit()`/`submit_scored()` 提交的行完全一致,只是调用方放弃了"等
+        到底写没写成功"这件事。
+
+        专用场景:late-commit 的补偿性写入(response_aborted 追加行、ops
+        terminal 的补偿写)——这类写入发生时,响应结果已经由更早的一次
+        `LedgerTimeout`/`LedgerUnavailable` 确定下来了,`mark_abort` 才是那
+        一刻真正权威、且同步落盘的信号;继续阻塞等这类补偿写的回执只会让
+        worst-case handler 延迟从"一次 5s 超时"堆叠成"两到三次 5s 超时相加",
+        对正确性没有任何增益(见 `server.py::_submit_accepted_or_ledger_error`/
+        `_submit_ops_terminal_nowait` 的调用点注释)。
+
+        错误(含故障注入)会在 writer 内部照常发生,但因为没有人在等待,
+        只能静默丢失——这是 best-effort 语义的应有代价,调用方不应该也不能
+        对这次提交做失败处理。"""
+        item = _QueueItem(row=row, accepted_row=None, is_scored=False, event=threading.Event())
+        self._queue.put(item)
+
     def submit_scored(self, row: dict, accepted_row: dict, timeout: float = 5.0) -> None:
         """scored 流专用:队列项携带 `accepted_row` 供 writer 线程内调用
         validator;`attempt_no`/`written_ts` 由 writer 填入,不由调用方给。"""

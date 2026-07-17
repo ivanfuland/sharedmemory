@@ -385,6 +385,20 @@ def _restore_env(snapshot: dict) -> None:
 
 
 def case_wedged_writer() -> CaseResult:
+    """P2(R4 阻断项 #7):writer 卡住 `_WEDGE_DELAY_S`(12s,远超单次 submit
+    timeout 5s)——此前 accepted 回执超时之后,response_aborted 追加行与
+    (accepted 失败分支触发的)ops terminal 都用**阻塞** `submit(timeout=5.0)`
+    提交,worst-case handler 延迟因此从"一次 5s 超时"堆叠成"两次相加 ~10s"。
+    修复后两者改用 `submit_nowait`(fire-and-forget,仍走同一条队列保证
+    FIFO),worst-case handler 延迟应稳定在 ~5s+ε,不随 writer 实际卡住多久
+    (哪怕卡 12s、卡 12min)而线性增长——这正是本用例故意把卡住时长设得远超
+    "两次阻塞相加"的 ~10s 上限的原因:若 handler 延迟仍随卡住时长增长,说明
+    某处还在阻塞等这次卡住的 writer。
+
+    调用返回之后 writer 仍在长睡眠里,原始 accepted 行 + 迟到的
+    response_aborted 行要等 writer 真正解卡(`_WEDGE_DELAY_S` 之后)才落盘
+    ——late-commit 语义没变,只是"调用返回"与"数据落盘"彻底解耦,必须轮询
+    等待,不能像修复前那样指望阻塞 submit 顺带当一次同步屏障。"""
     iso = _Isolated()
     old_path = os.environ.get("PATH", "")
     snapshot = None
@@ -401,7 +415,8 @@ def case_wedged_writer() -> CaseResult:
         importlib.reload(server_mod)
         state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
 
-        state.ledger.accepted._fh = _SlowFileProxy(state.ledger.accepted._fh, delay=6.0)
+        wedge_delay = 12.0  # 远超"两次 5s 阻塞相加"的 ~10s 上限——见函数文档
+        state.ledger.accepted._fh = _SlowFileProxy(state.ledger.accepted._fh, delay=wedge_delay)
 
         task = f"wedged writer late-commit 测试 {uuid.uuid4().hex[:8]}"
         t0 = time.monotonic()
@@ -411,12 +426,31 @@ def case_wedged_writer() -> CaseResult:
         if result.get("status") != "error" or result.get("meta", {}).get("error_code") != "ledger_timeout":
             return CaseResult("wedged_writer", False, f"期望 status=error/ledger_timeout,实得 {result}")
 
+        # worst-case handler 延迟必须稳定在 ~5s+ε,不随 wedge_delay(12s)增长
+        # ——修复前(response_aborted/ops terminal 补偿写都阻塞)这里会量到
+        # ~10s;留够抖动余量,门槛设在 7s(< wedge_delay 的一半,足以分辨两种
+        # 实现)。
+        if elapsed >= 7.0:
+            return CaseResult(
+                "wedged_writer", False,
+                f"handler 延迟 {elapsed:.1f}s >= 7.0s(wedge_delay={wedge_delay}s)——"
+                "补偿性写入(response_aborted/ops terminal)疑似仍在堆叠阻塞等待,"
+                "不是 best-effort nowait。",
+            )
+
         rid = result["meta"]["mcp_request_id"]
 
         from everos_mcp import ledger as ledger_mod  # noqa: PLC0415
 
-        accepted_rows, _ = ledger_mod.iter_rows(iso.dirs["ledger_dir"], "accepted")
-        rid_rows = [r for r in accepted_rows if r.get("rid") == rid]
+        deadline = time.monotonic() + wedge_delay + 8.0
+        rid_rows: list = []
+        while time.monotonic() < deadline:
+            accepted_rows, _ = ledger_mod.iter_rows(iso.dirs["ledger_dir"], "accepted")
+            rid_rows = [r for r in accepted_rows if r.get("rid") == rid]
+            if len(rid_rows) >= 2:
+                break
+            time.sleep(0.2)
+
         if len(rid_rows) != 2:
             return CaseResult("wedged_writer", False,
                                f"期望 rid={rid} 在 accepted 流恰好 2 行(原始行+response_aborted),实得 {rid_rows}")
@@ -426,9 +460,10 @@ def case_wedged_writer() -> CaseResult:
                                f"{[r.get('kind') for r in rid_rows]}")
 
         return CaseResult("wedged_writer", True,
-                           f"writer 卡住 6s(> submit timeout 5s)期间:调用在 {elapsed:.1f}s 后返回 "
-                           "error/ledger_timeout;原始 accepted 行迟到落盘,response_aborted 行"
-                           "在其后追加——late-commit 顺序符合预期。")
+                           f"writer 卡住 {wedge_delay:.0f}s(远超 submit timeout 5s)期间:调用在 "
+                           f"{elapsed:.1f}s 后返回 error/ledger_timeout(非 10-15s 的堆叠阻塞);"
+                           "writer 解卡后原始 accepted 行迟到落盘,response_aborted 行在其后追加"
+                           "——late-commit 顺序符合预期。")
     finally:
         try:
             if server_mod is not None and server_mod._STATE is not None:

@@ -597,13 +597,22 @@ def _start_watchdog(state: AppState, period: float = _WATCHDOG_PERIOD_SECONDS) -
 def _submit_accepted_or_ledger_error(state: AppState, rid: str, row: dict):
     """尝试提交 accepted 行。返回 `(ok, error_code, retryable)`;`ok=False` 表示
     ledger 写入本身失败/超时,调用方应把最终响应降级为
-    ledger_timeout/ledger_unavailable(该行代表的原始 stage 语义作废)。"""
+    ledger_timeout/ledger_unavailable(该行代表的原始 stage 语义作废)。
+
+    P2(R4 阻断项 #7):accepted 回执超时之后,response_aborted 追加行是
+    spec 冻结的 best-effort 补偿写("best-effort 不等回执")——此前实现却用
+    阻塞 `submit(timeout=5.0)` 提交它,若 writer 真的长时间卡住(不是本测试
+    场景那种 6s 后自愈,而是真的 wedged),这里会再堆叠一次最长 5s 的阻塞
+    等待,worst-case handler 延迟从 ~5s 变成 ~10s。`mark_abort` 才是这一刻
+    真正权威、且同步落盘的信号(`effective_status` 优先读 aborts.log)——
+    response_aborted 行写不写得进都不改变最终判定,故改为 `submit_nowait`
+    (仍走同一条队列,FIFO 顺序不受影响,late-commit 时行迟早会写)。"""
     try:
         state.ledger.accepted.submit(row, timeout=5.0)
         return True, None, None
     except LedgerTimeout:
         try:
-            state.ledger.accepted.submit(response_aborted_row(rid, "ledger_timeout"), timeout=5.0)
+            state.ledger.accepted.submit_nowait(response_aborted_row(rid, "ledger_timeout"))
         except Exception:  # noqa: BLE001 —— best-effort,不能因为这次追加也失败而二次抛出
             pass
         try:
@@ -620,6 +629,12 @@ def _submit_accepted_or_ledger_error(state: AppState, rid: str, row: dict):
 
 
 def _submit_ops_terminal_or_ledger_error(state: AppState, rid: str, status: str, error_code: Optional[str]):
+    """ops terminal 的**主提交**路径——正常成功路径(accepted 已经落账)必须
+    阻塞等回执:这是记录"这次请求到底算 hit/abstain_empty/error"的权威事件,
+    调用方需要知道它有没有真的写进去(见 watchdog/effective_status 对
+    ops.jsonl 的依赖)。这里的阻塞语义不受本次修复影响——只有"accepted 阶段
+    已经 late-commit"的补偿场景才改用 `_submit_ops_terminal_nowait`
+    (见该函数文档)。"""
     try:
         state.ledger.ops.submit(ops_terminal(rid, status, error_code=error_code), timeout=5.0)
         return True, None, None
@@ -637,6 +652,24 @@ def _submit_ops_terminal_or_ledger_error(state: AppState, rid: str, status: str,
         return False, "ledger_unavailable", True
 
 
+def _submit_ops_terminal_nowait(state: AppState, rid: str, status: str, error_code: Optional[str]) -> None:
+    """P2(R4 阻断项 #7):accepted 阶段已经确定失败(late-commit 超时/写入
+    异常,`_submit_accepted_or_ledger_error` 已经返回 `ok=False`)时,响应
+    结果已经板上钉钉是 error——这里的 ops terminal 只是补充记账,不再是
+    "决定响应内容"的关键路径。继续用阻塞 `submit(timeout=5.0)` 等它的回执,
+    会在 accepted 阶段的等待(最长 5s)之上再堆叠一次最长 5s 的阻塞,
+    worst-case handler 延迟因此变成两次超时相加(~10s)甚至三次(若这之前
+    response_aborted 也阻塞的话,是本次修复前的真实情况,~15s)。`mark_abort`
+    已经在 `_submit_accepted_or_ledger_error` 里同步落盘过、是权威信号——
+    `effective_status` 判定优先读 aborts.log,这行 ops terminal 写不写得进
+    都不改变最终判定,故改为 best-effort 的 `submit_nowait`(仍走同一条队列,
+    FIFO 顺序不受影响)。"""
+    try:
+        state.ledger.ops.submit_nowait(ops_terminal(rid, status, error_code=error_code))
+    except Exception:  # noqa: BLE001 —— best-effort,提交本身失败也不影响响应
+        pass
+
+
 def _finish(
     state: AppState, rid: str, accepted: dict, status: str, error_code: Optional[str],
     retryable: Optional[bool], *, cards: list, raw_returned: int, reason: str,
@@ -650,13 +683,17 @@ def _finish(
         status, error_code, retryable = "error", ledger_err_code, ledger_retryable
         cards, reason = [], "账本写入异常，本次响应已放弃（数据可能延迟落盘，不代表请求丢失）。"
         accepted = None
-
-    ops_ok, ops_err_code, ops_retryable = _submit_ops_terminal_or_ledger_error(
-        state, rid, status, error_code if status == "error" else None,
-    )
-    if not ops_ok:
-        status, error_code, retryable = "error", ops_err_code, ops_retryable
-        cards, reason = [], "账本终态写入异常，本次响应已放弃（数据可能延迟落盘，不代表请求丢失）。"
+        # P2(R4 #7):accepted 已经确定失败(late-commit/写入异常)——响应已经
+        # 板上钉钉是 error,ops terminal 只是补充记账,best-effort 提交即可,
+        # 不再堆叠第二次阻塞等待(见 `_submit_ops_terminal_nowait` 文档)。
+        _submit_ops_terminal_nowait(state, rid, status, error_code)
+    else:
+        ops_ok, ops_err_code, ops_retryable = _submit_ops_terminal_or_ledger_error(
+            state, rid, status, error_code if status == "error" else None,
+        )
+        if not ops_ok:
+            status, error_code, retryable = "error", ops_err_code, ops_retryable
+            cards, reason = [], "账本终态写入异常，本次响应已放弃（数据可能延迟落盘，不代表请求丢失）。"
 
     if accepted is not None and status == "hit" and score_eligible("hit", accepted):
         state.worker.enqueue(rid)
