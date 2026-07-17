@@ -386,6 +386,15 @@ def test_queue_full_drop_returns_false(tmp_path, monkeypatch, infinity_stub, fak
 
 
 # ======================================================================
+# producer 冻结枚举(P2 回归测试:reconcile() 曾手误写 "reconcile" 而不是
+# "reconciliation")
+# ======================================================================
+
+def test_producer_enum_pinned_to_three_values():
+    assert scorer.PRODUCERS == frozenset({"realtime", "reconciliation", "manual"})
+
+
+# ======================================================================
 # 4. reconcile 补齐孤儿 + 失败 5 次落 permanent_failure 后不再扫
 # ======================================================================
 
@@ -433,6 +442,10 @@ def test_reconcile_fills_orphan_and_permanent_failure_stops_rescan(
         failed_rows = [r for r in orphan_rows if r["rid"] == "r-failed"]
         assert len(failed_rows) == 6  # 原 5 条 retryable_error + 1 条新 permanent_failure
         assert failed_rows[-1]["status"] == "permanent_failure"
+        # P2:`reconcile()` 落的 permanent_failure 行 producer 曾手误写成
+        # "reconcile"(非枚举值),必须是冻结枚举里的 "reconciliation"。
+        assert failed_rows[-1]["producer"] == "reconciliation"
+        assert failed_rows[-1]["producer"] in scorer.PRODUCERS
 
         # 再扫一遍:r-failed 不应再被计入待补打集合(已终态失败)
         def _fail_if_called(rid):

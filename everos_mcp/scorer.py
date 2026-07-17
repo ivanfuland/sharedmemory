@@ -103,6 +103,14 @@ _DEFAULT_RECONCILE_INTERVAL = 600.0
 _DEFAULT_RECONCILE_BATCH_GAP = 1.0
 _DEFAULT_FAIL_THRESHOLD = 5
 
+# scored 行 producer 冻结枚举(spec 冻结值;materialize.py 的在线健康率只认
+# "realtime" 字面量,别处出现的任何拼写漂移都会让本该算健康完成率的行悄悄
+# 漏计)。P2:此前 `reconcile()` 落 `permanent_failure` 行时手误写成
+# "reconcile"(非枚举值),与 `enqueue_reconcile`/`_WorkItem` 实际使用的
+# "reconciliation" 不一致——两者都指向 scored 行的 `producer` 字段,必须
+# 统一取自本枚举,不再各处手写字面量。
+PRODUCERS = frozenset({"realtime", "reconciliation", "manual"})
+
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 
@@ -762,7 +770,7 @@ def reconcile(
         if fail_count >= fail_threshold:
             permanent += 1
             row = scored_row(
-                rid, "reconcile", "permanent_failure", per_card={}, pins={},
+                rid, "reconciliation", "permanent_failure", per_card={}, pins={},
                 score_error_code="permanent_failure_threshold",
                 score_error_detail=f"累计 retryable_error 达 {fail_count} 次(阈值 {fail_threshold})",
             )
