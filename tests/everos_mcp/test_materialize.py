@@ -191,6 +191,67 @@ def test_healthy_false_infinite_score():
     assert materialize.healthy(row, accepted) is False
 
 
+def test_healthy_false_per_card_value_none():
+    """占位分数(值为 None)不能靠"没有不健康的数字"这种真空状态蒙混过关
+    ——per-card 条目必须至少含一个数值叶子。"""
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = None
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+def test_healthy_false_per_card_value_empty_dict():
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = {}
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+def test_healthy_false_per_card_value_empty_list():
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = []
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+def test_healthy_false_per_card_value_string():
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = "0.5"
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+def test_healthy_true_for_deeply_nested_finite_numerics():
+    """分数值形状不必是扁平 float 或一层 {"cos":..,"ce":..}——只要递归展开
+    后全是 finite 数值叶子,嵌套多深都算健康(_collect_numeric_leaves 对
+    Task 7 尚未落地的真实形状保持中立)。"""
+    accepted = _hit_accepted("r1")
+    per_card = {
+        materialize._card_key(c): {"scores": {"cos": [0.8], "ce": [0.7, 0.6]}}
+        for c in accepted["candidates"]
+    }
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is True
+
+
+def test_healthy_false_nan_at_depth():
+    accepted = _hit_accepted("r1")
+    per_card = {
+        materialize._card_key(c): {"scores": {"cos": [0.8], "ce": [math.nan]}}
+        for c in accepted["candidates"]
+    }
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
 def test_healthy_false_missing_pin():
     accepted = _hit_accepted("r1")
     pins = _full_pins()

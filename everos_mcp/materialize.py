@@ -103,21 +103,54 @@ def _accepted_candidate_keys(accepted_row: dict | None) -> set[str]:
     return {_card_key(c) for c in candidates}
 
 
-def _all_finite(value) -> bool:
-    """递归检查 `value` 内的全部 int/float 叶子节点都是 `math.isfinite`。
+def _collect_numeric_leaves(value) -> list | None:
+    """递归收集 `value` 内全部 int/float 叶子节点,返回叶子列表。
+
     per_card 的分数值形状(Task 7 scorer.py 尚未落地)大概率是
     `{"cos": ..., "ce": ...}` 这种嵌套 dict,而不是裸 float——用递归而不是
-    假设扁平结构,对未来实际形状更稳健。非数值叶子(字符串等)不参与判定,
-    bool 是 int 子类但不当分数处理(不会被误判为需要 finite 校验)。"""
+    假设扁平结构,对未来实际形状更稳健。
+
+    返回 `None`(不是空列表)表示递归途中遇到了**无法识别的叶子类型**
+    (`None`/字符串/其他非数值非容器类型)——这与"容器但一个数值叶子都没有"
+    (空 dict/空 list,返回 `[]`)是两种不同的畸形,调用方必须分开处理:
+    前者是"分数位置放了杂质",后者是"假装有分数其实是空的",两者都不健康,
+    但如果混着判(比如 `None` 也返回 `[]`),空 dict 会跟真的什么都没写的
+    值变得无法区分,而这里我们本来就要把两者都判不健康,所以用 `None` 这个
+    哨兵只是让语义写清楚,不是为了留一条"None 也算 OK"的后门。
+    `bool` 是 `int` 子类但不当分数处理:不算叶子(不进列表),但也不算杂质
+    (不触发 `None` 返回)——沿用既有决定,不新增行为。"""
     if isinstance(value, bool):
-        return True
+        return []
     if isinstance(value, (int, float)):
-        return math.isfinite(value)
+        return [value]
     if isinstance(value, dict):
-        return all(_all_finite(v) for v in value.values())
+        leaves: list = []
+        for v in value.values():
+            sub = _collect_numeric_leaves(v)
+            if sub is None:
+                return None
+            leaves.extend(sub)
+        return leaves
     if isinstance(value, (list, tuple)):
-        return all(_all_finite(v) for v in value)
-    return True
+        leaves = []
+        for v in value:
+            sub = _collect_numeric_leaves(v)
+            if sub is None:
+                return None
+            leaves.extend(sub)
+        return leaves
+    return None
+
+
+def _card_score_valid(value) -> bool:
+    """单张卡的 per_card 值是否合法:递归展开后必须**至少含一个数值叶子**
+    (空 dict `{}`/空 list `[]`/`None`/字符串都不能冒充"这张卡有分数"——
+    值缺失不能靠"没有不合规的数字"这种真空状态蒙混过关健康谓词),且全部
+    数值叶子都 `math.isfinite`。"""
+    leaves = _collect_numeric_leaves(value)
+    if not leaves:  # None(遇到杂质叶子)或 []([]/{} 递归下来零个数值叶子)
+        return False
+    return all(math.isfinite(x) for x in leaves)
 
 
 # ======================================================================
@@ -136,7 +169,7 @@ def healthy(scored_row: dict, accepted_row: dict) -> bool:
     expected_keys = _accepted_candidate_keys(accepted_row)
     if set(per_card.keys()) != expected_keys:
         return False
-    if not _all_finite(per_card):
+    if not all(_card_score_valid(v) for v in per_card.values()):
         return False
 
     pins = scored_row.get("pins")
