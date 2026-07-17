@@ -158,15 +158,20 @@ def test_search_non_loopback_refused():
 # ======================================================================
 
 def _full_envelope():
+    """候选 payload 含 prod passage 规格所需的必需字段(task_intent/approach、
+    name/description)——P1f/P2a schema 校验落地后,缺这些字段的 fixture 会
+    在 `normalize_candidates` 阶段就被拒(见下方专项测试),happy path fixture
+    必须是"builder 真的能拼出 passage"的合法形状,不能只塞任意 `"text"` 占位
+    字段。"""
     return {
         "request_id": "req-123",
         "data": {
             "agent_cases": [
-                {"id": "ac_1", "score": 0.9, "text": "case one"},
-                {"id": "ac_2", "score": 0.5, "text": "case two"},
+                {"id": "ac_1", "score": 0.9, "task_intent": "调研 X", "approach": "先读 spec"},
+                {"id": "ac_2", "score": 0.5, "task_intent": "修 Y", "approach": "二分定位"},
             ],
             "agent_skills": [
-                {"id": "sk_1", "score": None, "text": "skill one"},
+                {"id": "sk_1", "score": None, "name": "调研技能", "description": "先框架后细节"},
             ],
         },
     }
@@ -183,7 +188,7 @@ def test_normalize_full_envelope_happy_path():
     assert c0.mem_type == "agent_case"
     assert c0.native_score == 0.9
     assert c0.source_rank == 0
-    assert c0.payload == {"id": "ac_1", "score": 0.9, "text": "case one"}
+    assert c0.payload == {"id": "ac_1", "score": 0.9, "task_intent": "调研 X", "approach": "先读 spec"}
 
     c1 = result.cases[1]
     assert c1.source_rank == 1
@@ -275,4 +280,80 @@ def test_normalize_top_level_non_object_maps_to_bad_response(non_object_resp):
     everos_bad_response,顶层类型检查必须在 normalize_candidates 最前面。"""
     with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
         upstream.normalize_candidates(non_object_resp)
+    assert exc_info.value.code == "everos_bad_response"
+
+
+# ======================================================================
+# P1f/P2a:候选 payload 白名单字段 schema 校验——kill "KeyError/TypeError 滑到
+# build_passage 才炸、落 internal" + "非 str 字段靠 clamp_payload 的
+# isinstance 检查绕过截断上限(len(非 str)==0)"两个 bug
+# ======================================================================
+
+@pytest.mark.parametrize("bad_value", [["a", "list"], {"nested": "dict"}, 42, 3.14, True])
+def test_normalize_whitelisted_field_wrong_type_maps_to_bad_response(bad_value):
+    """`task_intent` 这类白名单字段如果是 list/dict/数值/bool——不是 str 也不是
+    None——必须在 normalize 阶段就被拒,不能带着畸形类型继续走到
+    `contract.clamp_payload`(那里非 str 值的"长度"被算成 0,截断上限被绕过)
+    或 `probe_passage.build_passage`(那里"\\n".join 需要 str 元素,炸
+    TypeError)。"""
+    env = _full_envelope()
+    env["data"]["agent_cases"][0]["task_intent"] = bad_value
+    with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+        upstream.normalize_candidates(env)
+    assert exc_info.value.code == "everos_bad_response"
+
+
+def test_normalize_required_case_field_missing_maps_to_bad_response():
+    """prod passage 规格(`_assemble_text`)需要 task_intent+approach 都在场
+    才能拼出 passage——缺任一个,`payload[field]` 会原生 KeyError。schema
+    校验必须提前把这类"缺失必需字段"的候选挡在 normalize 阶段。"""
+    env = _full_envelope()
+    del env["data"]["agent_cases"][0]["approach"]
+    with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+        upstream.normalize_candidates(env)
+    assert exc_info.value.code == "everos_bad_response"
+
+
+def test_normalize_required_case_field_none_maps_to_bad_response():
+    """必需字段显式为 None——`"\\n".join(...)` 需要 str,None 会原生 TypeError
+    (与"缺失"效果一致,同样必须提前拒)。"""
+    env = _full_envelope()
+    env["data"]["agent_cases"][0]["task_intent"] = None
+    with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+        upstream.normalize_candidates(env)
+    assert exc_info.value.code == "everos_bad_response"
+
+
+def test_normalize_required_skill_field_missing_maps_to_bad_response():
+    env = _full_envelope()
+    del env["data"]["agent_skills"][0]["name"]
+    with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+        upstream.normalize_candidates(env)
+    assert exc_info.value.code == "everos_bad_response"
+
+
+def test_normalize_optional_case_field_missing_is_accepted():
+    """`key_insight` 只在 "full" 规格才被 build_passage 用到,shadow 固定用
+    "prod" 规格——缺失/None 都合法(clamp_payload 自己会把它当 0 长度处理),
+    不该被 schema 校验误伤。"""
+    env = _full_envelope()
+    assert "key_insight" not in env["data"]["agent_cases"][0]  # fixture 本就没给
+    result = upstream.normalize_candidates(env)
+    assert len(result.cases) == 2
+
+
+def test_normalize_optional_case_field_none_is_accepted():
+    env = _full_envelope()
+    env["data"]["agent_cases"][0]["key_insight"] = None
+    result = upstream.normalize_candidates(env)
+    assert len(result.cases) == 2
+
+
+def test_normalize_optional_skill_field_wrong_type_still_rejected():
+    """可选字段(content)缺失/None 合法,但类型非法(既非 str 也非 None)仍要拒
+    ——"可选"只豁免"没给",不豁免"给了但类型是垃圾"。"""
+    env = _full_envelope()
+    env["data"]["agent_skills"][0]["content"] = ["not", "a", "string"]
+    with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+        upstream.normalize_candidates(env)
     assert exc_info.value.code == "everos_bad_response"

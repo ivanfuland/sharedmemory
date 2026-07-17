@@ -9,8 +9,26 @@ retrieve.py 保持不动,不复用它的 urlopen 调用)。
 真实响应 envelope(EverOS dto + retrieve.py/scripts/eval_run_m1c.py 双证):
 `{request_id, data:{agent_cases, agent_skills, ...}}`。`normalize_candidates`
 校验:两个数组存在、卡 id 非空且跨两个数组无重复、native score 是 finite
-float 或 None;任一违规一律 `UpstreamBadResponse(code="everos_bad_response")`
-——绝不落 `internal`。
+float 或 None、**候选 payload 白名单字段 schema 合法**(P1f/P2a,见下);任一
+违规一律 `UpstreamBadResponse(code="everos_bad_response")`——绝不落 `internal`。
+
+**payload schema 校验(P1f/P2a)**:此前候选 payload 里的白名单字段
+(case=task_intent/approach/key_insight;skill=name/description/content)
+完全不校验类型/存在性,两类问题因此能滑过 normalize 阶段:
+①一个非 str 值(list/dict/数值)会让 `contract.clamp_payload` 把它的
+"长度"算成 0(`len(x) if isinstance(x, str) else 0`),截断上限被静默绕过
+(P2a:clamp 类型旁路);②`blobstore.build_snapshots` 调用
+`probe_passage.build_passage`(spec 固定 "prod")时,该函数对 prod 规格必需
+字段做 `payload[field]` 取值 + `"\\n".join(...)` 拼接——字段缺失原生
+`KeyError`、字段为 None 原生 `TypeError`,这两个异常都不在 server.py 的
+显式 except 分支里,滑进最外层 broad except 被误判成 `internal`(P1f)。
+
+修法:在候选构造时把 schema 校验前移到这里——白名单字段值必须是 str 或
+None(缺失等同 None);prod 规格必需字段(case:task_intent/approach;
+skill:name/description,与 `everos_eval.probe_passage._PROD_CASE_FIELDS`/
+`_PROD_SKILL_FIELDS` 同源,不在本模块重新硬编码这份"builder 需要什么"的
+知识)不许是 None/缺失。可选字段(key_insight/content)允许 None/缺失,但
+类型非法(非 str 非 None)仍要拒——"可选"只豁免"没给",不豁免"给了垃圾"。
 """
 from __future__ import annotations
 
@@ -18,9 +36,23 @@ import math
 from dataclasses import dataclass
 from urllib.error import HTTPError
 
+from everos_eval.probe_passage import _PROD_CASE_FIELDS, _PROD_SKILL_FIELDS
 from everos_mcp import http
 from everos_mcp.config import Config
 from everos_mcp.contract import ContractError
+
+# 与 contract._WHITELIST 的字段名一致(clamp_payload 消费同一份白名单)——
+# 这里独立维护一份是因为 upstream.py 不依赖 everos_mcp.contract 的私有字典
+# 结构,只需要"这几个字段名"这个事实;必需字段直接从 probe_passage 的 prod
+# 规格常量导入,避免"builder 需要哪些字段"这份知识在两处重复维护而漂移。
+_WHITELIST_FIELDS = {
+    "agent_case": ("task_intent", "approach", "key_insight"),
+    "agent_skill": ("name", "description", "content"),
+}
+_REQUIRED_PASSAGE_FIELDS = {
+    "agent_case": _PROD_CASE_FIELDS,
+    "agent_skill": _PROD_SKILL_FIELDS,
+}
 
 # 与 everos_eval/retrieve.py::search 的既有端点一致(不改动该模块,逐字段复刻)。
 _SEARCH_PATH = "/api/v1/memory/search"
@@ -100,6 +132,26 @@ def _finite_or_none(value, *, label: str) -> float | None:
     return fvalue
 
 
+def _validate_payload_schema(item: dict, mem_type: str, *, label: str) -> None:
+    """白名单字段(P1f/P2a):值必须是 str 或 None/缺失;prod 规格必需字段
+    (`_REQUIRED_PASSAGE_FIELDS`)不许是 None/缺失——这两条分别对应
+    `build_snapshots`(spec 固定 "prod")实际会踩到的两种炸法。"""
+    whitelist = _WHITELIST_FIELDS[mem_type]
+    required = _REQUIRED_PASSAGE_FIELDS[mem_type]
+    for field in whitelist:
+        value = item.get(field)
+        if value is None:
+            if field in required:
+                raise UpstreamBadResponse(
+                    f"{label}: 缺少必需字段 {field!r}(prod passage 规格需要非 None 值)"
+                )
+            continue
+        if not isinstance(value, str):
+            raise UpstreamBadResponse(
+                f"{label}: 字段 {field!r} 类型非法(需 str 或 None,实际 {type(value).__name__})"
+            )
+
+
 def _build_candidates(items: list, mem_type: str, seen_ids: set) -> list:
     out = []
     for rank, item in enumerate(items):
@@ -112,6 +164,7 @@ def _build_candidates(items: list, mem_type: str, seen_ids: set) -> list:
             raise UpstreamBadResponse(f"{mem_type}[{rank}]: id 重复(跨 agent_cases/agent_skills): {cid!r}")
         seen_ids.add(cid)
         native_score = _finite_or_none(item.get("score"), label=f"{mem_type}[{rank}] id={cid!r}")
+        _validate_payload_schema(item, mem_type, label=f"{mem_type}[{rank}] id={cid!r}")
         out.append(Candidate(id=cid, mem_type=mem_type, native_score=native_score,
                               payload=item, source_rank=rank))
     return out
