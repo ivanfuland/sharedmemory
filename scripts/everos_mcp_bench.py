@@ -79,7 +79,7 @@ async def _run_one_round(client, queries: list[str], round_idx: int, seen: set[s
     return round_samples
 
 
-async def _run_calls(url: str, token: str, queries: list[str], reps: int) -> list[dict]:
+async def _run_calls(url: str, token: str, queries: list[str], reps: int) -> tuple[list[dict], list[dict]]:
     """每轮(30 次调用)开一个新的 MCP session,且每轮带重试(见
     `_MAX_ROUND_ATTEMPTS`)——**不是**为了省协议握手开销而刻意用一个跨全程的
     持久 session:早期实测单一持久 streamable-http session 在跑到 ~30 轮附近
@@ -90,17 +90,29 @@ async def _run_calls(url: str, token: str, queries: list[str], reps: int) -> lis
     该能扛住偶发网络抖动,故这里按轮加重试:某轮任意一次调用抛异常,整轮弃
     重做(用新 session),最多 `_MAX_ROUND_ATTEMPTS` 次;`seen` 集合在重试前
     回滚到本轮开始前的快照,保证 cold_first_seen 判定不因重试而失真。连续
-    失败到达上限才真正向上抛(那时才是需要人看的真故障)。"""
+    失败到达上限才真正向上抛(那时才是需要人看的真故障)。
+
+    P1e(重要口径变化):这套按轮重试机制原本是为了修一个**已经修好的** harness
+    bug 而加的诊断/容错手段——但保留至今会把"这一轮其实撞到了真实传输层故障"
+    这件事悄悄洗掉:重试成功后整轮样本照常计入 effective,gate 只看 p95,
+    对"需要重试才能跑通"这件事视而不见。机制本身保留(诊断价值仍在——某轮
+    偶发失败时不必让整个 900s bench 直接报废),但**每轮实际用掉几次 attempt**
+    现在会被如实记录并随 samples 一起返回给调用方,由 `_build_report` 判定
+    "通过的 run 必须是 0 retries"——重试机制救得回本轮数据,但救不回"这是一
+    个零重试的干净 run"这个更强的断言。"""
     samples: list[dict] = []
+    round_retries: list[dict] = []
     seen: set[str] = set()
     for round_idx in range(reps):
         round_t0 = time.perf_counter()
         seen_snapshot = set(seen)
         last_exc: Exception | None = None
         round_samples: list[dict] | None = None
+        attempts_used = 0
         for attempt in range(_MAX_ROUND_ATTEMPTS):
             seen.clear()
             seen.update(seen_snapshot)
+            attempts_used = attempt + 1
             try:
                 client = stubs.Client(url, auth=token)
                 async with client:
@@ -118,17 +130,24 @@ async def _run_calls(url: str, token: str, queries: list[str], reps: int) -> lis
                 f"round {round_idx + 1}/{reps} 连续 {_MAX_ROUND_ATTEMPTS} 次重试仍失败"
             ) from last_exc
 
+        round_retries.append({"round": round_idx, "attempts": attempts_used})
         samples.extend(round_samples)
         print(
             f"[bench] round {round_idx + 1}/{reps} done in "
             f"{(time.perf_counter() - round_t0) * 1000.0:.0f}ms "
-            f"(total calls so far: {len(samples)})",
+            f"(total calls so far: {len(samples)}, attempts used: {attempts_used})",
             file=sys.stderr, flush=True,
         )
-    return samples
+    return samples, round_retries
 
 
-def _build_report(samples: list[dict], *, discard_rounds: int, reps: int) -> dict:
+def _build_report(samples: list[dict], round_retries: list[dict], *, discard_rounds: int, reps: int) -> dict:
+    """P1e:gate 现在是三门联合(AND),不再只看 p95:
+    ① p95 <= 门槛;② effective 样本里零非 "hit" 状态(此前 abstain_empty 也
+    被当"可接受",在这套始终有候选的合成拓扑下不该出现,出现即真故障或
+    stub 拓扑坏了,必须 FAIL 而不是被悄悄放过);③ 零重试(此前重试机制会把
+    "这一轮撞到真实传输层故障"洗成"整轮正常完成",gate 对此视而不见——现在
+    任何一轮需要 >1 次 attempt 都直接判 FAIL,并在报告里点名是哪几轮)。"""
     effective = [s for s in samples if s["round"] >= discard_rounds]
     cold = [s for s in samples if s["cold_first_seen"]]
     warm_effective = [s for s in effective if not s["cold_first_seen"]]
@@ -139,11 +158,22 @@ def _build_report(samples: list[dict], *, discard_rounds: int, reps: int) -> dic
     p99 = nearest_rank_percentile(effective_ms, 99)
 
     cold_ms = [s["ms"] for s in cold]
-    error_statuses = [s["status"] for s in effective if s["status"] not in ("hit", "abstain_empty")]
+    non_hit_statuses = [s["status"] for s in effective if s["status"] != "hit"]
+
+    retried_rounds = [r for r in round_retries if r["attempts"] > 1]
+    total_retries = sum(r["attempts"] - 1 for r in round_retries)
+
+    p95_ok = p95 <= _P95_GATE_MS
+    all_hit_ok = not non_hit_statuses
+    zero_retries_ok = total_retries == 0
+    gate_passed = p95_ok and all_hit_ok and zero_retries_ok
 
     return {
-        "gate": {"metric": "p95_ms_effective_warm_path", "threshold_ms": _P95_GATE_MS,
-                 "value_ms": p95, "passed": p95 <= _P95_GATE_MS},
+        "gate": {
+            "metric": "p95_ms_effective_warm_path", "threshold_ms": _P95_GATE_MS,
+            "value_ms": p95, "passed": gate_passed,
+            "p95_ok": p95_ok, "all_hit_ok": all_hit_ok, "zero_retries_ok": zero_retries_ok,
+        },
         "config": {
             "query_count": _QUERY_COUNT, "reps": reps, "discard_rounds": discard_rounds,
             "total_calls": len(samples), "effective_sample_count": len(effective_ms),
@@ -166,7 +196,9 @@ def _build_report(samples: list[dict], *, discard_rounds: int, reps: int) -> dic
             "note": "effective 集合里排除掉 cold_first_seen 后的子集——正常情况下应与 "
                      "effective_warm_path 几乎相同(discard_rounds>=1 时首见样本已被丢弃)。",
         },
-        "non_hit_statuses_in_effective": error_statuses,
+        "non_hit_statuses_in_effective": non_hit_statuses,
+        "total_retries": total_retries,
+        "retried_rounds": retried_rounds,
     }
 
 
@@ -202,10 +234,12 @@ def main(argv: list[str] | None = None) -> int:
 
             url = f"http://127.0.0.1:{port}/mcp"
             t_wall_start = time.monotonic()
-            samples = asyncio.run(_run_calls(url, token, queries, args.reps))
+            samples, round_retries = asyncio.run(_run_calls(url, token, queries, args.reps))
             wall_seconds = time.monotonic() - t_wall_start
 
-            report = _build_report(samples, discard_rounds=args.discard_rounds, reps=args.reps)
+            report = _build_report(
+                samples, round_retries, discard_rounds=args.discard_rounds, reps=args.reps
+            )
             report["wall_seconds"] = wall_seconds
         finally:
             rc, out = stubs.terminate_and_collect(proc)
@@ -223,11 +257,24 @@ def main(argv: list[str] | None = None) -> int:
     passed = report.get("gate", {}).get("passed", False)
     if not passed:
         print(f"BENCH GATE FAILED: {report.get('gate')}", file=sys.stderr)
+        if report.get("non_hit_statuses_in_effective"):
+            print(
+                f"  non-hit statuses in effective samples: "
+                f"{report['non_hit_statuses_in_effective']}",
+                file=sys.stderr,
+            )
+        if report.get("retried_rounds"):
+            print(
+                f"  rounds that needed a retry (must be 0 for a passing run): "
+                f"{report['retried_rounds']}",
+                file=sys.stderr,
+            )
         return 1
     print(
         f"BENCH GATE PASSED: p95={report['gate']['value_ms']:.1f}ms "
         f"<= {report['gate']['threshold_ms']:.0f}ms "
-        f"(n={report['effective_warm_path']['sample_count']})",
+        f"(n={report['effective_warm_path']['sample_count']}, "
+        f"retries=0, all hit)",
         file=sys.stderr,
     )
     return 0
