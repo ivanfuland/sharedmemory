@@ -52,6 +52,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -59,11 +60,14 @@ import threading
 import time
 import urllib.request
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.error import URLError
 
+import anyio
+import mcp.server.lowlevel.server as _mcp_lowlevel_server
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
@@ -93,6 +97,100 @@ from everos_mcp.materialize import fold, healthy, score_eligible
 from everos_mcp.scorer import ScoreWorker, collect_config_fp
 
 _LOG = logging.getLogger("everos_mcp.server")
+
+# ======================================================================
+# 运行时 monkeypatch:mcp python-sdk `Server._handle_message` 未处理的
+# ClosedResourceError(Task 9 systematic-debugging 定位,见 task-9-report.md)
+#
+# 根因(已用 GitHub issue/PR 逐条核实):`mcp.server.lowlevel.server.Server.
+# _handle_message` 的 `case Exception():` 分支直接 `await
+# session.send_log_message(...)` 把内部异常回报给客户端,**没有 try/except**。
+# 当客户端在这次请求上已经断开(streamable-http 高频重连场景下几乎必然会撞上
+# 这个时序窗口)时,`send_log_message` 内部的 `_write_stream.send()` 会因为
+# stream 已关闭而抛 `anyio.ClosedResourceError`/`BrokenResourceError`——这个
+# 异常本身**没被捕获**,顺着 anyio TaskGroup 网状 `__aexit__` 一路向上传播,
+# 最终会把 `StreamableHTTPSessionManager` 长期持有的共享 task group 拖垮
+# (该 task group 后续所有新请求要挂靠的地方),表现为:线程数/fd 数全程持平
+# (不是资源耗尽),但新连接从某个时刻起全部排队等到超时——本仓 Task 9 用
+# session-churn 压测 + `asyncio.all_tasks()` 计数实测复现。
+#
+# 上游状态(2026-07-17 用 `gh issue/pr view` 核实,非猜测):
+#   - modelcontextprotocol/python-sdk#2064(本 bug 本体)与 #1967(同一根因的
+#     另一触发路径)均已确认、均已提修复 PR(#2072 等),**但该 PR 从未合并**
+#     (`mergedAt: null`,issue 被关闭为 COMPLETED 但代码从未进 v1.x 分支)。
+#   - `mcp` PyPI 最新版就是本仓当前锁定的 1.28.1(v1.x 分支已无更新);修复
+#     只存在于 v2.0.0 alpha/beta 预发布线,而 fastmcp 3.4.2 的
+#     `pyproject`/METADATA 显式要求 `mcp<2.0,>=1.24.0`——升级 mcp 到 2.x 会
+#     直接违反 fastmcp 自己的依赖约束,此路不通(不是"不愿意升",是升不了)。
+#   - 因此:**没有任何可用的上游发行版能修这个 bug**,只能在本仓运行时打
+#     补丁。这不是"抄一份改过的库"(不复制/不 vendor 源码),是对已确认的
+#     具体方法做最小化运行时替换,逻辑与官方(未合并)PR #2072 的修复逐字
+#     一致——client 断连导致回报失败是预期内场景,记 debug 日志、原样继续,
+#     不让这类"通知失败"级别的次生异常升级成"整条服务瘫痪"。
+#
+# 版本钉死断言:仅在确认版本号 == 补丁编写时验证过的版本才生效;版本不符时
+# 只告警不阻断启动(万一升级悄悄带上游修复,老补丁应该继续安全——它只是把
+# 已被上游自己修好的同一个异常又多包了一层 try/except,无害;但要显式提醒
+# 复核这段补丁是否还有必要,以免长期占着不必要的维护负担)。
+# ======================================================================
+
+_MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION = "1.28.1"
+
+
+async def _patched_handle_message(
+    self,
+    message,
+    session,
+    lifespan_context,
+    raise_exceptions: bool = False,
+):
+    """`mcp.server.lowlevel.server.Server._handle_message` 的运行时替换版——
+    与上游原实现逐字一致,唯一改动是给 `send_log_message` 套
+    try/except(anyio.ClosedResourceError, anyio.BrokenResourceError),
+    对应官方未合并 PR #2072 的修复逻辑。签名/行为之外的任何改写都不允许。"""
+    mod = _mcp_lowlevel_server
+    with warnings.catch_warnings(record=True) as w:
+        match message:
+            case mod.RequestResponder(request=mod.types.ClientRequest(root=req)) as responder:
+                with responder:
+                    await self._handle_request(message, req, session, lifespan_context, raise_exceptions)
+            case mod.types.ClientNotification(root=notify):
+                await self._handle_notification(notify)
+            case Exception():
+                mod.logger.error(f"Received exception from stream: {message}")
+                try:
+                    await session.send_log_message(
+                        level="error",
+                        data="Internal Server Error",
+                        logger="mcp.server.exception_handler",
+                    )
+                except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+                    # 客户端已断连,回报失败是预期内场景——这正是本补丁
+                    # 存在的理由(见模块顶部长注释 / issue #2064 / PR #2072)。
+                    mod.logger.debug("Could not send error log: client disconnected")
+                if raise_exceptions:
+                    raise message
+
+        for warning in w:
+            mod.logger.info("Warning: %s: %s", warning.category.__name__, warning.message)
+
+
+def _apply_mcp_handle_message_patch() -> None:
+    try:
+        installed = importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover — 环境损坏,交给别处报错
+        installed = "unknown"
+    if installed != _MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION:
+        _LOG.warning(
+            f"everos_mcp: mcp SDK 版本为 {installed!r},与本补丁验证过的版本 "
+            f"{_MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION!r} 不同——补丁仍会生效"
+            "(逻辑对得上就无害),但应人工复核上游是否已经修掉 #2064,补丁是否还有必要。"
+        )
+    _mcp_lowlevel_server.Server._handle_message = _patched_handle_message
+
+
+_apply_mcp_handle_message_patch()
+
 
 # ======================================================================
 # 模块级 bearer fail-fast(与 cass_mcp/server.py 骨架一致)
@@ -284,7 +382,20 @@ def bootstrap(
 def main() -> None:  # pragma: no cover — 真进程入口,由集成/部署验证覆盖
     cfg = config_mod.load()
     bootstrap(cfg)
-    mcp.run(transport="http", host="127.0.0.1", port=cfg.port)
+    # stateless_http=True(Task 9 systematic-debugging 定位,见任务简报/报告):
+    # fastmcp 3.4.2 底层 `mcp.server.streamable_http_manager.StreamableHTTPSessionManager`
+    # 默认有状态模式下,每个客户端断开的 MCP session **永不清理**——`_server_instances`
+    # 只在配置了 `session_idle_timeout`(该库默认 None,fastmcp 未把这个参数透传出来)
+    # 或空闲超时触发时才会弹出旧 session;两条路都没打开,于是每次客户端重连都会
+    # 在同一个事件循环里永久攒下一个卡在 `app.run()` 里的僵尸协程。会话churn 压测
+    # 实测:约 6-180 次重连后(与并发/日志开销相关,不固定)必然把
+    # `_session_creation_lock`(新 session 创建路径上的单一 anyio.Lock)排到永久阻塞,
+    # 新连接从此全部超时——线程数全程持平(证明不是 anyio 线程池耗尽),只有
+    # session 数单调只增。`everos_search` 是纯函数(task,limit)+ 模块级 `_STATE`,
+    # 不依赖任何 MCP session 范围的状态,`stateless_http=True`(每次请求换一个全新
+    # transport,零 session 追踪)对本工具语义完全无损,且从根上让"session 永不清理"
+    # 这件事无从发生——不是绕开症状,是让泄漏的资源本身不存在。
+    mcp.run(transport="http", host="127.0.0.1", port=cfg.port, stateless_http=True)
 
 
 # ======================================================================
