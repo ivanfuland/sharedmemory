@@ -24,6 +24,10 @@ probe = [
     "transformers>=4.40",
     "tokenizers>=0.19",
 ]
+mcp-shadow = [
+    "transformers>=4.40",
+    "tokenizers>=0.19",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "everos_eval/tests"]
