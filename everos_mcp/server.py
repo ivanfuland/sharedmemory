@@ -128,10 +128,10 @@ _LOG = logging.getLogger("everos_mcp.server")
 #     一致——client 断连导致回报失败是预期内场景,记 debug 日志、原样继续,
 #     不让这类"通知失败"级别的次生异常升级成"整条服务瘫痪"。
 #
-# 版本钉死断言:仅在确认版本号 == 补丁编写时验证过的版本才生效;版本不符时
-# 只告警不阻断启动(万一升级悄悄带上游修复,老补丁应该继续安全——它只是把
-# 已被上游自己修好的同一个异常又多包了一层 try/except,无害;但要显式提醒
-# 复核这段补丁是否还有必要,以免长期占着不必要的维护负担)。
+# 版本钉死断言:仅在确认版本号 == 补丁编写时逐字核对过的版本才生效;版本
+# 不符时**跳过打补丁**(不是"警告后照打")+ CRITICAL 日志,不阻断启动——
+# 版本不符代表这份逐字核对已经过期,静默沿用旧补丁可能悄悄覆盖上游的新
+# 实现,交给人工复核才安全(见 `_apply_mcp_handle_message_patch` 文档字符串)。
 # ======================================================================
 
 _MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION = "1.28.1"
@@ -176,16 +176,30 @@ async def _patched_handle_message(
 
 
 def _apply_mcp_handle_message_patch() -> None:
+    """版本不符 -> **跳过打补丁**(不是"警告后照打")+ CRITICAL 日志,不阻断
+    启动。`--frozen` 意味着依赖升级永远是人主动做的决定,不会在无人察觉的
+    情况下悄悄发生;但一旦真的手动升级了 `mcp`,本函数原样打一个针对旧版本
+    源码逐字验证过的 monkeypatch 上去,风险是:①上游若已经改了
+    `_handle_message` 的实现(不只是修复 #2064,而是任何重构),我们的替换
+    版本会静默覆盖新逻辑,悄悄丢掉上游的改动而不报错;②上游若已修掉 #2064,
+    我们的补丁只是多余(无害)但也无法自动确认这一点。两种情况都不该
+    "警告一下,反正逻辑对得上就继续用"——版本不符时代表这份逐字核对已经
+    过期,交给人工复核才是唯一安全的默认动作,故直接跳过打补丁本身。"""
     try:
         installed = importlib.metadata.version("mcp")
     except importlib.metadata.PackageNotFoundError:  # pragma: no cover — 环境损坏,交给别处报错
         installed = "unknown"
     if installed != _MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION:
-        _LOG.warning(
-            f"everos_mcp: mcp SDK 版本为 {installed!r},与本补丁验证过的版本 "
-            f"{_MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION!r} 不同——补丁仍会生效"
-            "(逻辑对得上就无害),但应人工复核上游是否已经修掉 #2064,补丁是否还有必要。"
+        _LOG.critical(
+            f"everos_mcp: mcp SDK 版本为 {installed!r},与本补丁逐字核对过的版本 "
+            f"{_MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION!r} 不同——**跳过** "
+            "_handle_message 补丁(不警告后硬套,版本不符 = 核对已过期)。"
+            "人工复核:上游是否已修掉 python-sdk#2064(补丁可删)、或是否重构过"
+            "_handle_message(需要重新核对补丁再钉死新版本号)。服务仍会启动,"
+            "但会话高频重连场景下 #2064 的未捕获 ClosedResourceError 不再有本"
+            "补丁兜底。"
         )
+        return
     _mcp_lowlevel_server.Server._handle_message = _patched_handle_message
 
 

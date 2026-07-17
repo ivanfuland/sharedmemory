@@ -204,20 +204,20 @@ def _unique_envelope_for_query(query: str) -> dict:
             "agent_cases": [
                 {
                     "id": f"ac_{h[:16]}_{i}",
-                    "score": 0.9 - i * 0.1,
+                    "score": 0.9 - i * 0.04,
                     "task_intent": f"合成任务意图 {h[:8]} #{i}",
                     "approach": f"合成解法摘要 {h[8:16]} #{i}",
                 }
-                for i in range(10)
+                for i in range(20)  # 简报冻结值:20+20(不是 10+10)——bench 门禁按这个候选量算
             ],
             "agent_skills": [
                 {
                     "id": f"sk_{h[:16]}_{i}",
-                    "score": 0.85 - i * 0.1,
+                    "score": 0.85 - i * 0.04,
                     "name": f"合成技能名 {h[:8]} #{i}",
                     "description": f"合成技能描述 {h[8:16]} #{i}",
                 }
-                for i in range(10)
+                for i in range(20)
             ],
         },
     }
