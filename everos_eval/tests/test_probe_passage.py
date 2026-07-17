@@ -199,6 +199,56 @@ def test_fetch_infinity_models_sees_expected_models():
     assert "BAAI/bge-reranker-v2-m3" in seen
 
 
+# ---- P1c:可选 get_json 注入点(everos_mcp 出站唯一通道复用),非 live ----
+
+def test_fetch_infinity_models_default_none_uses_bare_urlopen(monkeypatch):
+    """`get_json=None`(默认)行为必须与改动前逐字一致:裸 `urlopen`,零变化。"""
+    import everos_eval.probe_passage as pp
+
+    calls = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"id": "x"}]}).encode("utf-8")
+
+    def fake_urlopen(url, timeout=None):
+        calls["url"] = url
+        calls["timeout"] = timeout
+        return _FakeResp()
+
+    monkeypatch.setattr(pp, "urlopen", fake_urlopen)
+    result = fetch_infinity_models("http://127.0.0.1:9")
+    assert result == ["x"]
+    assert calls == {"url": "http://127.0.0.1:9/models", "timeout": 30}
+
+
+def test_fetch_infinity_models_uses_injected_get_json_instead_of_urlopen(monkeypatch):
+    """注入 `get_json` 时不得再走裸 `urlopen`——两条路径互斥,不是"注入了也顺手
+    再兜底调一次 urlopen"。"""
+    import everos_eval.probe_passage as pp
+
+    def boom_urlopen(*a, **kw):  # noqa: ANN001
+        raise AssertionError("get_json 注入时不应再调用裸 urlopen")
+
+    monkeypatch.setattr(pp, "urlopen", boom_urlopen)
+
+    calls = []
+
+    def fake_get_json(url, timeout):
+        calls.append((url, timeout))
+        return {"data": [{"id": "m1"}, {"id": "m2"}]}
+
+    result = fetch_infinity_models("http://127.0.0.1:9", get_json=fake_get_json)
+    assert result == ["m1", "m2"]
+    assert calls == [("http://127.0.0.1:9/models", 30)]
+
+
 @pytest.mark.live
 def test_run_window_probe_end_to_end():
     base = _infinity_base()
