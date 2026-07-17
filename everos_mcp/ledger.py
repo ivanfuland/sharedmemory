@@ -27,7 +27,11 @@
      也不会覆盖)+ 父目录 fsync,再新开一个空的当前段文件,**新段文件创建
      后同样父目录 fsync**(两处 fsync 都是为了让"重命名"和"新文件出现"这两
      件事本身在下一次崩溃前是持久的);
-  ③ chmod 700/600 强制校验(root 目录 0700,四个账文件 0600)。
+  ③ chmod 700/600 校验:已存在的目录/文件权限必须精确等于期望值,不符
+     -> raise `LedgerPermissionError`,**绝不静默 chmod 修复**——账本里可能有
+     查询明文,权限被改过是篡改/误配置信号,fail-stop 优先于自愈(与
+     config.py 对 `ledger_dir` 的态度一致)。只有本 Ledger 自己新建的目录/
+     文件才会被赋予正确权限(root 目录 0700,四个账文件 0600)。
 - 段读取:`iter_rows(root, stream_name)` 按段序读——sealed-* 段(按文件名
   排序,时间戳前缀保证顺序)在前,当前段在后;半行(JSON 解析失败的残行,
   典型是被 sealed 的段自己的最后一行)跳过不计入返回行,只计入告警数,
@@ -47,6 +51,7 @@ import fcntl
 import json
 import os
 import queue
+import stat
 import threading
 import time
 import uuid
@@ -90,6 +95,16 @@ class LedgerUnavailable(Exception):
     之类的对外语义。"""
 
 
+class LedgerPermissionError(Exception):
+    """账目录下已存在的目录/文件权限不符预期(目录非 0700 / 文件非 0600)。
+
+    这是 fail-stop 信号,不是"顺手修一下"的机会:账本里可能有查询明文,权限
+    被谁改过是篡改/误配置的征兆,与 config.py 对 `ledger_dir` 的态度一致——
+    宁可拒绝启动,也不要在没人看见的情况下悄悄把可疑状态"修好"。只有 Ledger
+    自己新建的目录/文件才会被赋予正确权限;已经存在的一律校验、不符直接
+    raise,绝不静默 chmod 覆盖。"""
+
+
 # ======================================================================
 # 小工具
 # ======================================================================
@@ -102,13 +117,39 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _touch_0600(path: Path) -> None:
-    """确保文件存在且是 0600;不截断已有内容。"""
+def _verify_mode(path: Path, expected_mode: int) -> None:
+    """已存在的目录/文件权限必须精确等于 `expected_mode`,否则 raise
+    `LedgerPermissionError`——不修复,只拒绝。"""
+    actual = stat.S_IMODE(path.stat().st_mode)
+    if actual != expected_mode:
+        kind = "目录" if path.is_dir() else "文件"
+        raise LedgerPermissionError(
+            f"{path} 是{kind},权限应为 {oct(expected_mode)},实际 {oct(actual)}"
+            "——拒绝自动修复(疑似篡改或误配置),请人工核实后手动 chmod。"
+        )
+
+
+def _ensure_file_mode(path: Path, mode: int = _FILE_MODE) -> None:
+    """文件不存在 -> 由本 Ledger 新建并赋权(新建的东西当然要给对权限,这部分
+    不变);已存在 -> 只校验,不符直接 raise,绝不静默 chmod 覆盖(见
+    `LedgerPermissionError`)。不截断已有内容。"""
     if not path.exists():
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY, _FILE_MODE)
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, mode)
         os.close(fd)
+        os.chmod(path, mode)  # umask 可能已冲掉 os.open 的 mode,显式再钉一次
         _fsync_dir(path.parent)
-    os.chmod(path, _FILE_MODE)
+    else:
+        _verify_mode(path, mode)
+
+
+def _ensure_dir_mode(path: Path, mode: int = _DIR_MODE) -> None:
+    """目录版的 `_ensure_file_mode`:不存在 -> 新建并赋权;已存在 -> 只校验,
+    不符直接 raise。"""
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, mode)
+    else:
+        _verify_mode(path, mode)
 
 
 # ======================================================================
@@ -479,7 +520,7 @@ class LedgerWriter:
                 continue
             self._attempt_no[rid] = max(self._attempt_no.get(rid, 0), attempt + 1)
 
-        _touch_0600(self.path)
+        _ensure_file_mode(self.path)
         self._fh = open(self.path, "a", encoding="utf-8")
         self._thread = threading.Thread(
             target=self._run, name=f"ledger-writer-{name}", daemon=True
@@ -518,12 +559,13 @@ class LedgerWriter:
 
     def close(self, drain: bool = True) -> None:
         """`drain=True`:等队列里已有的行全部处理完再关文件(正常关停用)。
-        `drain=False`:立刻返回,不等待——daemon 线程会随进程退出,主要给测试
-        做快速/强制收尾用,不保证队列积压已落盘。"""
+        `drain=False`:不等待线程 join——daemon 线程会随进程退出,主要给测试
+        做快速/强制收尾用,不保证队列积压已落盘。两种情况都要关文件句柄,
+        否则 `drain=False` 会泄漏 `self._fh`。"""
         self._queue.put(_SENTINEL)
         if drain:
             self._thread.join(timeout=10)
-            self._fh.close()
+        self._fh.close()
 
     # ------------------------------------------------------------
     def _run(self) -> None:
@@ -570,32 +612,41 @@ class Ledger:
 
     def __init__(self, root: Path, fault: str | None = None, scored_validator=None):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        _ensure_dir_mode(self.root, _DIR_MODE)  # 新建 -> 赋权;已存在 -> 校验,不符 raise
 
         self._lock_path = self.root / ".lock"
         self._lock_fd = self._acquire_lock()
+        try:
+            self._seal_torn_tails()
+            self._verify_permissions()
 
-        self._seal_torn_tails()
-        self._enforce_permissions()
+            scored_existing, _ = iter_rows(self.root, "scored")
 
-        scored_existing, _ = iter_rows(self.root, "scored")
+            self.ops = LedgerWriter(
+                self.root / "ops.jsonl", "ops",
+                fault_reason="ops_write_fail" if fault == "ops_write_fail" else None,
+            )
+            self.accepted = LedgerWriter(
+                self.root / "accepted.jsonl", "accepted",
+                fault_reason="accepted_write_fail" if fault == "accepted_write_fail" else None,
+            )
+            self.scored = LedgerWriter(
+                self.root / "scored.jsonl", "scored",
+                validator=scored_validator,
+                existing_rows=scored_existing,
+            )
 
-        self.ops = LedgerWriter(
-            self.root / "ops.jsonl", "ops",
-            fault_reason="ops_write_fail" if fault == "ops_write_fail" else None,
-        )
-        self.accepted = LedgerWriter(
-            self.root / "accepted.jsonl", "accepted",
-            fault_reason="accepted_write_fail" if fault == "accepted_write_fail" else None,
-        )
-        self.scored = LedgerWriter(
-            self.root / "scored.jsonl", "scored",
-            validator=scored_validator,
-            existing_rows=scored_existing,
-        )
-
-        self._aborts_path = self.root / "aborts.log"
-        _touch_0600(self._aborts_path)
+            self._aborts_path = self.root / "aborts.log"
+            _ensure_file_mode(self._aborts_path)
+        except BaseException:
+            # 拿到 flock 之后、构造完成之前的任何失败(含权限校验 raise)都必须
+            # 放锁 —— 否则调用方修好问题后重开同一个 root 会被自己这次失败的
+            # 残留 flock 误挡成 LedgerLocked。
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._lock_fd)
+            raise
 
     # ------------------------------------------------------------
     def _acquire_lock(self) -> int:
@@ -614,10 +665,14 @@ class Ledger:
             path = self.root / f"{name}.jsonl"
             if not path.exists():
                 continue
-            data = path.read_bytes()
-            if not data:
+            if path.stat().st_size == 0:
                 continue
-            if data.endswith(b"\n"):
+            # 只看尾部一个字节判断"最后一行是否完整",不把整份(可能很大的)
+            # jsonl 读进内存——残尾检测只关心最后一次写有没有写完整。
+            with open(path, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                last_byte = f.read(1)
+            if last_byte == b"\n":
                 continue
             self._seal_segment(path)
 
@@ -632,11 +687,18 @@ class Ledger:
         os.close(fd)
         _fsync_dir(path.parent)
 
-    def _enforce_permissions(self) -> None:
-        os.chmod(self.root, _DIR_MODE)
-        os.chmod(self._lock_path, _FILE_MODE)
+    def _verify_permissions(self) -> None:
+        """启动协议③:校验(不修复)。root 目录与 `.lock` 此刻必然已经存在
+        (要么是本次新建、已经被赋予正确权限,要么是既有的、必须严丝合缝等于
+        期望权限),用 `_verify_mode` 直接比对。三个 jsonl 流文件可能是第一次
+        运行还不存在(交给下面构造 `LedgerWriter` 时新建赋权),也可能是
+        `_seal_torn_tails` 刚新开的空段(已经是正确权限),也可能是正常重启后
+        既有的旧文件(必须校验)——三种情况统一交给 `_ensure_file_mode` 处理。
+        任一权限不符 -> `LedgerPermissionError`,不静默 chmod 覆盖。"""
+        _verify_mode(self.root, _DIR_MODE)
+        _verify_mode(self._lock_path, _FILE_MODE)
         for name in _STREAM_NAMES:
-            _touch_0600(self.root / f"{name}.jsonl")
+            _ensure_file_mode(self.root / f"{name}.jsonl")
 
     # ------------------------------------------------------------
     def submit_scored(self, row: dict, accepted_row: dict, timeout: float = 5.0) -> None:

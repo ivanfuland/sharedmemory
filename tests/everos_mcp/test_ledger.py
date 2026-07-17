@@ -102,8 +102,11 @@ def test_flock_released_after_close_allows_new_instance(tmp_path):
 # ======================================================================
 
 def test_torn_tail_seals_segment(tmp_path):
+    # 手动模拟"重启前已存在的账目录"(而不是让 Ledger 自己新建)——权限必须
+    # 显式摆成合规值,因为 Ledger 对已存在的目录/文件只校验、不修复。
     root = tmp_path / "root"
     root.mkdir()
+    os.chmod(root, 0o700)
     ops_path = root / "ops.jsonl"
     good_row = {"rid": "r1", "kind": "started", "ts": 1.0}
     ops_path.write_text(json.dumps(good_row) + "\n" + '{"rid": "r2", "kind": "star', encoding="utf-8")
@@ -131,8 +134,10 @@ def test_torn_tail_seals_segment(tmp_path):
 def test_no_torn_tail_no_seal(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
+    os.chmod(root, 0o700)
     ops_path = root / "ops.jsonl"
     ops_path.write_text(json.dumps({"rid": "r1", "kind": "started"}) + "\n", encoding="utf-8")
+    os.chmod(ops_path, 0o600)  # 不是残尾,不会被重新封段——权限得手动摆合规
 
     led = ledger.Ledger(root)
     try:
@@ -144,8 +149,11 @@ def test_no_torn_tail_no_seal(tmp_path):
 def test_torn_tail_multiple_streams_sealed_independently(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
-    (root / "ops.jsonl").write_text('{"rid": "broken', encoding="utf-8")
-    (root / "accepted.jsonl").write_text(json.dumps({"rid": "r1"}) + "\n", encoding="utf-8")
+    os.chmod(root, 0o700)
+    (root / "ops.jsonl").write_text('{"rid": "broken', encoding="utf-8")  # 残尾,会被重新封段,权限不用摆
+    accepted_path = root / "accepted.jsonl"
+    accepted_path.write_text(json.dumps({"rid": "r1"}) + "\n", encoding="utf-8")
+    os.chmod(accepted_path, 0o600)  # 不是残尾,权限得手动摆合规
 
     led = ledger.Ledger(root)
     try:
@@ -532,6 +540,82 @@ def test_permissions_root_dir_0700_and_files_0600(tmp_path):
             path = led.root / name
             assert path.exists(), name
             assert stat.S_IMODE(path.stat().st_mode) == 0o600, name
+    finally:
+        led.close()
+
+
+def test_preexisting_root_dir_wrong_mode_raises_not_repaired(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    os.chmod(root, 0o755)  # 故意摆错——模拟"已存在但权限不对"的账目录
+
+    with pytest.raises(ledger.LedgerPermissionError):
+        ledger.Ledger(root)
+
+    # 拒绝启动,而且绝不「顺手」把这个错误权限修好——校验之后现场权限原样保留。
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+
+def test_preexisting_stream_file_wrong_mode_raises_not_repaired(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    os.chmod(root, 0o700)
+    accepted_path = root / "accepted.jsonl"
+    accepted_path.write_text(json.dumps({"rid": "r1"}) + "\n", encoding="utf-8")
+    os.chmod(accepted_path, 0o644)  # 故意摆错,且不是残尾(结尾有 \n),不会被重新封段
+
+    with pytest.raises(ledger.LedgerPermissionError):
+        ledger.Ledger(root)
+
+    assert stat.S_IMODE(accepted_path.stat().st_mode) == 0o644  # 没被静默修复
+
+
+def test_preexisting_lock_file_wrong_mode_raises_not_repaired(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    os.chmod(root, 0o700)
+    lock_path = root / ".lock"
+    lock_path.write_bytes(b"")
+    os.chmod(lock_path, 0o644)  # 故意摆错
+
+    with pytest.raises(ledger.LedgerPermissionError):
+        ledger.Ledger(root)
+
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o644
+
+
+def test_permission_failure_after_lock_acquired_releases_lock(tmp_path):
+    """权限校验在拿到 flock 之后才跑(启动协议①在②③之前)——校验失败必须把
+    锁放掉,否则调用方修好权限后重开同一个 root 会被自己这次失败的残留 flock
+    误挡成 LedgerLocked(这是实现 verify-then-raise 时必须连带修的一个真实
+    资源泄漏点,而不是这条测试本身要求的行为)。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    os.chmod(root, 0o755)  # 故意摆错,触发 _verify_permissions 失败
+
+    with pytest.raises(ledger.LedgerPermissionError):
+        ledger.Ledger(root)
+
+    os.chmod(root, 0o700)  # 人工修好
+    led = ledger.Ledger(root)  # 如果锁泄漏了,这里会变成 LedgerLocked
+    led.close()
+
+
+def test_correct_preexisting_permissions_start_fine(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    os.chmod(root, 0o700)
+    lock_path = root / ".lock"
+    lock_path.write_bytes(b"")
+    os.chmod(lock_path, 0o600)
+    accepted_path = root / "accepted.jsonl"
+    accepted_path.write_text(json.dumps({"rid": "r1"}) + "\n", encoding="utf-8")
+    os.chmod(accepted_path, 0o600)
+
+    led = ledger.Ledger(root)  # 权限全部合规——应该正常启动,不 raise
+    try:
+        rows, _ = ledger.iter_rows(root, "accepted")
+        assert rows == [{"rid": "r1"}]
     finally:
         led.close()
 
