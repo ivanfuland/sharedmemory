@@ -23,6 +23,7 @@ PUBLIC 仓纪律:本文件里的容器名/端口/token 全部是本模块生成�
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import http.server as http_server_mod
 import json
@@ -364,6 +365,56 @@ def subprocess_env(
     return env
 
 
+_STDOUT_SINK_ATTR = "_everos_stdout_sink"
+_STDOUT_DRAINER_ATTR = "_everos_stdout_drainer"
+_STDOUT_SINK_MAXLEN = 8000  # 保留最近 N 行(足够覆盖任一故障用例的诊断 tail)
+
+
+def _attach_stdout_drainer(proc: subprocess.Popen) -> None:
+    """给子进程挂一个**持续**排空 stdout 的后台读线程。
+
+    根因(Task 9 systematic-debugging faulthandler 定位,见 task-9-rootcause.md):
+    server 子进程以 `stdout=PIPE` 起,uvicorn 对**每个** HTTP 请求都会在事件循环
+    线程内同步写一行 access log 到 stdout。若父进程不持续读这个管道,写满内核
+    默认 64KiB 管道缓冲后(约 1100 行 access log ≈ bench 第 34 轮),事件循环
+    线程会**阻塞在 `logging` 的 `flush()`**(栈:h11_impl.send → logging.emit →
+    flush),整个事件循环随之卡死——不再 accept 新连接、既有连接停在 CLOSE-WAIT。
+    这是经典的"管道缓冲写满死锁",纯测试基座缺陷(生产走 systemd/journald 会
+    持续排空管道,不触发)。修复:起进程即挂一个后台线程逐行排空 stdout 到
+    有界缓冲,`terminate_and_collect`/`collected_output` 再从缓冲取诊断 tail。"""
+    sink: collections.deque = collections.deque(maxlen=_STDOUT_SINK_MAXLEN)
+
+    def _drain() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                sink.append(line)
+        except (ValueError, OSError):  # 管道在关闭竞态下被合上,忽略
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    t = threading.Thread(target=_drain, name="everos-stub-stdout-drainer", daemon=True)
+    setattr(proc, _STDOUT_SINK_ATTR, sink)
+    setattr(proc, _STDOUT_DRAINER_ATTR, t)
+    t.start()
+
+
+def collected_output(proc: subprocess.Popen, *, join_timeout: float = 5.0) -> str:
+    """取排空线程已收集的 stdout 全文(先 join 到 EOF 保证进程已产出的行都收齐)。
+    进程仍在跑时也可调用(取当前快照),但典型用法是进程已退出后取诊断 tail。"""
+    drainer = getattr(proc, _STDOUT_DRAINER_ATTR, None)
+    if drainer is not None:
+        drainer.join(timeout=join_timeout)
+    sink = getattr(proc, _STDOUT_SINK_ATTR, None)
+    return "".join(sink) if sink is not None else ""
+
+
 def spawn_server(env: dict, *, cwd: Path = REPO_ROOT) -> subprocess.Popen:
     """起真实 `uv run --frozen --group mcp-shadow python -m everos_mcp.server`
     子进程——与生产 unit 的 `ExecStart` 逐字段一致的启动方式(仅 cwd 换成本
@@ -375,12 +426,17 @@ def spawn_server(env: dict, *, cwd: Path = REPO_ROOT) -> subprocess.Popen:
     143),但 SIGKILL 谁都捕获不了,内核直接干掉 `uv` 本身,它的子进程(真正
     持有 ledger flock 的那个)会变成孤儿继续存活、继续攥着锁——kill -9 类
     故障案例必须用 `os.killpg` 打整个进程组,不能只 `send_signal` 给 `proc.pid`
-    (那只是 `uv` 自己的 PID)。"""
-    return subprocess.Popen(
+    (那只是 `uv` 自己的 PID)。
+
+    子进程 stdout 挂后台排空线程(见 `_attach_stdout_drainer`)——不排空会因
+    uvicorn 每请求同步写 access log 撑满管道缓冲、卡死事件循环(Task 9 定位)。"""
+    proc = subprocess.Popen(
         ["uv", "run", "--frozen", "--group", "mcp-shadow", "python", "-m", "everos_mcp.server"],
         cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True,
     )
+    _attach_stdout_drainer(proc)
+    return proc
 
 
 def killpg_hard(proc: subprocess.Popen) -> None:
@@ -441,11 +497,18 @@ def terminate_and_collect(proc: subprocess.Popen, *, timeout: float = 10.0) -> t
     """SIGTERM(`uv run` 正常会转发给真正的 server 子进程、等它 graceful
     shutdown 完再退出——实测 returncode==143),超时则整组 SIGKILL(`proc.kill()`
     只杀得到 `uv` 自己,见 `killpg_hard` 文档字符串),收集
-    (returncode, 已捕获 stdout/stderr 全文)。"""
+    (returncode, 排空线程已捕获的 stdout/stderr tail)。
+
+    stdout 由 `spawn_server` 挂的后台排空线程持续读取(不能改回 `communicate()`
+    ——那样只在退出时读一次,运行期间管道会被 uvicorn 的 per-request access log
+    写满而卡死事件循环,见 `_attach_stdout_drainer`)。"""
     proc.terminate()
     try:
-        out, _ = proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         killpg_hard(proc)
-        out, _ = proc.communicate(timeout=timeout)
-    return proc.returncode, out or ""
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+    return proc.returncode, collected_output(proc, join_timeout=timeout)

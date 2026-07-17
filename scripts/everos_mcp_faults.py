@@ -284,7 +284,7 @@ def case_double_instance() -> CaseResult:
             except Exception:
                 stubs.killpg_hard(proc_b)
                 rc_b = proc_b.wait(timeout=10)
-            out_b = proc_b.stdout.read() if proc_b.stdout else ""
+            out_b = stubs.collected_output(proc_b)  # stdout 由排空线程收集,不直接 read（会与线程抢管道）
 
             if rc_b == 0:
                 return CaseResult("double_instance", False, "第二实例不应该成功启动(rc==0)")
