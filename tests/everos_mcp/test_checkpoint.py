@@ -88,6 +88,64 @@ def test_init_or_load_refuses_on_meta_missing_launched_ts_field(tmp_path):
         cp.init_or_load(ledger_has_rows=False, now=_T0)
 
 
+def test_init_or_load_refuses_on_launched_ts_nan(tmp_path):
+    """`json.loads` 默认接受 `NaN` 字面量,`isinstance(NaN, float)` 为真——单纯
+    类型检查挡不住;必须显式 `math.isfinite` 校验(P1g)。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    # json.dumps(float('nan')) 写出裸 `NaN` 字面量(Python json 模块的非标准扩展)
+    # ——这正是本测试要覆盖的绕过路径:`json.loads` 照单全收,`isinstance` 也认
+    # 它是 float,唯有 `math.isfinite` 能拦。
+    (root / "meta.json").write_text(
+        json.dumps({"launched_ts": float("nan"), "due_since": None, "reviews": []}),
+        encoding="utf-8",
+    )
+    cp = checkpoint.Checkpoint(root)
+    with pytest.raises(checkpoint.CheckpointCorrupt):
+        cp.init_or_load(ledger_has_rows=False, now=_T0)
+
+
+def test_init_or_load_refuses_on_launched_ts_infinity(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({"launched_ts": float("inf"), "due_since": None, "reviews": []}),
+        encoding="utf-8",
+    )
+    cp = checkpoint.Checkpoint(root)
+    with pytest.raises(checkpoint.CheckpointCorrupt):
+        cp.init_or_load(ledger_has_rows=False, now=_T0)
+
+
+def test_state_refuses_on_due_since_nan(tmp_path):
+    """due_since=NaN 落盘(如损坏/篡改)-> state() 读取时必须 fail-closed,不能
+    让后续 `now - due_since` 静默算出 NaN 再让比较运算悄悄永远为 False。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({"launched_ts": _T0, "due_since": float("nan"), "reviews": []}),
+        encoding="utf-8",
+    )
+    cp = checkpoint.Checkpoint(root)
+    with pytest.raises(checkpoint.CheckpointCorrupt):
+        cp.state(real_query_count=0, now=_T0 + 10)
+
+
+def test_state_refuses_on_review_ts_nan(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({
+            "launched_ts": _T0, "due_since": _T0 + 5,
+            "reviews": [{"ts": float("nan"), "decision": "continue", "by": "x", "note": "n"}],
+        }),
+        encoding="utf-8",
+    )
+    cp = checkpoint.Checkpoint(root)
+    with pytest.raises(checkpoint.CheckpointCorrupt):
+        cp.state(real_query_count=0, now=_T0 + 10)
+
+
 def test_init_or_load_requires_earliest_ts_when_ledger_has_rows_and_meta_exists(tmp_path):
     """meta 已存在、ledger_has_rows=True 但调用方没给 earliest_ledger_ts——这会
     让回拨校验被静默跳过,必须 fail loud(ValueError)而不是悄悄放行。"""

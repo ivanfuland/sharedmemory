@@ -50,6 +50,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import sys
 import time
@@ -68,6 +69,18 @@ VALID_DECISIONS = ("continue", "calibrate", "stop")
 class CheckpointCorrupt(Exception):
     """meta.json 缺失(但账本已有行)/ 解析失败 / launched_ts 晚于最早账行 ts
     ——fail-closed 拒绝启动或拒绝操作,绝不静默重建/修复。"""
+
+
+def _require_finite_ts(value, *, field: str) -> None:
+    """P1g:`json.loads` 默认接受 `NaN`/`Infinity`/`-Infinity` 字面量(Python
+    json 模块的非标准扩展),`isinstance(NaN, float)` 也为真——单纯的类型检查
+    挡不住这类值混进时间戳字段(静默污染 due/overdue 判据的算术)。任何时间戳
+    类字段必须是有限实数(非 bool——bool 是 int 子类但不当数值时间戳处理),
+    否则 fail-closed。"""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise CheckpointCorrupt(f"meta.json 字段 {field} 非法(非数值): {value!r}")
+    if not math.isfinite(value):
+        raise CheckpointCorrupt(f"meta.json 字段 {field} 非有限数值(NaN/Inf): {value!r}")
 
 
 def _fsync_dir(path: Path) -> None:
@@ -129,7 +142,14 @@ class Checkpoint:
     def _try_load(self) -> dict | None:
         """返回解析后的 meta dict;文件不存在返回 None;存在但解析失败/缺
         `launched_ts` -> raise `CheckpointCorrupt`(不区分"损坏"与"结构不
-        对",都是 fail-closed 信号)。"""
+        对",都是 fail-closed 信号)。
+
+        P1g:`launched_ts`/`due_since`(存在时)/`reviews[*].ts`(存在时)一律
+        必须是有限实数——`json.loads` 会放行 `NaN`/`Infinity` 字面量,纯类型
+        检查(`isinstance(..., float)`)对 NaN 也返回 True,必须显式
+        `math.isfinite` 校验,否则这类值会静默污染 due/overdue 时间算术
+        (`now - NaN` 恒为 NaN,比较运算恒为 False,状态机悄悄卡死而不报错)。
+        """
         if not self.meta_path.exists():
             return None
         try:
@@ -139,6 +159,19 @@ class Checkpoint:
             raise CheckpointCorrupt(f"{self.meta_path} 解析失败: {e}") from e
         if not isinstance(obj, dict) or not isinstance(obj.get("launched_ts"), (int, float)):
             raise CheckpointCorrupt(f"{self.meta_path} 缺少合法 launched_ts 字段")
+        _require_finite_ts(obj["launched_ts"], field="launched_ts")
+
+        due_since = obj.get("due_since")
+        if due_since is not None:
+            _require_finite_ts(due_since, field="due_since")
+
+        reviews = obj.get("reviews") or []
+        for i, review in enumerate(reviews):
+            if not isinstance(review, dict):
+                raise CheckpointCorrupt(f"{self.meta_path} reviews[{i}] 非对象: {review!r}")
+            if "ts" in review:
+                _require_finite_ts(review["ts"], field=f"reviews[{i}].ts")
+
         obj.setdefault("due_since", None)
         obj.setdefault("reviews", [])
         return obj
