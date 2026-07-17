@@ -97,10 +97,19 @@ def compute_cap(embed_window: int, rerank_window: int, query_budget: int,
     return min(embed_window, rerank_window - query_budget, hard_cap)
 
 
-def fetch_infinity_models(infinity_base: str) -> list[str]:
-    """GET $INFINITY_BASE/models 活性核实(Step 0):cc-infinity 实际在服务的模型 id 集。"""
-    with urlopen(f"{infinity_base}/models", timeout=30) as resp:
-        body = json.loads(resp.read().decode())
+def fetch_infinity_models(infinity_base: str, get_json=None) -> list[str]:
+    """GET $INFINITY_BASE/models 活性核实(Step 0):cc-infinity 实际在服务的模型 id 集。
+
+    `get_json`(可选,默认 `None`):注入形如 `everos_mcp.http.get_json(url, timeout)
+    -> dict` 的调用——同一出站通道(loopback 断言 + 拒绝 redirect),避免这个
+    GET 探针绕开 everos_mcp 的出站边界另起裸 `urlopen`。默认 `None` 时行为与
+    此前完全一致(裸 `urlopen`,零变化,供不需要该边界的调用方/既有测试用)。
+    """
+    if get_json is not None:
+        body = get_json(f"{infinity_base}/models", 30)
+    else:
+        with urlopen(f"{infinity_base}/models", timeout=30) as resp:
+            body = json.loads(resp.read().decode())
     return [item["id"] for item in body["data"]]
 
 
@@ -133,9 +142,12 @@ class WindowProbe:
         }
 
 
-def run_window_probe(infinity_base: str) -> WindowProbe:
-    """Step 0:live 核实两模型仍在服务 + 本机 pinned tokenizer 读窗口 + 定 CAP。"""
-    seen = fetch_infinity_models(infinity_base)
+def run_window_probe(infinity_base: str, get_json=None) -> WindowProbe:
+    """Step 0:live 核实两模型仍在服务 + 本机 pinned tokenizer 读窗口 + 定 CAP。
+
+    `get_json`:透传给 `fetch_infinity_models`(见其文档字符串)——默认 `None`
+    时行为不变(裸 `urlopen`)。"""
+    seen = fetch_infinity_models(infinity_base, get_json=get_json)
     for expected in (EMBED_MODEL_ID, RERANK_MODEL_ID):
         assert expected in seen, (
             f"cc-infinity /models 未见 {expected}(实返回 {seen})——"

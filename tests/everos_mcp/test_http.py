@@ -31,7 +31,10 @@ class _Counter:
 
 
 class _Stub:
-    """通用本地 HTTP stub,行为由 `handler_fn(request_body: dict) -> (status, body_bytes|None, headers)` 决定。"""
+    """通用本地 HTTP stub,行为由 `handler_fn(request_body: dict) -> (status, body_bytes|None, headers)` 决定。
+
+    GET 请求(无 body 可解析)同样路由到 `handler_fn`,传入空 dict——`get_json`
+    测试与 `post_json` 测试复用同一个 stub 类。"""
 
     def __init__(self, handler_fn):
         self.counter = _Counter()
@@ -41,14 +44,7 @@ class _Stub:
             def log_message(self, *a):
                 pass
 
-            def do_POST(self):
-                outer.counter.bump()
-                length = int(self.headers.get("Content-Length", 0))
-                raw = self.rfile.read(length) if length else b""
-                try:
-                    parsed = json.loads(raw.decode("utf-8")) if raw else {}
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    parsed = {}
+            def _respond(self, parsed):
                 status, body, extra_headers = handler_fn(parsed)
                 self.send_response(status)
                 for k, v in extra_headers.items():
@@ -58,6 +54,20 @@ class _Stub:
                 self.end_headers()
                 if body is not None:
                     self.wfile.write(body)
+
+            def do_POST(self):
+                outer.counter.bump()
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    parsed = {}
+                self._respond(parsed)
+
+            def do_GET(self):
+                outer.counter.bump()
+                self._respond({})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -194,5 +204,90 @@ def test_http_error_propagates_with_body_readable():
             http.post_json(stub.base_url + "/boom", {"q": "x"}, timeout=5)
         assert exc_info.value.code == 500
         assert exc_info.value.read() == b"internal stub error"
+    finally:
+        stub.stop()
+
+
+# ======================================================================
+# P1c: get_json —— 同一出站通道(loopback + 拒绝 redirect),供 `/models` 探针用
+# ======================================================================
+
+def test_get_json_happy_path():
+    stub = _make_stub(lambda body: (200, json.dumps({"data": [{"id": "m1"}]}).encode("utf-8"),
+                                     {"Content-Type": "application/json"}))
+    try:
+        result = http.get_json(stub.base_url + "/models", timeout=5)
+        assert result == {"data": [{"id": "m1"}]}
+        assert stub.counter.n == 1
+    finally:
+        stub.stop()
+
+
+def test_get_json_redirect_refused_second_stub_receives_zero_requests():
+    second = _make_stub(lambda body: (200, json.dumps({"ok": True}).encode(), {"Content-Type": "application/json"}))
+    try:
+        first = _make_stub(lambda body: (302, b"", {"Location": second.base_url + "/dest"}))
+        try:
+            with pytest.raises(http.RedirectRefused):
+                http.get_json(first.base_url + "/models", timeout=5)
+        finally:
+            first.stop()
+        assert second.counter.n == 0
+    finally:
+        second.stop()
+
+
+@pytest.mark.parametrize("bad_url", [
+    "http://203.0.113.5:80/models",
+    "http://example.invalid/models",
+])
+def test_get_json_non_loopback_url_refused_before_send(bad_url):
+    with pytest.raises(ValueError):
+        http.get_json(bad_url, timeout=1)
+
+
+def test_get_json_bad_json_valid_utf8_invalid_json():
+    stub = _make_stub(lambda body: (200, "不是 JSON 的纯文字回复".encode("utf-8"), {"Content-Type": "application/json"}))
+    try:
+        with pytest.raises(http.BadJson):
+            http.get_json(stub.base_url + "/models", timeout=5)
+    finally:
+        stub.stop()
+
+
+# ======================================================================
+# P2b: 响应体读取硬顶 —— 超限 -> ResponseTooLarge,不回显内容
+# ======================================================================
+
+def test_post_json_response_too_large_refused(monkeypatch):
+    monkeypatch.setattr(http, "MAX_RESPONSE_BYTES", 16)
+    oversized = b"x" * 64
+    stub = _make_stub(lambda body: (200, oversized, {"Content-Type": "application/json"}))
+    try:
+        with pytest.raises(http.ResponseTooLarge) as exc_info:
+            http.post_json(stub.base_url + "/big", {"q": "x"}, timeout=5)
+        assert b"x" * 64 not in str(exc_info.value).encode("utf-8", errors="ignore")
+    finally:
+        stub.stop()
+
+
+def test_get_json_response_too_large_refused(monkeypatch):
+    monkeypatch.setattr(http, "MAX_RESPONSE_BYTES", 16)
+    oversized = b"y" * 64
+    stub = _make_stub(lambda body: (200, oversized, {"Content-Type": "application/json"}))
+    try:
+        with pytest.raises(http.ResponseTooLarge):
+            http.get_json(stub.base_url + "/big", timeout=5)
+    finally:
+        stub.stop()
+
+
+def test_response_within_cap_still_succeeds(monkeypatch):
+    monkeypatch.setattr(http, "MAX_RESPONSE_BYTES", 4096)
+    stub = _make_stub(lambda body: (200, json.dumps({"ok": True}).encode("utf-8"),
+                                     {"Content-Type": "application/json"}))
+    try:
+        result = http.post_json(stub.base_url + "/small", {"q": "x"}, timeout=5)
+        assert result == {"ok": True}
     finally:
         stub.stop()
