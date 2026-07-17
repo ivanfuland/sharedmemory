@@ -1,0 +1,1008 @@
+"""server.py 的测试(P4 Task 8:fastmcp 组装 + 启动自检 + watchdog)。
+
+固定纪律(见 everos_mcp/server.py 顶部文档字符串 + 任务简报,均为冻结项):
+- 处理链顺序:① ops started(先于契约门,失败→os._exit(86)) → ② 契约门 →
+  ③ checkpoint overdue 短路(先于 upstream) → ④ upstream 失败矩阵 →
+  ⑤ 空结果/compute_returned → ⑥ 快照+落账 → ⑦ ops terminal → ⑧ enqueue →
+  ⑨ 响应组装。
+- 协议层(fastmcp in-process Client)与函数体内契约层是两道独立的门:
+  `limit=5.5`/`None` 在协议层就被 Pydantic 拒绝,函数体从未执行,零账;
+  `"5"`/`True` 被 Pydantic 隐式转型后才进函数体,按转型后的值判契约。
+- reason 字段禁止携带查询原文/上游响应体。
+
+Infinity 用本地 http.server 模拟(/models、/embeddings、/rerank,与
+test_scorer.py 同款 stub);EverOS 用另一个独立 http.server 模拟
+(/api/v1/memory/search);docker 经 monkeypatch `scorer._run_docker` 替身。
+`ScoreWorker` 构造内部固定调用真实 `probe_passage.run_window_probe`(Task 7
+冻结实现,无覆盖口子)——因此本文件几乎全部测试都要起 Infinity stub +
+fake docker,复用本机已缓存的 pinned HF tokenizer 快照(同 test_scorer.py 的
+既定假设)。PUBLIC 仓纪律:容器名/端口均为合成占位值,无真实拓扑字面量。
+"""
+from __future__ import annotations
+
+import http.server as http_server_mod
+import importlib
+import json
+import os
+import socket
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from fastmcp.client import Client
+from fastmcp.exceptions import ToolError
+
+from everos_eval import probe_passage
+from everos_mcp import ledger as ledger_mod
+from everos_mcp import scorer
+
+pytestmark = pytest.mark.slow  # 全文件依赖真实 pinned HF tokenizer 快照,标 slow 与既有约定一致
+
+
+# ======================================================================
+# Infinity HTTP stub(/models、/embeddings、/rerank)—— 与 test_scorer.py 同款
+# ======================================================================
+
+def _embed_vec(text: str) -> list:
+    import hashlib
+
+    h = hashlib.sha256(text.encode("utf-8")).digest()
+    return [(b + 1) / 256.0 for b in h[:8]]
+
+
+def _rerank_score(query: str, doc: str) -> float:
+    import hashlib
+
+    h = hashlib.sha256((query + "\x00" + doc).encode("utf-8")).digest()
+    return h[0] / 255.0
+
+
+class _InfinityState:
+    def __init__(self):
+        self.requests: list[dict] = []
+        self.models = [probe_passage.EMBED_MODEL_ID, probe_passage.RERANK_MODEL_ID]
+
+    def record(self, method, path, payload=None):
+        self.requests.append({"method": method, "path": path, "payload": payload})
+
+
+class _InfinityHandler(http_server_mod.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # noqa: A003
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802
+        state = self.server.state
+        state.record("GET", self.path)
+        if self.path == "/models":
+            self._json(200, {"data": [{"id": m} for m in state.models]})
+            return
+        self.send_error(404)
+
+    def do_POST(self):  # noqa: N802
+        state = self.server.state
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+        state.record("POST", self.path, payload)
+        if self.path == "/embeddings":
+            texts = payload["input"]
+            data = [{"index": i, "embedding": _embed_vec(t)} for i, t in enumerate(texts)]
+            self._json(200, {"data": data})
+            return
+        if self.path == "/rerank":
+            query = payload["query"]
+            docs = payload["documents"]
+            results = [
+                {"index": i, "relevance_score": _rerank_score(query, d)}
+                for i, d in enumerate(docs)
+            ]
+            self._json(200, {"results": results})
+            return
+        self.send_error(404)
+
+
+class InfinityStub:
+    def __init__(self):
+        self.server = http_server_mod.ThreadingHTTPServer(("127.0.0.1", 0), _InfinityHandler)
+        self.server.state = _InfinityState()
+        self.state = self.server.state
+        self.port = self.server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def shutdown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def infinity_stub():
+    stub = InfinityStub()
+    yield stub
+    try:
+        stub.shutdown()
+    except Exception:
+        pass
+
+
+# ======================================================================
+# docker stub(monkeypatch scorer._run_docker——与 test_scorer.py 同款)
+# ======================================================================
+
+class _CP:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _default_exec_output(tag: str) -> str:
+    return (
+        f"{'a' * 63}{tag[-1]}  /app/.cache/huggingface/hub/models--BAAI--bge-m3/blobs/config-{tag}\n"
+        f"{'b' * 63}{tag[-1]}  /app/.cache/huggingface/hub/models--BAAI--bge-m3/blobs/weight-{tag}\n"
+    )
+
+
+class FakeDocker:
+    def __init__(self):
+        self.container_image = "sha256:" + "1" * 64
+        self.config_image = "sha256:" + "2" * 64
+        self.started_at = "2026-07-17T00:00:00.000000000Z"
+        self.repo_digest = "example.invalid/cc-infinity@sha256:" + "3" * 64
+        self.exec_output = _default_exec_output("v1")
+
+    def run(self, args, timeout=30.0):
+        if args[0] == "inspect":
+            fmt = args[3]
+            if fmt == "{{.Config.Image}}":
+                return _CP(0, self.config_image, "")
+            if fmt == "{{.Image}}":
+                return _CP(0, self.container_image, "")
+            if fmt == "{{.State.StartedAt}}":
+                return _CP(0, self.started_at, "")
+            return _CP(1, "", f"unsupported format {fmt}")
+        if args[0] == "image" and args[1] == "inspect":
+            return _CP(0, self.repo_digest, "")
+        if args[0] == "exec":
+            return _CP(0, self.exec_output, "")
+        return _CP(1, "", f"unsupported docker args {args}")
+
+
+@pytest.fixture
+def fake_docker(monkeypatch):
+    fd = FakeDocker()
+    monkeypatch.setattr(scorer, "_run_docker", fd.run)
+    return fd
+
+
+# ======================================================================
+# EverOS HTTP stub(/api/v1/memory/search)—— 独立于 Infinity 的另一台 stub
+# ======================================================================
+
+class _EverosState:
+    def __init__(self):
+        self.requests: list[dict] = []
+        self.mode = "normal"  # normal | http_error | bad_json
+        self.http_status = 500
+        self.envelope = None  # 非 None 时覆盖默认空信封
+
+    def record(self, payload):
+        self.requests.append(payload)
+
+
+class _EverosHandler(http_server_mod.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # noqa: A003
+        pass
+
+    def do_POST(self):  # noqa: N802
+        state = self.server.state
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            payload = {}
+        state.record(payload)
+
+        if state.mode == "http_error":
+            body = b"everos stub upstream broke"
+            self.send_response(state.http_status)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if state.mode == "bad_json":
+            body = b"\xff\xfe not valid json at all"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        envelope = state.envelope
+        if envelope is None:
+            envelope = {"request_id": "req-default", "data": {"agent_cases": [], "agent_skills": []}}
+        body = json.dumps(envelope, allow_nan=True).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class EverosStub:
+    def __init__(self):
+        self.server = http_server_mod.ThreadingHTTPServer(("127.0.0.1", 0), _EverosHandler)
+        self.server.state = _EverosState()
+        self.state = self.server.state
+        self.port = self.server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def shutdown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def everos_stub():
+    stub = EverosStub()
+    yield stub
+    try:
+        stub.shutdown()
+    except Exception:
+        pass
+
+
+def _closed_port_url() -> str:
+    """绑一个端口再立刻关掉——connect 到这个 URL 会立刻 ECONNREFUSED(URLError,
+    非 HTTPError),不用真的等 10s socket timeout 就能触发"连接级失败"分支。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return f"http://127.0.0.1:{port}"
+
+
+# ======================================================================
+# Config / env 组装(与 test_scorer.py 同款,追加 everos_stub 独立 base_url)
+# ======================================================================
+
+def _build_env(tmp_path: Path, everos_base: str, infinity_base: str, *,
+                container: str = "test-infinity", expect_empty: bool = False,
+                traffic_class: str | None = None) -> tuple[dict, Path]:
+    ledger_dir = tmp_path / "ledger"
+    ledger_dir.mkdir(exist_ok=True)
+    ledger_dir.chmod(0o700)
+    instance_dir = tmp_path / "instance"
+    (instance_dir / ".cases").mkdir(parents=True, exist_ok=True)
+    (instance_dir / "skills" / "demo-skill").mkdir(parents=True, exist_ok=True)
+    (instance_dir / "skills" / "demo-skill" / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+    case_file = instance_dir / ".cases" / "agent_case-2026-07-17.md"
+    case_file.write_text("---\nentry_count: 1\n---\n# cases\n", encoding="utf-8")
+    pin_file = tmp_path / "PIN"
+    pin_file.write_text("git_sha=deadbeef\nfreeze_hash=cafef00d\n", encoding="utf-8")
+
+    env = {
+        "EVEROS_MCP_PORT": "1",
+        "EVEROS_MCP_TOKEN": "test-token",
+        "EVEROS_BASE_URL": everos_base,
+        "EVEROS_AGENT_ID": "test-agent",
+        "INFINITY_BASE": infinity_base,
+        "SHADOW_LEDGER_DIR": str(ledger_dir),
+        "EVEROS_EMBED_MODEL": probe_passage.EMBED_MODEL_ID,
+        "EVEROS_RERANK_MODEL": probe_passage.RERANK_MODEL_ID,
+        "EVEROS_PIN_FILE": str(pin_file),
+        "EVEROS_INSTANCE_DIR": str(instance_dir),
+        "INFINITY_CONTAINER": container,
+    }
+    if expect_empty:
+        env["EVEROS_MCP_EXPECT_EMPTY"] = "1"
+    if traffic_class:
+        env["SHADOW_TRAFFIC_CLASS"] = traffic_class
+    return env, ledger_dir
+
+
+def _apply_env(monkeypatch, env: dict) -> None:
+    for k in list(os.environ):
+        if k.startswith(("EVEROS_", "SHADOW_", "INFINITY_", "TELEGRAM_")):
+            monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+
+# ======================================================================
+# 模块 reload 夹具:每个测试拿到一份干净的 everos_mcp.server(重新执行模块
+# 顶层代码,含 bearer fail-fast + 新 FastMCP 实例),测试结束尽力回收
+# bootstrap() 产出的后台线程/flock fd。
+# ======================================================================
+
+@pytest.fixture
+def fresh_server(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith(("EVEROS_", "SHADOW_", "INFINITY_", "TELEGRAM_")):
+            monkeypatch.delenv(k, raising=False)
+
+    holder: dict = {"mod": None}
+
+    def _reload():
+        import everos_mcp.server as mod
+        importlib.reload(mod)
+        holder["mod"] = mod
+        return mod
+
+    holder["reload"] = _reload
+    yield holder
+
+    mod = holder.get("mod")
+    if mod is not None and mod._STATE is not None:
+        state = mod._STATE
+        state.watchdog_stop.set()
+        try:
+            state.worker.close(drain=False)
+        except Exception:
+            pass
+        try:
+            state.ledger.close(drain=False)
+        except Exception:
+            pass
+
+
+def _wait_for_scored(ledger_dir, rid, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows, _ = ledger_mod.iter_rows(ledger_dir, "scored")
+        matches = [r for r in rows if r.get("rid") == rid]
+        if matches:
+            return matches
+        time.sleep(0.05)
+    raise AssertionError(f"等 rid={rid!r} 的 scored 行超时({timeout}s)")
+
+
+def _ops_rows_for(ledger_dir, rid):
+    rows, _ = ledger_mod.iter_rows(ledger_dir, "ops")
+    return [r for r in rows if r.get("rid") == rid]
+
+
+def _accepted_rows_for(ledger_dir, rid):
+    rows, _ = ledger_mod.iter_rows(ledger_dir, "accepted")
+    return [r for r in rows if r.get("rid") == rid]
+
+
+def _full_envelope_two_cases_two_skills():
+    return {
+        "request_id": "req-full",
+        "data": {
+            "agent_cases": [
+                {"id": "ac_1", "score": 0.9, "task_intent": "调研 X 的技术方案",
+                 "approach": "先读 spec 再对照实现"},
+                {"id": "ac_2", "score": 0.5, "task_intent": "修 Y 的 bug",
+                 "approach": "复现后二分定位"},
+            ],
+            "agent_skills": [
+                {"id": "sk_1", "score": 0.8, "name": "调研技能",
+                 "description": "先框架后细节"},
+                {"id": "sk_2", "score": 0.3, "name": "修 bug 技能",
+                 "description": "先复现后定位"},
+            ],
+        },
+    }
+
+
+# ======================================================================
+# 1. 全链命中(hit):stub 2 case + 2 skill → 4 卡 skill-first 交错序;
+#    ops/accepted 行齐;worker 收到 enqueue 并产出 scored 行。
+# ======================================================================
+
+def test_full_hit_chain_skill_first_interleave_and_worker_enqueued(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.envelope = _full_envelope_two_cases_two_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("调研任务", 5)
+
+    assert result["status"] == "hit"
+    assert result["reason"]
+    assert "调研任务" not in result["reason"]  # reason 禁止携带查询原文
+    cards = result["cards"]
+    assert [c["id"] for c in cards] == ["sk_1", "ac_1", "sk_2", "ac_2"]  # skill-first 交错
+    for c in cards:
+        assert set(c.keys()) == {"id", "card_type", "truncated", "payload"}
+
+    meta = result["meta"]
+    assert meta["guard_mode"] == "shadow"
+    assert meta["raw_returned"] == 4
+    assert meta["error_code"] is None
+    rid = meta["mcp_request_id"]
+
+    ops_rows = _ops_rows_for(ledger_dir, rid)
+    assert {r["kind"] for r in ops_rows} == {"started", "terminal"}
+    terminal = next(r for r in ops_rows if r["kind"] == "terminal")
+    assert terminal["effective_status"] == "hit"
+
+    accepted_rows = _accepted_rows_for(ledger_dir, rid)
+    assert len(accepted_rows) == 1
+    assert accepted_rows[0]["stage"] == "hit"
+    assert len(accepted_rows[0]["candidates"]) == 4
+
+    scored_rows = _wait_for_scored(ledger_dir, rid)
+    assert len(scored_rows) == 1
+    assert scored_rows[0]["status"] == "ok"
+
+
+def test_full_hit_chain_limit_truncates_returned_cards(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.envelope = _full_envelope_two_cases_two_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("调研任务二", 2)
+    assert result["status"] == "hit"
+    assert [c["id"] for c in result["cards"]] == ["sk_1", "ac_1"]
+    assert result["meta"]["raw_returned"] == 4  # raw_returned 记全量候选,不受 limit 截断影响
+
+
+# ======================================================================
+# 2. 重放测试:仅凭 accepted 行 + 快照复算 cards,与实际响应逐字段一致。
+# ======================================================================
+
+def test_replay_from_accepted_row_and_snapshots_matches_response(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.envelope = _full_envelope_two_cases_two_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("重放测试任务", 5)
+    rid = result["meta"]["mcp_request_id"]
+    accepted = _accepted_rows_for(ledger_dir, rid)[0]
+
+    replayed_cards = []
+    for c in accepted["candidates"]:
+        payload = json.loads(state.blobstore.get(c["payload_sha"]))
+        replayed_cards.append({
+            "id": c["card_id"], "card_type": c["card_type"],
+            "truncated": c["truncated"], "payload": payload,
+        })
+
+    assert replayed_cards == result["cards"]
+
+
+# ======================================================================
+# 3. 协议层(fastmcp in-process client):类型拒绝 vs 隐式转型
+# ======================================================================
+
+async def _call_via_client(server_mod, task, limit):
+    client = Client(server_mod.mcp)
+    async with client:
+        return await client.call_tool("everos_search", {"task": task, "limit": limit})
+
+
+@pytest.mark.parametrize("bad_limit", [5.5, None])
+def test_protocol_level_invalid_limit_rejected_before_function_body_no_ledger_rows(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub, bad_limit,
+):
+    import asyncio
+
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    ops_before, _ = ledger_mod.iter_rows(ledger_dir, "ops")
+    with pytest.raises(ToolError):
+        asyncio.run(_call_via_client(server_mod, "x", bad_limit))
+    ops_after, _ = ledger_mod.iter_rows(ledger_dir, "ops")
+    assert ops_after == ops_before  # 协议级拒绝根本没进函数体,零账
+
+
+@pytest.mark.parametrize("coerced_limit,expected_count", [("5", 4), (True, 1)])
+def test_protocol_level_implicit_coercion_judged_post_coercion(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+    coerced_limit, expected_count,
+):
+    import asyncio
+
+    everos_stub.state.envelope = _full_envelope_two_cases_two_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    res = asyncio.run(_call_via_client(server_mod, "任务x", coerced_limit))
+    assert res.is_error is False
+    assert res.data["status"] == "hit"
+    assert len(res.data["cards"]) == expected_count
+
+
+# ======================================================================
+# 4. 契约违规 → error + ops 行 + accepted stage=contract_reject 无 candidates 键
+# ======================================================================
+
+def test_contract_violation_linebreak_records_contract_reject_without_candidates_key(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("fix bug\n", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "task_has_linebreak"
+    assert result["meta"]["retryable"] is False
+    assert result["cards"] == []
+    assert "fix bug" not in result["reason"]
+
+    rid = result["meta"]["mcp_request_id"]
+    ops_rows = _ops_rows_for(ledger_dir, rid)
+    assert {r["kind"] for r in ops_rows} == {"started", "terminal"}
+    terminal = next(r for r in ops_rows if r["kind"] == "terminal")
+    assert terminal["effective_status"] == "error"
+    assert terminal["error_code"] == "task_has_linebreak"
+
+    accepted_rows = _accepted_rows_for(ledger_dir, rid)
+    assert len(accepted_rows) == 1
+    assert accepted_rows[0]["stage"] == "contract_reject"
+    assert "candidates" not in accepted_rows[0]
+    assert accepted_rows[0]["query"] is None
+
+
+@pytest.mark.parametrize("bad_limit,code", [(0, "limit_out_of_range"), (6, "limit_out_of_range")])
+def test_contract_violation_limit_out_of_range(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub, bad_limit, code,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("正常任务", bad_limit)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == code
+
+
+# ======================================================================
+# 5. EverOS 失败矩阵:500 / 404 / 连接超时 / 重复 id / NaN native score
+# ======================================================================
+
+def test_upstream_5xx_maps_to_http_error_retryable(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.mode = "http_error"
+    everos_stub.state.http_status = 500
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_http_error"
+    assert result["meta"]["retryable"] is True
+
+    rid = result["meta"]["mcp_request_id"]
+    accepted = _accepted_rows_for(ledger_dir, rid)[0]
+    assert accepted["stage"] == "upstream_fail"
+    assert "candidates" not in accepted
+
+
+def test_upstream_4xx_maps_to_http_error_non_retryable(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.mode = "http_error"
+    everos_stub.state.http_status = 404
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_http_error"
+    assert result["meta"]["retryable"] is False
+
+
+def test_upstream_connection_level_failure_maps_to_timeout_retryable(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    dead_url = _closed_port_url()
+    env, _ = _build_env(tmp_path, dead_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_timeout"
+    assert result["meta"]["retryable"] is True
+
+
+def test_upstream_duplicate_card_id_maps_to_bad_response(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.envelope = {
+        "request_id": "req-dup",
+        "data": {
+            "agent_cases": [{"id": "dup_1", "score": 0.5, "task_intent": "a", "approach": "b"}],
+            "agent_skills": [{"id": "dup_1", "score": 0.4, "name": "a", "description": "b"}],
+        },
+    }
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+    assert result["meta"]["retryable"] is False
+
+
+def test_upstream_nan_native_score_maps_to_bad_response(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    everos_stub.state.envelope = {
+        "request_id": "req-nan",
+        "data": {
+            "agent_cases": [{"id": "ac_nan", "score": float("nan"), "task_intent": "a", "approach": "b"}],
+            "agent_skills": [],
+        },
+    }
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+
+
+def test_upstream_non_json_response_maps_to_bad_response_separately_from_internal(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """非 JSON 响应必须落 everos_bad_response,不能被外层 broad except 误判成
+    internal——单独测试,不与 http_error/normalize 违规共用一个用例。"""
+    everos_stub.state.mode = "bad_json"
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+    assert result["meta"]["retryable"] is False
+
+
+# ======================================================================
+# 6. 空结果 → abstain_empty
+# ======================================================================
+
+def test_empty_upstream_result_is_abstain_empty_not_error(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查一个库里没有的东西", 5)
+    assert result["status"] == "abstain_empty"
+    assert result["cards"] == []
+    assert result["meta"]["error_code"] is None
+    assert "库存为空" in result["reason"]
+
+    rid = result["meta"]["mcp_request_id"]
+    terminal = next(r for r in _ops_rows_for(ledger_dir, rid) if r["kind"] == "terminal")
+    assert terminal["effective_status"] == "abstain_empty"
+    assert "error_code" not in terminal
+
+
+# ======================================================================
+# 7. 启动自检探针:空库耗尽重试 → SystemExit(87);expect_empty=1 跳过
+# ======================================================================
+
+def test_startup_probe_exhausted_retries_raises_system_exit_87(
+    tmp_path, monkeypatch, everos_stub,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, "http://127.0.0.1:1")
+    _apply_env(monkeypatch, env)
+    import everos_mcp.server as server_mod
+    importlib.reload(server_mod)
+
+    cfg = server_mod.config_mod.load()
+    with pytest.raises(SystemExit) as exc_info:
+        server_mod._startup_probe(
+            cfg, max_attempts=2, budget_seconds=0.02, sleep_fn=lambda s: None,
+        )
+    assert exc_info.value.code == 87
+
+
+def test_startup_probe_succeeds_when_upstream_eventually_non_empty(
+    tmp_path, monkeypatch, everos_stub,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, "http://127.0.0.1:1")
+    _apply_env(monkeypatch, env)
+    import everos_mcp.server as server_mod
+    importlib.reload(server_mod)
+
+    call_count = {"n": 0}
+
+    def flaky_search(cfg, query):
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            return {"request_id": "r", "data": {"agent_cases": [], "agent_skills": []}}
+        return {"request_id": "r", "data": {
+            "agent_cases": [{"id": "ac_1", "score": 0.5, "task_intent": "a", "approach": "b"}],
+            "agent_skills": [],
+        }}
+
+    monkeypatch.setattr(server_mod.upstream, "search", flaky_search)
+    cfg = server_mod.config_mod.load()
+    server_mod._startup_probe(cfg, max_attempts=3, budget_seconds=0.02, sleep_fn=lambda s: None)
+    assert call_count["n"] == 2
+
+
+def test_startup_probe_skipped_when_expect_empty(tmp_path, monkeypatch, everos_stub):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, "http://127.0.0.1:1", expect_empty=True)
+    _apply_env(monkeypatch, env)
+    import everos_mcp.server as server_mod
+    importlib.reload(server_mod)
+
+    cfg = server_mod.config_mod.load()
+    assert cfg.expect_empty is True
+
+    def _boom(*a, **kw):
+        raise AssertionError("expect_empty=1 时不应该真的发起探针查询")
+
+    monkeypatch.setattr(server_mod.upstream, "search", _boom)
+    server_mod._startup_probe(cfg, max_attempts=3, budget_seconds=0.02, sleep_fn=lambda s: None)
+
+
+# ======================================================================
+# 8. checkpoint overdue 短路
+# ======================================================================
+
+def test_checkpoint_overdue_short_circuits_before_upstream(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    now = time.time()
+    meta = {
+        "launched_ts": now - 40 * 86400,
+        "due_since": now - 8 * 86400,
+        "reviews": [],
+    }
+    state.checkpoint.meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    def _boom(*a, **kw):
+        raise AssertionError("overdue 时不应该发起 upstream 调用")
+
+    monkeypatch.setattr(server_mod.upstream, "search", _boom)
+
+    result = server_mod.everos_search("被拦截的任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "review_overdue"
+    assert result["meta"]["retryable"] is False
+    assert "被拦截的任务" not in result["reason"]
+
+    rid = result["meta"]["mcp_request_id"]
+    accepted = _accepted_rows_for(ledger_dir, rid)[0]
+    assert accepted["stage"] == "gated"
+    assert accepted["query"] == "被拦截的任务"  # gated 行本身要求记入(已 strip)
+    assert "candidates" not in accepted
+
+
+# ======================================================================
+# 9. ops-started 写失败 → os._exit(86)(monkeypatch _hard_exit 验证退出码)
+# ======================================================================
+
+def test_ops_started_write_failure_triggers_hard_exit_86(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    exit_calls = []
+    monkeypatch.setattr(server_mod, "_hard_exit", lambda code: exit_calls.append(code))
+
+    def _broken_submit(row, timeout=5.0):
+        raise RuntimeError("模拟 ops started fsync 失败")
+
+    monkeypatch.setattr(state.ledger.ops, "submit", _broken_submit)
+
+    server_mod.everos_search("任意任务", 5)
+    assert exit_calls == [86]
+
+
+# ======================================================================
+# 10. watchdog:writer/worker 死→重启一次→再死 unit fail;orphan/checkpoint/磁盘告警
+# ======================================================================
+
+def test_watchdog_dead_writer_restarts_once_then_hard_exits(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    monkeypatch.setattr(state.ledger.ops, "alive", lambda: False)
+    restart_calls = []
+    monkeypatch.setattr(server_mod, "_restart_ledger_writer", lambda st, name: restart_calls.append(name))
+
+    exit_calls = []
+    monkeypatch.setattr(server_mod, "_hard_exit", lambda code: exit_calls.append(code))
+
+    server_mod._watchdog_pass(state, now=time.time())
+    assert restart_calls == ["ops"]
+    assert exit_calls == []
+
+    server_mod._watchdog_pass(state, now=time.time())
+    assert exit_calls == [1]
+
+
+def test_watchdog_orphan_alert_fires_for_stale_score_eligible_row(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    rid = "orphan-rid"
+    old_ts = time.time() - 25 * 3600
+    state.ledger.ops.submit(ledger_mod.ops_started(rid, "real"))
+    state.ledger.ops.submit(ledger_mod.ops_terminal(rid, "hit"))
+    candidate = {
+        "card_id": "c1", "card_type": "agent_case", "source_rank": 0,
+        "native_score": 0.9, "payload_sha": "a" * 64, "passage_sha": "b" * 64, "truncated": False,
+    }
+    accepted = ledger_mod.accepted_row(
+        "hit", rid, old_ts, "real", query="q", q_len=1, everos_rid="er-1",
+        candidates=[candidate], returned_ids=["c1"], search_ms=1.0, pre_commit_ms=1.0, config_fp={},
+    )
+    state.ledger.accepted.submit(accepted)
+
+    alerts = []
+    monkeypatch.setattr(server_mod, "_alert", lambda msg: alerts.append(msg))
+    server_mod._watchdog_pass(state, now=time.time())
+    assert any("orphan" in m for m in alerts)
+
+
+def test_watchdog_alert_content_never_contains_query_text(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """告警内容零明文——即便 orphan 查询里带敏感 query 文本,alert 消息也不能
+    出现它。"""
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    rid = "orphan-secret"
+    secret_query = "一个不该出现在告警里的敏感查询原文"
+    old_ts = time.time() - 25 * 3600
+    state.ledger.ops.submit(ledger_mod.ops_started(rid, "real"))
+    state.ledger.ops.submit(ledger_mod.ops_terminal(rid, "hit"))
+    candidate = {
+        "card_id": "c1", "card_type": "agent_case", "source_rank": 0,
+        "native_score": 0.9, "payload_sha": "a" * 64, "passage_sha": "b" * 64, "truncated": False,
+    }
+    accepted = ledger_mod.accepted_row(
+        "hit", rid, old_ts, "real", query=secret_query, q_len=len(secret_query), everos_rid="er-1",
+        candidates=[candidate], returned_ids=["c1"], search_ms=1.0, pre_commit_ms=1.0, config_fp={},
+    )
+    state.ledger.accepted.submit(accepted)
+
+    captured = []
+    monkeypatch.setattr(server_mod._LOG, "critical", lambda msg: captured.append(msg))
+    server_mod._watchdog_pass(state, now=time.time())
+    assert captured  # 至少触发了一条告警(orphan)
+    assert all(secret_query not in m for m in captured)
+
+
+def test_watchdog_disk_usage_alert(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    monkeypatch.setattr(server_mod, "_dir_usage_bytes", lambda root: 6 * 1024 * 1024 * 1024)
+    alerts = []
+    monkeypatch.setattr(server_mod, "_alert", lambda msg: alerts.append(msg))
+    server_mod._watchdog_pass(state, now=time.time())
+    assert any("用量" in m for m in alerts)
+
+
+def test_watchdog_checkpoint_due_alert(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    now = time.time()
+    meta = {"launched_ts": now - 31 * 86400, "due_since": None, "reviews": []}
+    state.checkpoint.meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    alerts = []
+    monkeypatch.setattr(server_mod, "_alert", lambda msg: alerts.append(msg))
+    server_mod._watchdog_pass(state, now=now)
+    assert any("checkpoint state=due" in m for m in alerts)
+
+
+# ======================================================================
+# 11. bootstrap 启动序:Checkpoint 正确接了 earliest_ledger_ts;bearer fail-fast
+# ======================================================================
+
+def test_bootstrap_wires_earliest_ledger_ts_into_checkpoint(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    meta = json.loads(state.checkpoint.meta_path.read_text(encoding="utf-8"))
+    assert meta["launched_ts"] is not None
+
+    # 再跑一次搜索产生一条 real 的 ops started 行,验证第二次 bootstrap(模拟
+    # 重启)能正常用 earliest_ledger_ts 通过 init_or_load 校验,不 fail-closed。
+    server_mod.everos_search("热身查询", 5)
+    state.worker.close(drain=False)
+    state.ledger.close(drain=False)
+
+    server_mod2 = fresh_server["reload"]()
+    server_mod2.bootstrap(skip_probe=True, start_watchdog=False)  # 不应抛 CheckpointCorrupt
+
+
+def test_module_import_bearer_fail_fast_when_token_missing(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith(("EVEROS_", "SHADOW_", "INFINITY_")):
+            monkeypatch.delenv(k, raising=False)
+    import everos_mcp.server as server_mod
+
+    with pytest.raises(RuntimeError):
+        importlib.reload(server_mod)
+
+    # 现场清理:恢复一个可用 token,把模块 reload 回可用状态,避免污染后续测试
+    monkeypatch.setenv("EVEROS_MCP_TOKEN", "test-token")
+    importlib.reload(server_mod)
