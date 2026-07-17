@@ -411,10 +411,15 @@ def test_reconcile_fills_orphan_and_permanent_failure_stops_rescan(
 
         worker = scorer.ScoreWorker(cfg, led, store, queue_max=8, retry_backoff_base=0.01)
         try:
+            # P1d:reconcile() 不再直接调用打分 primitive——它只把待补打的 rid
+            # 投递进 worker 的共享队列(`enqueue_reconcile`),真正的打分计算
+            # 仍然只发生在 worker 唯一的消费线程里(互斥/并发 1 由此保证)。
             report = scorer.reconcile(
-                cfg, led, worker._score_once, interval_between=0.0, fail_threshold=5
+                cfg, led, worker.enqueue_reconcile, interval_between=0.0, fail_threshold=5
             )
         finally:
+            # close(drain=True) 会先处理完已入队的 r-orphan 打分任务,再处理
+            # sentinel——由此保证下面的断言能看到实际打分结果。
             worker.close(drain=True, timeout=5)
 
         assert report.orphans_found == 1
@@ -430,17 +435,82 @@ def test_reconcile_fills_orphan_and_permanent_failure_stops_rescan(
         assert failed_rows[-1]["status"] == "permanent_failure"
 
         # 再扫一遍:r-failed 不应再被计入待补打集合(已终态失败)
-        def _fail_if_called(rid, producer):
+        def _fail_if_called(rid):
             raise AssertionError(f"r-failed 不应被再次 rescore(rid={rid!r})")
 
         report2 = scorer.reconcile(
             cfg, led,
-            lambda rid, producer: _fail_if_called(rid, producer) if rid == "r-failed" else None,
+            lambda rid: _fail_if_called(rid) if rid == "r-failed" else True,
             interval_between=0.0, fail_threshold=5,
         )
         assert report2.permanent_failures == 0
         failed_rows_again, _ = ledger_mod.iter_rows(ledger_dir, "scored")
         assert len([r for r in failed_rows_again if r["rid"] == "r-failed"]) == 6
+    finally:
+        led.close(drain=False)
+
+
+# ======================================================================
+# 4b (P1d). reconciliation 与实时打分互斥(并发 1)——单一 worker 队列/线程是
+# 唯一的打分执行路径,同一时刻最多一个 _score_once 在跑。
+# ======================================================================
+
+def test_reconcile_enqueue_while_worker_busy_never_scores_concurrently(
+    tmp_path, monkeypatch, infinity_stub, fake_docker
+):
+    cfg, ledger_dir = _make_cfg(tmp_path, monkeypatch, infinity_stub.base_url)
+    led = ledger_mod.Ledger(ledger_dir, scored_validator=materialize.healthy)
+    store = blobstore_mod.BlobStore(ledger_dir)
+    try:
+        rids = [f"r-conc-{i}" for i in range(4)]
+        accepted_by_rid = {
+            rid: _seed_hit_query(led, store, rid, f"任务 {rid}", [("case", f"c-{rid}", f"内容 {rid}")])
+            for rid in rids
+        }
+
+        worker = scorer.ScoreWorker(cfg, led, store, queue_max=8, retry_backoff_base=0.01)
+        lock = threading.Lock()
+        state = {"active": 0, "max_active": 0}
+        real_score_once = worker._score_once
+
+        def _tracked_score_once(rid, producer):
+            with lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                time.sleep(0.05)  # 放大并发窗口,让潜在的竞态有机会暴露
+                real_score_once(rid, producer)
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+        worker._score_once = _tracked_score_once
+
+        try:
+            # 混合投递:realtime enqueue 与 reconcile 的 enqueue_reconcile 并发调用
+            # (模拟 `_reconcile_loop` 周期扫描与真实查询响应路径同时发生)——
+            # 两者共用同一条队列/同一个消费线程,并发只能是 1。
+            def _reconcile_enqueue_all():
+                for rid in rids[2:]:
+                    worker.enqueue_reconcile(rid)
+
+            t = threading.Thread(target=_reconcile_enqueue_all)
+            for rid in rids[:2]:
+                worker.enqueue(rid)
+            t.start()
+            t.join(timeout=5)
+
+            for rid in rids:
+                _wait_for_scored(led, rid, timeout=10.0)
+        finally:
+            worker.close(drain=True, timeout=5)
+
+        assert state["max_active"] == 1
+        for rid in rids:
+            rows, _ = ledger_mod.iter_rows(ledger_dir, "scored")
+            matches = [r for r in rows if r["rid"] == rid]
+            assert len(matches) == 1
+            assert materialize.healthy(matches[0], accepted_by_rid[rid]) is True
     finally:
         led.close(drain=False)
 
@@ -542,6 +612,25 @@ def test_measure_embedding_dim_raises_on_redirect_with_zero_second_request(
     with pytest.raises(Exception):
         scorer.measure_embedding_dim(cfg)
     assert len(infinity_stub.state.requests) == 1  # 拒绝跟随重定向,第二个请求永不发出
+
+
+# ======================================================================
+# 7b (P1c). /models 探针也必须走出站唯一通道:redirect stub -> RedirectRefused,
+# 零第二请求,经注入的 http.get_json 路径(scorer/server 实际接线的同一条路)。
+# ======================================================================
+
+def test_run_window_probe_models_redirect_refused_via_injected_get_json(
+    tmp_path, monkeypatch, infinity_stub, fake_docker
+):
+    from everos_mcp import http as http_mod
+
+    cfg, _ = _make_cfg(tmp_path, monkeypatch, infinity_stub.base_url)
+    infinity_stub.state.mode = "redirect"
+    with pytest.raises(http_mod.RedirectRefused):
+        probe_passage.run_window_probe(cfg.infinity_base, get_json=http_mod.get_json)
+    # /models 是 run_window_probe 的第一次出站——redirect 在 opener 层被拒绝,
+    # 重定向目标请求永不发出,故只应记录到这一次请求。
+    assert len(infinity_stub.state.requests) == 1
 
 
 # ======================================================================

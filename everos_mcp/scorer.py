@@ -22,17 +22,28 @@
   ——一个日聚合文件可能有多条);目录不可读/frontmatter 解析失败 ->
   `LibCountsError`,调用方让该次 lib_counts 缺席 + 记 score_error_detail,不糊 0
   (lib_counts 不在 PIN_KEYS,不影响 `materialize.healthy` 的健康判定)。
-- `ScoreWorker`:独立线程消费 rid 队列;`enqueue` 非阻塞,队列满丢任务返回
-  False(accepted 已落账,reconciliation 兜底补打)。打分:accepted 行 + 快照 ->
+- `ScoreWorker`:**单一后台线程消费单一队列**——这是"实时打分与
+  reconciliation 互斥、并发 1"(spec 冻结,P1d)的实现方式:队列里的每一项
+  记录 `(rid, producer, done_event)`,`_run()` 是唯一调用 `_score_once` 的
+  地方,不存在第二个线程能触发打分计算。`enqueue(rid)` 非阻塞投递
+  producer="realtime"、队列满丢任务返回 False(accepted 已落账,
+  reconciliation 兜底补打);`enqueue_reconcile(rid)` 是 `reconcile()` 的唯一
+  投递口,producer="reconciliation",同样非阻塞、满则丢弃(下一轮 sweep 会
+  重新发现,不是数据丢失);`manual_rescore(rid)` 走同一队列(阻塞 `put` +
+  等待 `done_event`,产出与旧版"直接同步调用"一致的调用方语义,但打分计算
+  仍然只在 worker 线程执行)。打分:accepted 行 + 快照 ->
   `probe_scores.embed`(query 与缺缓存卡向量同批,注入 `http.post_json`)×磁盘
   卡向量缓存(键 = `(passage_sha, model, artifact_fp)`,天然随 artifact_fp
   变化失效)算 cos -> `probe_scores.rerank` 算 ce -> 构造 scored 行(不含
   attempt_no,由 writer 分配)提交 `Ledger.submit_scored`。瞬时失败(含 marker
   漂移)重试 <= 3 次(指数退避),仍败落 `retryable_error` 行。
-- `reconcile(...)`:score_eligible accepted 与 terminal scored 的 anti-join,
-  逐条限速补打(批间隔 1s);同 rid 累计 retryable_error >= 5 次 -> 落
-  `permanent_failure`,此后不再进入待补打集合。`manual_rescore` 走同一条打分
-  primitive,producer="manual"。
+- `reconcile(...)`:score_eligible accepted 与 terminal scored 的 anti-join
+  + 累计失败计数(同 rid retryable_error >= 5 次 -> 落 `permanent_failure`,
+  此后不再进入待补打集合)——这部分是纯 ledger 读写,不涉及打分计算,继续
+  同步执行、不受"并发 1"约束。真正需要补打的 rid 一律经注入的 `enqueue_fn`
+  (通常是 `ScoreWorker.enqueue_reconcile`)投递,逐条限速(批间隔默认 1s,
+  限速的是"投递节奏"而不是"打分完成节奏"——打分本身异步发生在 worker 线程,
+  reconcile() 本身不阻塞等打分结果)。
 - 打分调用全在 worker 线程(同步 urllib 底座不进事件循环);出站一律经
   `everos_mcp.http.post_json` 注入进 `probe_scores.embed/rerank`。
 """
@@ -96,6 +107,17 @@ _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 
 _SENTINEL = object()
+
+
+@dataclass
+class _WorkItem:
+    """`ScoreWorker` 单一队列里的一项(P1d):`rid`+`producer` 供 `_score_once`
+    使用;`done_event` 仅 `manual_rescore` 用来阻塞等待完成,`enqueue`/
+    `enqueue_reconcile` 走 fire-and-forget 路径,不设置它。"""
+
+    rid: str
+    producer: str
+    done_event: "threading.Event | None" = None
 
 
 # ======================================================================
@@ -284,7 +306,7 @@ def _collect_pin_bundle(cfg: Config) -> tuple[str, dict]:
 
     embedding_dim = measure_embedding_dim(cfg)
     tokenizer_sha = compute_tokenizer_artifact_sha()
-    window = probe_passage.run_window_probe(cfg.infinity_base)
+    window = probe_passage.run_window_probe(cfg.infinity_base, get_json=http.get_json)
 
     repo_root = _repo_root()
     pins = {
@@ -472,19 +494,36 @@ class ScoreWorker:
 
     # ------------------------------------------------------------
     def enqueue(self, rid: str) -> bool:
-        """非阻塞:队列满返回 False(accepted 已落账,reconciliation 兜底)。"""
+        """非阻塞:队列满返回 False(accepted 已落账,reconciliation 兜底)。
+        producer="realtime"。"""
         try:
-            self._queue.put_nowait(rid)
+            self._queue.put_nowait(_WorkItem(rid, "realtime"))
+            return True
+        except queue.Full:
+            return False
+
+    def enqueue_reconcile(self, rid: str) -> bool:
+        """`reconcile()` 的唯一投递口(P1d):把 rid 塞进与 realtime 共用的
+        同一条队列——这就是"reconciliation 与实时打分互斥、并发 1"的实现
+        方式(单一消费线程,不是靠锁挡并发)。非阻塞,队列满返回 False(下一轮
+        sweep 会重新发现这个孤儿,不是数据丢失)。"""
+        try:
+            self._queue.put_nowait(_WorkItem(rid, "reconciliation"))
             return True
         except queue.Full:
             return False
 
     def manual_rescore(self, rid: str) -> None:
-        """人工补打入口,producer="manual"。不做 score_eligible 前置校验——人工
-        介入的场景本就是"我知道我在干什么",交给 `_score_once`/writer 的健康
-        谓词自然把关(缺 accepted 行会静默 no-op,畸形结果会被 validator 打回
-        retryable_error)。"""
-        self._score_once(rid, "manual")
+        """人工补打入口,producer="manual"。同样经共享队列投递(不直接调
+        `_score_once`),保持"打分调用只在 worker 唯一线程发生"这条不变量;
+        阻塞等待该 rid 处理完成再返回(调用方期望的是同步语义——旧版直接
+        同步调用,行为对调用方保持一致,只是执行体挪到了 worker 线程)。不做
+        score_eligible 前置校验——人工介入的场景本就是"我知道我在干什么",
+        交给 `_score_once`/writer 的健康谓词自然把关(缺 accepted 行会静默
+        no-op,畸形结果会被 validator 打回 retryable_error)。"""
+        done = threading.Event()
+        self._queue.put(_WorkItem(rid, "manual", done))
+        done.wait()
 
     def close(self, drain: bool = True, timeout: float = 10.0) -> None:
         self._recon_stop.set()
@@ -503,20 +542,25 @@ class ScoreWorker:
 
     # ------------------------------------------------------------
     def _run(self) -> None:
+        """唯一调用 `_score_once` 的地方——realtime/reconciliation/manual 三类
+        work item 全部经同一条队列串行处理,并发天然是 1。"""
         while True:
             item = self._queue.get()
             if item is _SENTINEL:
                 break
             try:
-                self._score_once(item, producer="realtime")
+                self._score_once(item.rid, producer=item.producer)
             except Exception:  # noqa: BLE001 —— worker 线程绝不能被单个 rid 打死
                 pass
+            finally:
+                if item.done_event is not None:
+                    item.done_event.set()
 
     def _reconcile_loop(self) -> None:
         while not self._recon_stop.wait(self._reconcile_interval):
             try:
                 reconcile(
-                    self.cfg, self.ledger, self._score_once,
+                    self.cfg, self.ledger, self.enqueue_reconcile,
                     interval_between=self._reconcile_batch_gap,
                     fail_threshold=self._fail_threshold,
                 )
@@ -645,7 +689,10 @@ class ScoreWorker:
 
 
 # ======================================================================
-# reconcile()——纯函数,注入打分 primitive,便于独立测试(manual_rescore 是
+# reconcile()——纯函数,注入 enqueue primitive(P1d:不再注入打分 primitive
+# 直接同步打分——reconcile() 只做 anti-join/阈值判断这类纯 ledger 读写,真正
+# 需要补打的 rid 一律经 `enqueue_fn` 投递进 ScoreWorker 的单一队列/单一消费
+# 线程,由此保证"reconciliation 与实时打分互斥、并发 1"。manual_rescore 是
 # ScoreWorker 的一个薄方法,见上文,不必再重复一份自由函数)。
 # ======================================================================
 
@@ -660,17 +707,23 @@ class ReconcileReport:
 def reconcile(
     cfg: Config,
     ledger: Ledger,
-    score_fn: Callable[[str, str], None],
+    enqueue_fn: Callable[[str], bool],
     *,
     interval_between: float = _DEFAULT_RECONCILE_BATCH_GAP,
     fail_threshold: int = _DEFAULT_FAIL_THRESHOLD,
 ) -> ReconcileReport:
     """全扫 score_eligible accepted vs terminal_scored 的 anti-join,逐条限速
-    补打(并发 1,批间隔 `interval_between`)。同 rid 累计 retryable_error >=
-    `fail_threshold` 次 -> 落 `permanent_failure`(此后不再进入待补打集合)。
+    **投递**(并发 1 由单一 worker 队列保证,不是本函数自己拿锁挡出来的;
+    `interval_between` 限的是投递节奏,不是打分完成节奏——打分本身异步发生
+    在 worker 线程,本函数不阻塞等结果)。同 rid 累计 retryable_error >=
+    `fail_threshold` 次 -> 落 `permanent_failure`(此后不再进入待补打集合,
+    这部分判定与写入仍是纯 ledger 读写,同步执行)。
 
-    `score_fn(rid, producer)`——通常是 `ScoreWorker._score_once`;测试可注入
-    纯 fake 验证 anti-join/阈值逻辑,不必起真 worker。
+    `enqueue_fn(rid) -> bool`——通常是 `ScoreWorker.enqueue_reconcile`(P1d,
+    此前是直接同步执行打分的 `score_fn(rid, producer)`,已改为"只管投递",
+    producer="reconciliation" 由 worker 内部固定,不再由调用方传入);测试可
+    注入纯 fake 验证 anti-join/阈值逻辑,不必起真 worker。返回 False(队列满)
+    时本函数不算作已补打,下一轮 sweep 会重新发现同一个孤儿。
 
     `cfg` 当前实现未直接使用(anti-join/阈值判断只需要 `ledger` 的三条流)——
     保留在签名里是为了跟简报冻结的 `reconcile(cfg, ledger, ...)` 接口对齐,
@@ -719,10 +772,10 @@ def reconcile(
         orphans.append(rid)
 
     rescored = 0
-    for rid in orphans:
-        score_fn(rid, "reconcile")
-        rescored += 1
-        if rid is not orphans[-1]:
+    for i, rid in enumerate(orphans):
+        if enqueue_fn(rid):
+            rescored += 1
+        if i < len(orphans) - 1:
             time.sleep(interval_between)
 
     return ReconcileReport(
