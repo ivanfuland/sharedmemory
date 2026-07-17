@@ -25,6 +25,7 @@ import os
 import threading
 import time
 from collections import namedtuple
+from pathlib import Path
 
 import pytest
 
@@ -726,6 +727,72 @@ def test_collect_pins_raises_when_marker_drifts_during_collection(
     monkeypatch.setattr(scorer, "_run_docker", flaky_run)
     with pytest.raises(scorer.PinCollectionError):
         scorer.collect_pins(cfg)
+
+
+# ======================================================================
+# PinFileCache(P2/R4 阻断项 #4):everos_pin 必须逐请求重读,不是 boot-cache
+# ======================================================================
+
+def test_pin_file_cache_rereads_after_mtime_change(tmp_path):
+    pin_path = tmp_path / "PIN"
+    pin_path.write_text("git_sha=aaa\n", encoding="utf-8")
+    cache = scorer.PinFileCache(pin_path)
+    assert cache.read() == "git_sha=aaa\n"
+
+    # mtime 精度在某些文件系统上是秒级——显式往后拨一点,确保 mtime_ns 真的变化
+    # (与内容大小同时变化时,mtime/size 任一变化都应触发重读;这里两者都变了)。
+    new_mtime = pin_path.stat().st_mtime + 5
+    pin_path.write_text("git_sha=bbb\n", encoding="utf-8")
+    os.utime(pin_path, (new_mtime, new_mtime))
+    assert cache.read() == "git_sha=bbb\n"
+
+
+def test_pin_file_cache_does_not_reread_when_mtime_and_size_unchanged(tmp_path, monkeypatch):
+    pin_path = tmp_path / "PIN"
+    pin_path.write_text("git_sha=aaa\n", encoding="utf-8")
+    cache = scorer.PinFileCache(pin_path)
+    assert cache.read() == "git_sha=aaa\n"
+
+    calls = {"n": 0}
+    real_read_text = Path.read_text
+
+    def _tracked_read_text(self, *a, **kw):
+        calls["n"] += 1
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _tracked_read_text)
+    assert cache.read() == "git_sha=aaa\n"  # 命中缓存,不应该真的再 read_text()
+    assert calls["n"] == 0
+
+
+def test_pin_file_cache_raises_when_file_missing_at_request_time(tmp_path):
+    pin_path = tmp_path / "PIN"
+    pin_path.write_text("git_sha=aaa\n", encoding="utf-8")
+    cache = scorer.PinFileCache(pin_path)
+    assert cache.read() == "git_sha=aaa\n"
+
+    pin_path.unlink()
+    with pytest.raises(scorer.PinCollectionError):
+        cache.read()
+
+
+def test_collect_config_fp_uses_injected_pin_cache_and_rereads_on_swap(tmp_path, monkeypatch, infinity_stub, fake_docker):
+    """collect_config_fp(cfg, pin_cache=...) 走注入的 PinFileCache——文件中途
+    换内容,下一次调用必须拿到新值(不是 bootstrap 时算好就再也不变)。"""
+    cfg, _ = _make_cfg(tmp_path, monkeypatch, infinity_stub.base_url)
+    cache = scorer.PinFileCache(cfg.pin_file)
+
+    fp1 = scorer.collect_config_fp(cfg, pin_cache=cache)
+    assert fp1["everos_pin"] == "git_sha=deadbeef\nfreeze_hash=cafef00d\n"
+
+    new_mtime = cfg.pin_file.stat().st_mtime + 5
+    cfg.pin_file.write_text("git_sha=newsha\nfreeze_hash=newfreeze\n", encoding="utf-8")
+    os.utime(cfg.pin_file, (new_mtime, new_mtime))
+
+    fp2 = scorer.collect_config_fp(cfg, pin_cache=cache)
+    assert fp2["everos_pin"] == "git_sha=newsha\nfreeze_hash=newfreeze\n"
+    # 静态字段不受影响
+    assert fp2["agent_id"] == fp1["agent_id"] == "test-agent"
 
 
 def test_collect_config_fp_reads_pin_file_raw_and_raises_if_missing(

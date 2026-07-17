@@ -540,6 +540,76 @@ def test_accepted_candidates_cover_all_raw_candidates_not_just_returned(
 
 
 # ======================================================================
+# 1b (P2/R4 #4). everos_pin 必须逐请求重读,不能只在 bootstrap 时算一次
+# 就长期 boot-cache——PIN 文件是上游 everos-prod 进程的属性,会在其重部署
+# 时变化。
+# ======================================================================
+
+def test_accepted_row_config_fp_picks_up_pin_file_swap_mid_run(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """PIN 文件在两次请求之间被替换内容(模拟 everos-prod 重部署)——第二次
+    请求的 accepted 行必须携带新 pin,不是 bootstrap 时读到的旧值。"""
+    everos_stub.state.envelope = _full_envelope_two_cases_two_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    pin_path = Path(env["EVEROS_PIN_FILE"])
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result1 = server_mod.everos_search("查任务一", 5)
+    rid1 = result1["meta"]["mcp_request_id"]
+    accepted1 = _accepted_rows_for(ledger_dir, rid1)[0]
+    assert accepted1["config_fp"]["everos_pin"] == "git_sha=deadbeef\nfreeze_hash=cafef00d\n"
+
+    new_mtime = pin_path.stat().st_mtime + 5
+    pin_path.write_text("git_sha=newsha\nfreeze_hash=newfreeze\n", encoding="utf-8")
+    os.utime(pin_path, (new_mtime, new_mtime))
+
+    result2 = server_mod.everos_search("查任务二", 5)
+    rid2 = result2["meta"]["mcp_request_id"]
+    accepted2 = _accepted_rows_for(ledger_dir, rid2)[0]
+    assert accepted2["config_fp"]["everos_pin"] == "git_sha=newsha\nfreeze_hash=newfreeze\n"
+    # 静态字段(server_git_sha 等)不受影响,两次请求应该一致
+    assert accepted1["config_fp"]["server_git_sha"] == accepted2["config_fp"]["server_git_sha"]
+    assert accepted1["config_fp"]["agent_id"] == accepted2["config_fp"]["agent_id"]
+
+
+def test_pin_file_missing_at_request_time_fails_closed_with_internal_error(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """PIN 文件在启动后、请求发生前被删除——这是我们自己的配置层故障,不是
+    上游 EverOS 响应异常,必须 fail-closed 返回 error_code="internal"(见
+    `_finish_config_fp_broken` 文档,已选定并记录这一判断),而不是让异常
+    未捕获地向上冒。ops 流仍必须有 started+terminal(error)两行。"""
+    everos_stub.state.envelope = _full_envelope_two_cases_two_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    pin_path = Path(env["EVEROS_PIN_FILE"])
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    pin_path.unlink()
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "internal"
+    assert result["meta"]["retryable"] is False
+    assert result["cards"] == []
+
+    rid = result["meta"]["mcp_request_id"]
+    ops_rows = _ops_rows_for(ledger_dir, rid)
+    assert {r["kind"] for r in ops_rows} == {"started", "terminal"}
+    terminal = next(r for r in ops_rows if r["kind"] == "terminal")
+    assert terminal["effective_status"] == "error"
+    assert terminal["error_code"] == "internal"
+    # 没有可提交的 accepted 行(config_fp 还没组好,契约门都没跑到)。
+    assert _accepted_rows_for(ledger_dir, rid) == []
+
+
+# ======================================================================
 # 2. 重放测试:仅凭 accepted 行 + 快照复算 cards,与实际响应逐字段一致。
 # ======================================================================
 

@@ -343,7 +343,7 @@ def collect_pins(cfg: Config) -> dict:
 
 
 # ======================================================================
-# collect_config_fp()
+# collect_config_fp() / PinFileCache
 # ======================================================================
 
 def _read_pin_file(path: Path) -> str:
@@ -355,9 +355,50 @@ def _read_pin_file(path: Path) -> str:
     return text
 
 
-def collect_config_fp(cfg: Config) -> dict:
-    """accepted 行 config fingerprint 的生产者(Task 8 消费)。`everos_pin` 是
-    `cfg.pin_file` 原文两因子,只读不重算——那是 `everos_prod_instance.sh` 写的。"""
+class PinFileCache:
+    """P2(R4 阻断项 #4):`everos_pin` 是**上游 everos-prod 进程**的属性,不是
+    本进程的静态配置——everos-prod 重部署会换 PIN 文件内容,而 `collect_config_fp`
+    此前只在 `bootstrap()` 时调用一次,结果被 `AppState.config_fp` 长期
+    boot-cache 住,此后每一条 accepted 行(不管请求发生在进程启动后第几秒/
+    第几天)都携带同一份陈旧 PIN——config fingerprint 因此对"upstream 已经
+    redeploy 过"这件事完全失明。
+
+    修法:PIN 必须逐请求重读,但真的每次都 `read_text()` 没必要——`os.stat()`
+    是微秒级操作,只有 mtime/size 真的变化时才重新读文件内容并使缓存失效。
+    静态字段(server_git_sha/agent_id/top_k/method/payload_cap/
+    tool_desc_version)不受影响,继续在 `bootstrap()` 时算一次(见
+    `collect_static_config_fp`)——它们不会在进程生命周期内变化,每请求重算
+    没有意义,反而会让 `_git_rev_parse_head` 这类 subprocess 调用拖垮 p95。
+    """
+
+    def __init__(self, path: Path):
+        self._path = Path(path)
+        self._cached: tuple[int, int, str] | None = None  # (mtime_ns, size, text)
+
+    def read(self) -> str:
+        """请求时刻 PIN 文件缺失/为空 -> `PinCollectionError`(调用方
+        server.py 据此把该请求判为 config 采集失败,fail-closed 返回
+        error_code="internal"——这是我们自己的配置层故障,不是上游 EverOS
+        响应异常,不适用 upstream_fail 系列 error_code;选择 "internal" 并在
+        此记录取舍)。"""
+        try:
+            st = self._path.stat()
+        except OSError as e:
+            raise PinCollectionError(f"EVEROS_PIN_FILE 不存在: {self._path}") from e
+        cached = self._cached
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+        text = self._path.read_text(encoding="utf-8")
+        if not text.strip():
+            raise PinCollectionError(f"EVEROS_PIN_FILE 为空: {self._path}")
+        self._cached = (st.st_mtime_ns, st.st_size, text)
+        return text
+
+
+def collect_static_config_fp(cfg: Config) -> dict:
+    """config fingerprint 里在进程生命周期内不变的静态部分——`bootstrap()`
+    算一次即可,不含 `everos_pin`(那是每请求经 `PinFileCache` 重读的部分,
+    见 `collect_config_fp` 文档)。"""
     return {
         "server_git_sha": _git_rev_parse_head(_repo_root()),
         "agent_id": cfg.agent_id,
@@ -365,8 +406,19 @@ def collect_config_fp(cfg: Config) -> dict:
         "method": METHOD,
         "payload_cap": PAYLOAD_CAP,
         "tool_desc_version": TOOL_DESC_VERSION,
-        "everos_pin": _read_pin_file(cfg.pin_file),
     }
+
+
+def collect_config_fp(cfg: Config, pin_cache: "PinFileCache | None" = None) -> dict:
+    """accepted 行 config fingerprint 的生产者(Task 8 消费)。`everos_pin` 是
+    `cfg.pin_file` 原文两因子,只读不重算——那是 `everos_prod_instance.sh` 写的,
+    但**读取时机**必须逐请求进行(见 `PinFileCache`),不能只在启动时读一次。
+
+    未传 `pin_cache` 时(CLI/一次性脚本/既有测试的直接调用形态)直接读一次
+    文件,行为与改动前完全一致;server.py 的每请求路径传入共享的
+    `PinFileCache` 实例,靠 mtime/size 判断是否需要重读。"""
+    pin_text = pin_cache.read() if pin_cache is not None else _read_pin_file(cfg.pin_file)
+    return {**collect_static_config_fp(cfg), "everos_pin": pin_text}
 
 
 # ======================================================================

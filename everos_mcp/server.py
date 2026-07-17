@@ -98,7 +98,12 @@ from everos_mcp.ledger import (
     response_aborted_row,
 )
 from everos_mcp.materialize import _ORPHAN_AGE_SECONDS, fold, healthy, score_eligible
-from everos_mcp.scorer import ScoreWorker, collect_config_fp
+from everos_mcp.scorer import (
+    PinCollectionError,
+    PinFileCache,
+    ScoreWorker,
+    collect_static_config_fp,
+)
 
 _LOG = logging.getLogger("everos_mcp.server")
 
@@ -269,7 +274,13 @@ class AppState:
     worker: ScoreWorker
     tokenizer: Any
     passage_cap: int
+    # P2(R4 #4):`config_fp` 只保存**静态**部分(server_git_sha/agent_id/
+    # top_k/method/payload_cap/tool_desc_version)——这些在进程生命周期内不
+    # 变,boot-cache 没问题。`everos_pin` 是上游 everos-prod 进程的属性,会
+    # 在其重部署时变化,必须逐请求经 `pin_cache` 重读,不能跟静态部分一起
+    # 缓存住——见 `_current_config_fp` / `scorer.PinFileCache`。
     config_fp: dict
+    pin_cache: Any
     checkpoint_lock: threading.Lock = field(default_factory=threading.Lock)
     restarted: dict = field(default_factory=dict)
     watchdog_stop: threading.Event = field(default_factory=threading.Event)
@@ -380,7 +391,9 @@ def bootstrap(
         # ScoreWorker 构造失败(pin 采集失败等)fail-fast 原样向上抛——不吞、不重试。
         worker = ScoreWorker(cfg, ledger, blobstore, tokenizer=resolved_tokenizer)
 
-        config_fp = collect_config_fp(cfg)
+        static_config_fp = collect_static_config_fp(cfg)
+        pin_cache = PinFileCache(cfg.pin_file)
+        pin_cache.read()  # fail-fast:启动时 PIN 文件必须可读(与改动前的态度一致)
     except BaseException:
         # 启动序中途任一步失败:已打开的 ledger/blobstore 资源尽力关闭,避免
         # flock 残留挡住下次重试启动(与 Ledger.__init__ 自身对 flock 的处理
@@ -393,7 +406,8 @@ def bootstrap(
 
     state = AppState(
         cfg=cfg, ledger=ledger, blobstore=blobstore, checkpoint=cp, worker=worker,
-        tokenizer=resolved_tokenizer, passage_cap=resolved_cap, config_fp=config_fp,
+        tokenizer=resolved_tokenizer, passage_cap=resolved_cap, config_fp=static_config_fp,
+        pin_cache=pin_cache,
     )
     _STATE = state
 
@@ -714,7 +728,7 @@ def _finish(
 
 def _finish_upstream_fail(
     state: AppState, rid: str, clean_task: str, error_code: str, retryable: bool,
-    pre_commit_ms: float, human_reason: str, *, error_detail: Optional[str] = None,
+    pre_commit_ms: float, human_reason: str, *, config_fp: dict, error_detail: Optional[str] = None,
 ) -> dict:
     kwargs = {}
     if error_detail is not None:
@@ -722,7 +736,7 @@ def _finish_upstream_fail(
     accepted = accepted_row(
         "upstream_fail", rid, time.time(), state.cfg.traffic_class,
         query=clean_task, q_len=len(clean_task), error_code=error_code,
-        pre_commit_ms=pre_commit_ms, config_fp=state.config_fp, **kwargs,
+        pre_commit_ms=pre_commit_ms, config_fp=config_fp, **kwargs,
     )
     return _finish(state, rid, accepted, "error", error_code, retryable,
                     cards=[], raw_returned=0, reason=human_reason)
@@ -742,6 +756,49 @@ def _finish_ledger_broken(
         "reason": human_reason,
         "meta": {
             "raw_returned": raw_returned,
+            "guard_mode": "shadow",
+            "mcp_request_id": rid,
+            "error_code": error_code,
+            "retryable": retryable,
+        },
+    }
+
+
+def _current_config_fp(state: AppState) -> dict:
+    """P2(R4 阻断项 #4):每请求重新组装 config fingerprint——静态部分
+    (`state.config_fp`)沿用 boot-cache,`everos_pin` 经 `state.pin_cache`
+    重读(mtime/size 未变则命中缓存,变了才真的重新读文件)。everos-prod
+    重部署会换 PIN 内容,只有逐请求重读才能让 accepted 行的 config_fp 反映
+    "这次搜索发生时上游到底是哪个版本"。"""
+    return {**state.config_fp, "everos_pin": state.pin_cache.read()}
+
+
+def _finish_config_fp_broken(state: AppState, rid: str, human_reason: str) -> dict:
+    """P2(R4 阻断项 #4):config fingerprint 采集失败(当前唯一成因:
+    `state.pin_cache.read()` 在请求时刻发现 PIN 文件缺失/为空)——这是**我们
+    自己的配置层**故障,不是上游 EverOS 响应异常,error_code 定为 "internal"
+    (失败矩阵"其他未预期异常"同码;PIN 文件属于本进程的配置输入,不满足
+    upstream_fail 系列 error_code 的语义,选定并在此记录)。
+
+    此刻还没有 clean_task/candidates 这些字段可以填一条判别联合合法的
+    accepted 行(甚至契约门都还没跑),因此没有可提交的 accepted 行——与
+    "快照/blobstore 写入阶段失败"同一处置纪律:只记 ops terminal + best-effort
+    mark_abort(防御性:即便有迟到写入,`effective_status` 仍优先读
+    aborts.log 判 error),不虚构一条 accepted 行来凑判别联合的字段要求。"""
+    try:
+        state.ledger.mark_abort(rid)
+    except Exception:  # noqa: BLE001 —— best-effort
+        pass
+    ops_ok, ops_err_code, ops_retryable = _submit_ops_terminal_or_ledger_error(state, rid, "error", "internal")
+    error_code, retryable = "internal", False
+    if not ops_ok:
+        error_code, retryable = ops_err_code, ops_retryable
+    return {
+        "status": "error",
+        "cards": [],
+        "reason": human_reason,
+        "meta": {
+            "raw_returned": 0,
             "guard_mode": "shadow",
             "mcp_request_id": rid,
             "error_code": error_code,
@@ -770,6 +827,19 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
     def _pre_commit_ms() -> float:
         return (time.monotonic() - t_start) * 1000.0
 
+    # ①.5 config fingerprint(P2/R4 #4):everos_pin 逐请求重读——PIN 文件是
+    # 上游 everos-prod 进程的属性,不能只在 bootstrap 时读一次。这一步在契约门
+    # 之前做,因为每个 accepted 行(含 contract_reject/gated)都要求携带
+    # config_fp;读取失败视为我方配置采集故障,直接短路返回 internal 错误,
+    # 不再走后续任何 stage(见 `_finish_config_fp_broken` 文档)。
+    try:
+        current_config_fp = _current_config_fp(state)
+    except PinCollectionError:
+        return _finish_config_fp_broken(
+            state, rid,
+            "本次请求的配置指纹采集失败（PIN 文件在请求时缺失/为空），本次检索未返回结果。",
+        )
+
     # ② 契约门
     try:
         clean_task = contract.validate_task(task_in)
@@ -777,7 +847,7 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
     except ContractError as e:
         accepted = accepted_row(
             "contract_reject", rid, time.time(), state.cfg.traffic_class,
-            error_code=e.code, pre_commit_ms=_pre_commit_ms(), config_fp=state.config_fp,
+            error_code=e.code, pre_commit_ms=_pre_commit_ms(), config_fp=current_config_fp,
         )
         return _finish(state, rid, accepted, "error", e.code, False,
                         cards=[], raw_returned=0, reason=f"输入不合法：{e.code}")
@@ -790,7 +860,7 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
         accepted = accepted_row(
             "gated", rid, time.time(), state.cfg.traffic_class,
             query=clean_task, q_len=len(clean_task),
-            pre_commit_ms=_pre_commit_ms(), config_fp=state.config_fp,
+            pre_commit_ms=_pre_commit_ms(), config_fp=current_config_fp,
         )
         return _finish(state, rid, accepted, "error", "review_overdue", False,
                         cards=[], raw_returned=0,
@@ -805,7 +875,7 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
     except upstream.UpstreamBadResponse:
         return _finish_upstream_fail(
             state, rid, clean_task, "everos_bad_response", False, _pre_commit_ms(),
-            "EverOS 响应不合法，本次检索未返回结果。",
+            "EverOS 响应不合法，本次检索未返回结果。", config_fp=current_config_fp,
         )
     except RedirectRefused:
         # M9.1/final-review:重定向属于上游异常行为(spec §8-1),不是本进程的
@@ -813,24 +883,24 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
         # 不可重试(第二个请求本就永不发出,opener 层已经拒绝跟随)。
         return _finish_upstream_fail(
             state, rid, clean_task, "everos_bad_response", False, _pre_commit_ms(),
-            "EverOS 返回重定向响应，视为异常上游行为，本次检索未返回结果。",
+            "EverOS 返回重定向响应，视为异常上游行为，本次检索未返回结果。", config_fp=current_config_fp,
         )
     except upstream.UpstreamHTTPError as e:
         status_code = getattr(e.__cause__, "code", None)
         retryable = isinstance(status_code, int) and 500 <= status_code < 600
         return _finish_upstream_fail(
             state, rid, clean_task, "everos_http_error", retryable, _pre_commit_ms(),
-            "EverOS 返回错误状态，本次检索未返回结果。",
+            "EverOS 返回错误状态，本次检索未返回结果。", config_fp=current_config_fp,
         )
     except (URLError, TimeoutError):
         return _finish_upstream_fail(
             state, rid, clean_task, "everos_timeout", True, _pre_commit_ms(),
-            "EverOS 连接超时，本次检索未返回结果。",
+            "EverOS 连接超时，本次检索未返回结果。", config_fp=current_config_fp,
         )
     except Exception as e:  # noqa: BLE001 —— 未预期异常,归 internal,不可重试
         return _finish_upstream_fail(
             state, rid, clean_task, "internal", False, _pre_commit_ms(),
-            "检索发生未预期错误。", error_detail=str(e)[:2000],
+            "检索发生未预期错误。", config_fp=current_config_fp, error_detail=str(e)[:2000],
         )
 
     # ⑤ 空结果 → abstain_empty;否则 compute_returned 取 limit
@@ -839,7 +909,7 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
         accepted = accepted_row(
             "empty", rid, time.time(), state.cfg.traffic_class,
             query=clean_task, q_len=len(clean_task), everos_rid=normalized.everos_request_id,
-            search_ms=search_ms, pre_commit_ms=_pre_commit_ms(), config_fp=state.config_fp,
+            search_ms=search_ms, pre_commit_ms=_pre_commit_ms(), config_fp=current_config_fp,
         )
         return _finish(state, rid, accepted, "abstain_empty", None, None,
                         cards=[], raw_returned=0,
@@ -893,14 +963,14 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
     except Exception as e:  # noqa: BLE001 —— 未预期异常:尽力落账为 upstream_fail 形状,不 mark_abort
         return _finish_upstream_fail(
             state, rid, clean_task, "internal", False, _pre_commit_ms(),
-            "候选处理发生未预期错误。", error_detail=str(e)[:2000],
+            "候选处理发生未预期错误。", config_fp=current_config_fp, error_detail=str(e)[:2000],
         )
 
     accepted = accepted_row(
         "hit", rid, time.time(), state.cfg.traffic_class,
         query=clean_task, q_len=len(clean_task), everos_rid=normalized.everos_request_id,
         search_ms=search_ms, candidates=candidates_for_ledger, returned_ids=returned_ids,
-        pre_commit_ms=_pre_commit_ms(), config_fp=state.config_fp,
+        pre_commit_ms=_pre_commit_ms(), config_fp=current_config_fp,
     )
     return _finish(
         state, rid, accepted, "hit", None, None, cards=cards, raw_returned=total_candidates,
