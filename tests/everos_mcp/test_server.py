@@ -451,6 +451,13 @@ def test_full_hit_chain_skill_first_interleave_and_worker_enqueued(
     assert len(accepted_rows) == 1
     assert accepted_rows[0]["stage"] == "hit"
     assert len(accepted_rows[0]["candidates"]) == 4
+    # P2(R4 #9):returned_ids 是 (card_type, card_id) 序对——JSON 无 tuple,
+    # 落盘编码为 [card_type, card_id] 两元素列表,顺序与响应 cards 一致
+    # (skill-first 交错序)。
+    assert accepted_rows[0]["returned_ids"] == [
+        ["agent_skill", "sk_1"], ["agent_case", "ac_1"],
+        ["agent_skill", "sk_2"], ["agent_case", "ac_2"],
+    ]
 
     scored_rows = _wait_for_scored(ledger_dir, rid)
     assert len(scored_rows) == 1
@@ -553,10 +560,12 @@ def test_replay_from_accepted_row_and_snapshots_matches_response(
     # P0:accepted["candidates"] 现在是全部原始候选(cases 全序 + skills 全序),
     # 不再是 `returned` 的交错序——复算响应必须按 `returned_ids`(响应实际的
     # skill-first 交错序 + limit 截断)过滤/排序,不能假设两者顺序/成员一致。
-    by_id = {c["card_id"]: c for c in accepted["candidates"]}
+    # P2(R4 #9):returned_ids 现在是 [card_type, card_id] 序对,不是裸 card_id
+    # ——JSON 无 tuple,查表键改用 (card_type, card_id) 元组。
+    by_id = {(c["card_type"], c["card_id"]): c for c in accepted["candidates"]}
     replayed_cards = []
-    for card_id in accepted["returned_ids"]:
-        c = by_id[card_id]
+    for card_type, card_id in accepted["returned_ids"]:
+        c = by_id[(card_type, card_id)]
         payload = json.loads(state.blobstore.get(c["payload_sha"]))
         replayed_cards.append({
             "id": c["card_id"], "card_type": c["card_type"],
@@ -585,10 +594,10 @@ def test_replay_from_accepted_row_matches_response_when_candidates_exceed_return
     assert len(accepted["candidates"]) == 6
     assert len(result["cards"]) == 2
 
-    by_id = {c["card_id"]: c for c in accepted["candidates"]}
+    by_id = {(c["card_type"], c["card_id"]): c for c in accepted["candidates"]}
     replayed_cards = []
-    for card_id in accepted["returned_ids"]:
-        c = by_id[card_id]
+    for card_type, card_id in accepted["returned_ids"]:
+        c = by_id[(card_type, card_id)]
         payload = json.loads(state.blobstore.get(c["payload_sha"]))
         replayed_cards.append({
             "id": c["card_id"], "card_type": c["card_type"],

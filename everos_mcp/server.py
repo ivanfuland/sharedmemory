@@ -832,11 +832,14 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
             })
             snapshot_by_id[cand.id] = snap
 
+        # P2(R4 阻断项 #9):spec §3「返回卡 (card_type, card_id) 序」——
+        # returned_ids 必须是 (card_type, card_id) 序对,不是裸 card_id;JSON
+        # 没有 tuple,落盘/传输一律编码为 [card_type, card_id] 两元素列表。
         returned_ids = []
         cards = []
         for cand in returned:
             snap = snapshot_by_id[cand.id]
-            returned_ids.append(cand.id)
+            returned_ids.append([cand.mem_type, cand.id])
             cards.append({
                 "id": cand.id, "card_type": cand.mem_type,
                 "truncated": snap.truncated, "payload": snap.payload_clamped,
