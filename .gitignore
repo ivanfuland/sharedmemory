@@ -33,3 +33,4 @@ cass-corpus-feed/
 
 # 本机私有 agent 指令(CLAUDE.local.md),永不进本 PUBLIC 仓
 CLAUDE.local.md
+infra/everos-mcp/*.env

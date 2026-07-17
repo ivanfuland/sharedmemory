@@ -137,6 +137,35 @@ def test_embed_empty_input_returns_empty_without_request():
     mock_urlopen.assert_not_called()
 
 
+# ---- post_json 注入(everos_mcp 出站唯一通道复用探针底座,Task 2)----
+
+def test_embed_injected_post_json_used_instead_of_default_urlopen():
+    """注入 post_json 后必须走注入通道:调用计数 == 1,且默认 urlopen 全程零调用。"""
+    calls = []
+
+    def fake_post_json(url, payload, *, timeout=60):
+        calls.append((url, payload, timeout))
+        return {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+
+    mock_urlopen = MagicMock()
+    with patch("everos_eval.probe_scores.urlopen", mock_urlopen):
+        vecs = embed(["text-a"], base_url="http://fake", model="m", timeout=7,
+                     post_json=fake_post_json)
+    assert vecs == [[0.1, 0.2]]
+    assert len(calls) == 1
+    assert calls[0] == ("http://fake/embeddings", {"input": ["text-a"], "model": "m"}, 7)
+    mock_urlopen.assert_not_called()
+
+
+def test_embed_without_injection_behavior_unchanged():
+    """不传 post_json 时行为不变:仍走现行 _post_json/urlopen 路径。"""
+    payload = {"data": [{"index": 0, "embedding": [0.3, 0.4]}]}
+    with patch("everos_eval.probe_scores.urlopen", return_value=_FakeResponse(payload)) as mock_urlopen:
+        vecs = embed(["text-a"], base_url="http://fake", model="m")
+    assert vecs == [[0.3, 0.4]]
+    mock_urlopen.assert_called_once()
+
+
 # ======================================================================
 # rerank():响应还原契约(P0-2,核心断言——乱序 mock)
 # ======================================================================
@@ -263,6 +292,34 @@ def test_rerank_default_tokenizer_is_task3_rerank_tokenizer():
         with patch("everos_eval.probe_scores.urlopen", return_value=_FakeResponse(payload)):
             rerank("你好", ["一段很短的中文文档"], base_url="http://fake", model="m")
     mock_factory.assert_called_once()
+
+
+# ---- post_json 注入(everos_mcp 出站唯一通道复用探针底座,Task 2)----
+
+def test_rerank_injected_post_json_used_instead_of_default_urlopen():
+    calls = []
+
+    def fake_post_json(url, payload, *, timeout=60):
+        calls.append((url, payload, timeout))
+        return {"results": [{"index": 0, "relevance_score": 0.77}]}
+
+    mock_urlopen = MagicMock()
+    with patch("everos_eval.probe_scores.urlopen", mock_urlopen):
+        scores = rerank("q", ["d0"], base_url="http://fake", model="m", timeout=9,
+                        tokenizer=_FakeTokenizer(), post_json=fake_post_json)
+    assert scores == [0.77]
+    assert len(calls) == 1
+    assert calls[0] == ("http://fake/rerank", {"query": "q", "documents": ["d0"], "model": "m"}, 9)
+    mock_urlopen.assert_not_called()
+
+
+def test_rerank_without_injection_behavior_unchanged():
+    payload = {"results": [{"index": 0, "relevance_score": 0.33}]}
+    with patch("everos_eval.probe_scores.urlopen", return_value=_FakeResponse(payload)) as mock_urlopen:
+        scores = rerank("q", ["d0"], base_url="http://fake", model="m",
+                        tokenizer=_FakeTokenizer())
+    assert scores == [0.33]
+    mock_urlopen.assert_called_once()
 
 
 # ======================================================================

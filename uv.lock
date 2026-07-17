@@ -1485,6 +1485,10 @@ dev = [
     { name = "blake3" },
     { name = "pytest" },
 ]
+mcp-shadow = [
+    { name = "tokenizers" },
+    { name = "transformers" },
+]
 probe = [
     { name = "tokenizers" },
     { name = "transformers" },
@@ -1500,6 +1504,10 @@ requires-dist = [
 dev = [
     { name = "blake3", specifier = ">=1.0.9" },
     { name = "pytest", specifier = ">=8.0" },
+]
+mcp-shadow = [
+    { name = "tokenizers", specifier = ">=0.19" },
+    { name = "transformers", specifier = ">=4.40" },
 ]
 probe = [
     { name = "tokenizers", specifier = ">=0.19" },

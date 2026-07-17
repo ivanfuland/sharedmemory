@@ -1,0 +1,26 @@
+[Unit]
+Description=everos-mcp — EverOS 影子检索暴露为 MCP 工具（shadow mode，只读旁路）
+After=network-online.target everos-prod.service
+Wants=network-online.target everos-prod.service
+
+[Service]
+Type=simple
+# 包不进 wheel，靠 cwd 导入（`python -m everos_mcp.server` 必须能 `import everos_mcp`）——
+# 没有这一行会 ModuleNotFoundError。
+WorkingDirectory=%h/projects/sharedmemory
+# 部署侧私有 env，不进仓（复制 everos-mcp.env.example 到此路径并填真实值）。
+EnvironmentFile=%h/projects/sharedmemory/infra/everos-mcp/everos-mcp.env
+# --frozen：启动时不重新解 lock（uv_lock_sha 才是真正的可复现 pin，见 collect_config_fp）。
+ExecStart=%h/.local/bin/uv run --frozen --group mcp-shadow python -m everos_mcp.server
+# 账本/日志可能含查询明文——本进程创建的任何文件都不给组/其他用户任何权限。
+UMask=0077
+# 86=ops-fatal（started 行写失败，fail-stop，不可恢复）、87=启动自检探针耗尽重试后
+# 仍空（拒启，等人看）——两者都不该被 systemd 自动拉起来重复触发同一个故障。
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=86 87
+# 143=SIGTERM 正常终止（uvicorn 收到 SIGTERM 后走 graceful shutdown）。
+SuccessExitStatus=143
+
+[Install]
+WantedBy=default.target

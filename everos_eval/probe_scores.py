@@ -87,12 +87,19 @@ def _assert_finite(value: Any, *, label: str) -> float:
 # embed() / rerank() / cosine()
 # ======================================================================
 
-def embed(texts: list[str], *, base_url: str, model: str, timeout: int = 60) -> list[list[float]]:
+def embed(texts: list[str], *, base_url: str, model: str, timeout: int = 60,
+          post_json: Callable[..., dict] | None = None) -> list[list[float]]:
     """POST {base_url}/embeddings。响应按 `data[].index` 还原(P0-2 契约);
-    校验:index 闭合、分量非有限值一律拒、批内维度全部一致、数量与输入一致。"""
+    校验:index 闭合、分量非有限值一律拒、批内维度全部一致、数量与输入一致。
+
+    `post_json`:可选注入的 POST 客户端,签名同 `_post_json(url, payload, *,
+    timeout)`。缺省(None)时走现行 `_post_json`(默认行为零变化,everos_mcp
+    注入自己的 `http.post_json` 走 loopback 断言 + redirect 拒绝 + BadJson)。
+    """
     if not texts:
         return []
-    body = _post_json(f"{base_url}/embeddings", {"input": texts, "model": model}, timeout=timeout)
+    poster = post_json if post_json is not None else _post_json
+    body = poster(f"{base_url}/embeddings", {"input": texts, "model": model}, timeout=timeout)
     data = body.get("data")
     if not isinstance(data, list):
         raise ValueError(f"embeddings 响应缺 data 数组: {body!r}")
@@ -116,13 +123,16 @@ def embed(texts: list[str], *, base_url: str, model: str, timeout: int = 60) -> 
 
 
 def rerank(query: str, docs: list[str], *, base_url: str, model: str, timeout: int = 60,
-           tokenizer=None) -> list[float]:
+           tokenizer=None, post_json: Callable[..., dict] | None = None) -> list[float]:
     """POST {base_url}/rerank。`results` 按分数降序返回,必须按 `item.index`
     scatter 回输入序(P0-2 核心契约——不是边角用例)。
 
     发请求前先做 CE 对预算断言(Task 3 遗留点名):逐 (query, doc) 对用 Task 3
     的 rerank tokenizer 实测 token 总数,超 `probe_passage.PAIR_BUDGET` 直接
     抛异常,不发请求、不静默截断。
+
+    `post_json`:可选注入的 POST 客户端,签名同 `_post_json(url, payload, *,
+    timeout)`。缺省(None)时走现行 `_post_json`(默认行为零变化)。
     """
     if not docs:
         return []
@@ -135,8 +145,9 @@ def rerank(query: str, docs: list[str], *, base_url: str, model: str, timeout: i
                 "(query+doc 对超出 rerank 模型有效窗口,拒绝静默截断,停工重新审视上游 passage 组装)"
             )
 
-    body = _post_json(f"{base_url}/rerank", {"query": query, "documents": docs, "model": model},
-                       timeout=timeout)
+    poster = post_json if post_json is not None else _post_json
+    body = poster(f"{base_url}/rerank", {"query": query, "documents": docs, "model": model},
+                  timeout=timeout)
     results = body.get("results")
     if not isinstance(results, list):
         raise ValueError(f"rerank 响应缺 results 数组: {body!r}")
