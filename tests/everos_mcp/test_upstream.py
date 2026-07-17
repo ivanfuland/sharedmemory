@@ -153,6 +153,27 @@ def test_search_non_loopback_refused():
         upstream.search(cfg, "q")
 
 
+def test_search_oversized_2xx_body_maps_to_upstream_bad_response_not_internal(monkeypatch):
+    """P1c:此前 `upstream.search` 只 catch `http.BadJson`,`http.ResponseTooLarge`
+    (响应体超过 `http.MAX_RESPONSE_BYTES`)会滑过、被 server.py 最外层 broad
+    except 误判成 error_code="internal"——这本质是上游响应异常(响应体不可信),
+    应同 BadJson 一样落 everos_bad_response,不落 internal。monkeypatch 把上限
+    调小,避免真的构造超大 fixture body(与 test_http.py 同一约定)。"""
+    from everos_mcp import http
+
+    monkeypatch.setattr(http, "MAX_RESPONSE_BYTES", 16)
+    oversized = json.dumps({"request_id": "r1", "data": {"agent_cases": [], "agent_skills": []}}).encode("utf-8")
+    assert len(oversized) > 16
+    stub = _make_stub(200, oversized)
+    try:
+        cfg = _cfg(stub.base_url)
+        with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+            upstream.search(cfg, "q")
+        assert exc_info.value.code == "everos_bad_response"
+    finally:
+        stub.stop()
+
+
 # ======================================================================
 # normalize_candidates():完整 envelope + 违规校验
 # ======================================================================

@@ -112,6 +112,13 @@ def search(cfg: Config, query: str) -> dict:
         raise UpstreamHTTPError(f"EverOS search HTTP {e.code}: {body!r}") from e
     except http.BadJson as e:
         raise UpstreamBadResponse(f"EverOS search 响应解析失败: {e}") from e
+    except http.ResponseTooLarge as e:
+        # P1c:此前只捕获 BadJson,ResponseTooLarge 会滑过本函数、被 server.py
+        # 最外层 broad except 误判成 error_code="internal"——这本质上是上游
+        # 响应异常(响应体超出可信上限),与 BadJson 同一类"响应不合法"故障,
+        # 应同码 everos_bad_response,不落 internal。异常消息本身不回显任何
+        # body 内容(`http.ResponseTooLarge` 已经只报字节数,不带内容片段)。
+        raise UpstreamBadResponse(f"EverOS search 响应超限: {e}") from e
 
 
 def _require_array(data: dict, key: str) -> list:

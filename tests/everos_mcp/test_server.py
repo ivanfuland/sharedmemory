@@ -862,6 +862,31 @@ def test_upstream_non_json_response_maps_to_bad_response_separately_from_interna
     assert result["meta"]["retryable"] is False
 
 
+def test_upstream_oversized_2xx_body_maps_to_bad_response_not_internal(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """P1c:响应体超过 `http.MAX_RESPONSE_BYTES`(`http.ResponseTooLarge`)此前
+    只被 `http.BadJson` 一种异常捕获,`ResponseTooLarge` 会滑过 `upstream.search`
+    的 except 分支、被 `_handle_search` 最外层 broad except 误判成 internal
+    ——必须同 BadJson 一样落 everos_bad_response。monkeypatch 调小上限,避免
+    真的构造超大 fixture body(与 test_http.py/test_upstream.py 同一约定)。"""
+    from everos_mcp import http as http_mod
+
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    # 启动序里的 /models 探针必须先用正常上限跑完,只在真正调用 everos_search
+    # 时才把上限调小——否则 bootstrap 自身对 Infinity 的 /models 探针也会被
+    # 误伤而拿不到窗口探测结果。
+    monkeypatch.setattr(http_mod, "MAX_RESPONSE_BYTES", 8)  # 正常空信封响应体也会超过 8 字节
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+    assert result["meta"]["retryable"] is False
+
+
 def test_upstream_top_level_json_array_maps_to_bad_response_not_internal(
     tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
 ):
