@@ -160,6 +160,28 @@ def test_state_stays_due_within_grace_period(tmp_path):
     assert cp.state(real_query_count=0, now=due_ts + 6 * _DAY) == "due"
 
 
+def test_state_due_since_is_sticky_despite_lower_later_query_count(tmp_path):
+    """一旦 due_since 落盘(比如计数触发到点),之后某次调用即便传入更低的
+    real_query_count(计数上报非单调 / 重启抖动),状态也不能被静默原谅回
+    "ok"——必须仍是 due,且到点后的逾期推进(overdue)照旧从原 due_since
+    起算。这是回归测试(此前实现里 state() 每次都用当次入参重算 is_due,
+    没先看持久化的 due_since,导致这个场景被误判成 ok)。"""
+    cp = checkpoint.Checkpoint(tmp_path / "root")
+    cp.init_or_load(ledger_has_rows=False, now=_T0)
+
+    due_ts = _T0 + _DAY
+    assert cp.state(real_query_count=200, now=due_ts) == "due"
+    on_disk = json.loads(cp.meta_path.read_text(encoding="utf-8"))
+    assert on_disk["due_since"] == due_ts
+
+    # 之后一次调用:count 掉回 5(远低于 200),时间也没到 30 天——若只看当次
+    # is_due 会误判 ok;必须仍是 due,因为 due_since 已经落盘且无复审。
+    assert cp.state(real_query_count=5, now=due_ts + _DAY) == "due"
+
+    # 逾期推进照旧从原 due_since 起算,不受这次低计数调用影响。
+    assert cp.state(real_query_count=5, now=due_ts + 7 * _DAY) == "overdue"
+
+
 def test_state_overdue_after_grace_period_with_no_review(tmp_path):
     cp = checkpoint.Checkpoint(tmp_path / "root")
     cp.init_or_load(ledger_has_rows=False, now=_T0)

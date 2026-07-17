@@ -162,18 +162,23 @@ class Checkpoint:
     def state(self, real_query_count: int, now: float | None = None) -> str:
         """`"ok" | "due" | "overdue"`。首次判定到点时原子持久化
         `due_since=now`。到点之后(ts >= due_since)记的复审让状态永久回到
-        "ok"(到点之前的复审不算数,见模块文档)。"""
+        "ok"(到点之前的复审不算数,见模块文档)。
+
+        `due_since` 一旦落盘就是粘性的(sticky):只有"ts >= due_since 的复审"
+        能把状态解回 "ok"——本次调用重新算出的 `is_due` 只用于**首次**判定
+        到点那一刻(把 due_since 从 None 变成一个具体时间戳)。已经持久化的
+        due_since 不因为某次调用传入的 `real_query_count` 更低(计数上报非
+        单调、重启抖动等)就被无视——不然就是一次静默的"already-due 又被原谅"
+        ,违反 fail-closed 的合规控制意图。"""
         now = time.time() if now is None else now
         meta = self._require_loaded()
 
-        launched_ts = meta["launched_ts"]
-        is_due = (now - launched_ts >= DUE_SECONDS) or (real_query_count >= DUE_QUERY_COUNT)
-
-        if not is_due:
-            return "ok"
-
         due_since = meta.get("due_since")
         if due_since is None:
+            launched_ts = meta["launched_ts"]
+            is_due = (now - launched_ts >= DUE_SECONDS) or (real_query_count >= DUE_QUERY_COUNT)
+            if not is_due:
+                return "ok"
             due_since = now
             meta["due_since"] = due_since
             _atomic_write_json(self.meta_path, meta)
