@@ -473,6 +473,65 @@ def test_full_hit_chain_limit_truncates_returned_cards(
     assert result["meta"]["raw_returned"] == 4  # raw_returned 记全量候选,不受 limit 截断影响
 
 
+def _full_envelope_three_cases_three_skills():
+    return {
+        "request_id": "req-full-6",
+        "data": {
+            "agent_cases": [
+                {"id": f"ac_{i}", "score": 0.9 - i * 0.1,
+                 "task_intent": f"任务意图 {i}", "approach": f"方案 {i}"}
+                for i in range(3)
+            ],
+            "agent_skills": [
+                {"id": f"sk_{i}", "score": 0.8 - i * 0.1,
+                 "name": f"技能 {i}", "description": f"描述 {i}"}
+                for i in range(3)
+            ],
+        },
+    }
+
+
+def test_accepted_candidates_cover_all_raw_candidates_not_just_returned(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """P0:accepted 行的 candidates(以及由此驱动的打分/复标)必须覆盖**全部
+    原始候选**(top_k=20/类型,非仅返回的 limit 张),不能只从 `returned`
+    (被 limit 截断后的交错序)构建——否则未返回的候选永远进不了影子账,
+    标定阶段就少了绝大多数数据。3 case + 3 skill、limit=2 → accepted 行必须
+    有 6 条候选(each 带 payload_sha/passage_sha/truncated),returned_ids
+    只有 2 个(响应确实被 limit 截断,不受影响)。"""
+    everos_stub.state.envelope = _full_envelope_three_cases_three_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("覆盖全部候选任务", 2)
+    assert result["status"] == "hit"
+    assert len(result["cards"]) == 2  # 响应仍按 limit 截断
+
+    rid = result["meta"]["mcp_request_id"]
+    accepted = _accepted_rows_for(ledger_dir, rid)[0]
+    candidates = accepted["candidates"]
+    assert len(candidates) == 6  # 全部原始候选(3 case + 3 skill),不是仅返回的 2 张
+    assert {c["card_id"] for c in candidates} == {f"ac_{i}" for i in range(3)} | {f"sk_{i}" for i in range(3)}
+    for c in candidates:
+        assert isinstance(c["payload_sha"], str) and c["payload_sha"]
+        assert isinstance(c["passage_sha"], str) and c["passage_sha"]
+        assert isinstance(c["truncated"], bool)
+
+    assert len(accepted["returned_ids"]) == 2
+
+    scored_rows = _wait_for_scored(ledger_dir, rid)
+    assert len(scored_rows) == 1
+    row = scored_rows[0]
+    assert row["status"] == "ok"
+    assert set(row["per_card"].keys()) == {
+        f"agent_case:ac_{i}" for i in range(3)
+    } | {f"agent_skill:sk_{i}" for i in range(3)}
+
+
 # ======================================================================
 # 2. 重放测试:仅凭 accepted 行 + 快照复算 cards,与实际响应逐字段一致。
 # ======================================================================
@@ -491,8 +550,45 @@ def test_replay_from_accepted_row_and_snapshots_matches_response(
     rid = result["meta"]["mcp_request_id"]
     accepted = _accepted_rows_for(ledger_dir, rid)[0]
 
+    # P0:accepted["candidates"] 现在是全部原始候选(cases 全序 + skills 全序),
+    # 不再是 `returned` 的交错序——复算响应必须按 `returned_ids`(响应实际的
+    # skill-first 交错序 + limit 截断)过滤/排序,不能假设两者顺序/成员一致。
+    by_id = {c["card_id"]: c for c in accepted["candidates"]}
     replayed_cards = []
-    for c in accepted["candidates"]:
+    for card_id in accepted["returned_ids"]:
+        c = by_id[card_id]
+        payload = json.loads(state.blobstore.get(c["payload_sha"]))
+        replayed_cards.append({
+            "id": c["card_id"], "card_type": c["card_type"],
+            "truncated": c["truncated"], "payload": payload,
+        })
+
+    assert replayed_cards == result["cards"]
+
+
+def test_replay_from_accepted_row_matches_response_when_candidates_exceed_returned(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """P0 场景下 accepted 行的 candidates(6)比响应 cards(limit=2)多——重放
+    必须先按 `returned_ids` 过滤/排序 accepted 候选,再逐字段匹配响应,而不能
+    再假设"accepted 候选 == 响应 cards"(这条假设是 P0 修复前的旧世界观)。"""
+    everos_stub.state.envelope = _full_envelope_three_cases_three_skills()
+    env, ledger_dir = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+
+    server_mod = fresh_server["reload"]()
+    state = server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("重放测试任务二", 2)
+    rid = result["meta"]["mcp_request_id"]
+    accepted = _accepted_rows_for(ledger_dir, rid)[0]
+    assert len(accepted["candidates"]) == 6
+    assert len(result["cards"]) == 2
+
+    by_id = {c["card_id"]: c for c in accepted["candidates"]}
+    replayed_cards = []
+    for card_id in accepted["returned_ids"]:
+        c = by_id[card_id]
         payload = json.loads(state.blobstore.get(c["payload_sha"]))
         replayed_cards.append({
             "id": c["card_id"], "card_type": c["card_type"],
@@ -691,6 +787,35 @@ def test_upstream_nan_native_score_maps_to_bad_response(
     result = server_mod.everos_search("查任务", 5)
     assert result["status"] == "error"
     assert result["meta"]["error_code"] == "everos_bad_response"
+
+
+def test_upstream_malformed_card_field_type_maps_to_bad_response_not_internal(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """P1f/P2a:候选 payload 白名单字段类型非法(如 `task_intent` 是 list 不是
+    str)——此前这类畸形字段能滑过 `normalize_candidates` 的校验,一路带到
+    `build_snapshots`/`build_passage` 阶段才炸 `TypeError`("\\n".join 需要
+    str 元素),被外层 broad except 误判成 internal。schema 校验必须在
+    `normalize_candidates` 里就地拦截,落 everos_bad_response(失败矩阵:
+    响应坏),不是 internal。"""
+    everos_stub.state.envelope = {
+        "request_id": "req-badfield",
+        "data": {
+            "agent_cases": [
+                {"id": "ac_bad", "score": 0.5, "task_intent": ["not", "a", "string"], "approach": "b"},
+            ],
+            "agent_skills": [],
+        },
+    }
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+    assert result["meta"]["retryable"] is False
 
 
 def test_upstream_redirect_maps_to_bad_response_not_internal(

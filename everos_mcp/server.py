@@ -77,6 +77,7 @@ from everos_eval import probe_passage
 from everos_eval.probe_metrics import compute_returned
 from everos_mcp import config as config_mod
 from everos_mcp import contract
+from everos_mcp import http
 from everos_mcp import upstream
 from everos_mcp.blobstore import BlobCorruption, BlobStore, build_snapshots
 from everos_mcp.checkpoint import Checkpoint
@@ -372,7 +373,7 @@ def bootstrap(
         if tokenizer is not None and passage_cap is not None:
             resolved_tokenizer, resolved_cap = tokenizer, passage_cap
         else:
-            window = probe_passage.run_window_probe(cfg.infinity_base)
+            window = probe_passage.run_window_probe(cfg.infinity_base, get_json=http.get_json)
             resolved_tokenizer = probe_passage.rerank_tokenizer()
             resolved_cap = window.cap
 
@@ -809,12 +810,18 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
 
     returned = compute_returned(normalized.cases, normalized.skills, allowed=lambda _c: True, limit=clean_limit)
 
-    # ⑥ 逐候选 build_snapshots → blobstore.put ×2 → 组装 accepted candidates + 响应 cards
+    # ⑥ P0:accepted/快照/打分必须覆盖**全部原始候选**(top_k=20/类型),不是
+    # 仅 `returned`(被 limit 截断后的交错序)——否则未返回的候选永远进不了
+    # 影子账,标定阶段就少了绝大多数数据(spec §3:「对 score_eligible 查询的
+    # 全部原始候选…计算三信号分」)。逐候选 build_snapshots → blobstore.put ×2
+    # → 组装全量 accepted candidates;响应 cards 仍只取 `returned` 子集,从同一份
+    # 已计算的快照里查(id 在 upstream.normalize_candidates 里已校验跨两数组
+    # 唯一,查表键直接用 card_id 即可,不需要再拼 (card_type, card_id))。
+    all_candidates = normalized.cases + normalized.skills
     try:
         candidates_for_ledger = []
-        cards = []
-        returned_ids = []
-        for cand in returned:
+        snapshot_by_id = {}
+        for cand in all_candidates:
             snap = build_snapshots(cand.payload, cand.mem_type, cap=state.passage_cap, tokenizer=state.tokenizer)
             payload_sha = state.blobstore.put(snap.payload_clamped)
             passage_sha = state.blobstore.put(snap.passage_text)
@@ -823,6 +830,12 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
                 "native_score": cand.native_score, "payload_sha": payload_sha,
                 "passage_sha": passage_sha, "truncated": snap.truncated,
             })
+            snapshot_by_id[cand.id] = snap
+
+        returned_ids = []
+        cards = []
+        for cand in returned:
+            snap = snapshot_by_id[cand.id]
             returned_ids.append(cand.id)
             cards.append({
                 "id": cand.id, "card_type": cand.mem_type,
