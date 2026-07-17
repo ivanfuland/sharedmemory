@@ -265,3 +265,14 @@ def test_normalize_native_score_none_is_accepted():
     env["data"]["agent_cases"][0]["score"] = None
     result = upstream.normalize_candidates(env)
     assert result.cases[0].native_score is None
+
+
+@pytest.mark.parametrize("non_object_resp", [[1, 2], "x", 3, None])
+def test_normalize_top_level_non_object_maps_to_bad_response(non_object_resp):
+    """`http.post_json` 只保证返回 `json.loads` 的结果——顶层合法 JSON 但非对象
+    (数组/字符串/数字/null)之前会直接摔进 `resp.get(...)` 触发 AttributeError,
+    被外层 broad except 误判成 internal。失败矩阵要求这类畸形信封一律
+    everos_bad_response,顶层类型检查必须在 normalize_candidates 最前面。"""
+    with pytest.raises(upstream.UpstreamBadResponse) as exc_info:
+        upstream.normalize_candidates(non_object_resp)
+    assert exc_info.value.code == "everos_bad_response"

@@ -166,6 +166,26 @@ def test_traffic_class_override(tmp_path, monkeypatch):
     assert cfg.traffic_class == "synthetic_bench"
 
 
+@pytest.mark.parametrize("valid_value", ["real", "synthetic_bench", "fault_test"])
+def test_traffic_class_valid_values_load(tmp_path, monkeypatch, valid_value):
+    env = _env(tmp_path)
+    env["SHADOW_TRAFFIC_CLASS"] = valid_value
+    _apply_env(monkeypatch, env)
+    cfg = config.load()
+    assert cfg.traffic_class == valid_value
+
+
+def test_traffic_class_invalid_value_rejected(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    env["SHADOW_TRAFFIC_CLASS"] = "bogus"
+    _apply_env(monkeypatch, env)
+    with pytest.raises(config.ConfigError) as exc_info:
+        config.load()
+    msg = str(exc_info.value)
+    assert "bogus" in msg
+    assert "real" in msg and "synthetic_bench" in msg and "fault_test" in msg
+
+
 def test_fault_override(tmp_path, monkeypatch):
     env = _env(tmp_path)
     env["SHADOW_FAULT"] = "everos_timeout"

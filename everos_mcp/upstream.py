@@ -120,10 +120,17 @@ def _build_candidates(items: list, mem_type: str, seen_ids: set) -> list:
 def normalize_candidates(resp: dict) -> NormalizedSearch:
     """解析真实 envelope `{request_id, data:{agent_cases, agent_skills}}`。
 
-    校验顺序:request_id 非空字符串 -> data 是对象 -> 两个数组存在 -> 逐候选
-    id 非空且跨两数组无重复、native score finite-or-None。任一违规
+    校验顺序:顶层是对象 -> request_id 非空字符串 -> data 是对象 -> 两个数组存在
+    -> 逐候选 id 非空且跨两数组无重复、native score finite-or-None。任一违规
     `UpstreamBadResponse(code="everos_bad_response")`。
+
+    `http.post_json` 只保证返回 `json.loads` 的结果——顶层合法 JSON 但非对象
+    (数组/字符串/数字/null)必须在这里挡住,不能让 `resp.get(...)` 摔
+    AttributeError 滑进外层 broad except 被误判成 internal。
     """
+    if not isinstance(resp, dict):
+        raise UpstreamBadResponse(f"EverOS 响应顶层非对象: {type(resp).__name__}")
+
     request_id = resp.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise UpstreamBadResponse(f"EverOS 响应 request_id 缺失/空/非字符串: {request_id!r}")

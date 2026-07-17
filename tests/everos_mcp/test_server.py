@@ -728,6 +728,24 @@ def test_upstream_non_json_response_maps_to_bad_response_separately_from_interna
     assert result["meta"]["retryable"] is False
 
 
+def test_upstream_top_level_json_array_maps_to_bad_response_not_internal(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """EverOS 响应是合法 JSON 但顶层是数组(非对象)——`normalize_candidates` 之前
+    会直接 `resp.get(...)` 摔 AttributeError,被外层 broad except 误判成
+    internal。失败矩阵要求畸形信封一律 everos_bad_response。"""
+    everos_stub.state.envelope = [1, 2, 3]
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+    assert result["meta"]["retryable"] is False
+
+
 # ======================================================================
 # 6. 空结果 → abstain_empty
 # ======================================================================

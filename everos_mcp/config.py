@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+_VALID_TRAFFIC_CLASSES = frozenset({"real", "synthetic_bench", "fault_test"})
+
 _REQUIRED_ENV = (
     "EVEROS_MCP_PORT",
     "EVEROS_MCP_TOKEN",
@@ -101,6 +103,11 @@ def load() -> Config:
 
     expect_empty = os.environ.get("EVEROS_MCP_EXPECT_EMPTY") == "1"
     traffic_class = os.environ.get("SHADOW_TRAFFIC_CLASS") or "real"
+    if traffic_class not in _VALID_TRAFFIC_CLASSES:
+        allowed = ", ".join(sorted(_VALID_TRAFFIC_CLASSES))
+        raise ConfigError(
+            f"SHADOW_TRAFFIC_CLASS 非法值: {traffic_class!r}，允许值: {{{allowed}}}"
+        )
     fault = os.environ.get("SHADOW_FAULT") or None
 
     return Config(
