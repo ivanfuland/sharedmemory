@@ -143,11 +143,14 @@ async def _run_calls(url: str, token: str, queries: list[str], reps: int) -> tup
 
 def _build_report(samples: list[dict], round_retries: list[dict], *, discard_rounds: int, reps: int) -> dict:
     """P1e:gate 现在是三门联合(AND),不再只看 p95:
-    ① p95 <= 门槛;② effective 样本里零非 "hit" 状态(此前 abstain_empty 也
-    被当"可接受",在这套始终有候选的合成拓扑下不该出现,出现即真故障或
-    stub 拓扑坏了,必须 FAIL 而不是被悄悄放过);③ 零重试(此前重试机制会把
-    "这一轮撞到真实传输层故障"洗成"整轮正常完成",gate 对此视而不见——现在
-    任何一轮需要 >1 次 attempt 都直接判 FAIL,并在报告里点名是哪几轮)。"""
+    ① p95 <= 门槛;② **全部**样本(含被丢弃的热身轮,不只是 effective 集合)
+    零非 "hit" 状态——热身轮只是为了不把 JIT/tokenizer 懒加载/首轮冷 blob
+    写入计入 p95 计时,不代表热身轮里出现的非 hit 状态可以被容忍:这套合成
+    拓扑本就始终有候选,任何一轮(不管是不是被丢弃的热身轮)出现非 hit 状态
+    都是真故障或 stub 拓扑坏了,必须 FAIL 而不是被悄悄放过(P1i:此前只查
+    effective 集合,热身轮里的非 hit 状态会被完全忽略);③ 零重试(此前重试
+    机制会把"这一轮撞到真实传输层故障"洗成"整轮正常完成",gate 对此视而不见
+    ——现在任何一轮需要 >1 次 attempt 都直接判 FAIL,并在报告里点名是哪几轮)。"""
     effective = [s for s in samples if s["round"] >= discard_rounds]
     cold = [s for s in samples if s["cold_first_seen"]]
     warm_effective = [s for s in effective if not s["cold_first_seen"]]
@@ -158,7 +161,10 @@ def _build_report(samples: list[dict], round_retries: list[dict], *, discard_rou
     p99 = nearest_rank_percentile(effective_ms, 99)
 
     cold_ms = [s["ms"] for s in cold]
-    non_hit_statuses = [s["status"] for s in effective if s["status"] != "hit"]
+    # P1i:非 hit 状态检查覆盖**全部**样本(含热身轮),不再局限于 effective 集合
+    # ——热身轮只对 p95 计时门槛不计分,不代表它对"库存拓扑该始终命中"这条
+    # 断言免检。
+    non_hit_statuses = [s["status"] for s in samples if s["status"] != "hit"]
 
     retried_rounds = [r for r in round_retries if r["attempts"] > 1]
     total_retries = sum(r["attempts"] - 1 for r in round_retries)
@@ -196,7 +202,7 @@ def _build_report(samples: list[dict], round_retries: list[dict], *, discard_rou
             "note": "effective 集合里排除掉 cold_first_seen 后的子集——正常情况下应与 "
                      "effective_warm_path 几乎相同(discard_rounds>=1 时首见样本已被丢弃)。",
         },
-        "non_hit_statuses_in_effective": non_hit_statuses,
+        "non_hit_statuses": non_hit_statuses,
         "total_retries": total_retries,
         "retried_rounds": retried_rounds,
     }
@@ -257,10 +263,10 @@ def main(argv: list[str] | None = None) -> int:
     passed = report.get("gate", {}).get("passed", False)
     if not passed:
         print(f"BENCH GATE FAILED: {report.get('gate')}", file=sys.stderr)
-        if report.get("non_hit_statuses_in_effective"):
+        if report.get("non_hit_statuses"):
             print(
-                f"  non-hit statuses in effective samples: "
-                f"{report['non_hit_statuses_in_effective']}",
+                f"  non-hit statuses (any round, incl. discarded warmup): "
+                f"{report['non_hit_statuses']}",
                 file=sys.stderr,
             )
         if report.get("retried_rounds"):
