@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +35,21 @@ from everos_eval import probe_passage
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 
+# M3.1:sha 必须是 64 位小写十六进制(sha256 hexdigest 的形状),否则一律拒绝
+# ——不允许把 `sha` 拼进 `blobs_dir / sha` 之前先做这道格式校验,traversal-shaped
+# 输入(`"../../x"`、`"/etc/hostname"` 等)必须在**触碰文件系统之前**被拒。
+_SHA_RE = re.compile(r"[0-9a-f]{64}")
+
 
 class BlobCorruption(Exception):
-    """磁盘上的 blob 内容与其文件名(声称的 sha256)不一致——篡改或损坏。"""
+    """磁盘上的 blob 内容与其文件名(声称的 sha256)不一致——篡改或损坏。
+
+    `get()`/`exists()` 对非法 sha 格式(长度不对/含路径分隔符/大写等)也复用
+    这个异常类——traversal-shaped 输入本质上就是"文件名与内容寻址约定不符"
+    的一种,判给同一异常比新开一个更细的异常类更省心,调用方(scorer 等)本来
+    就已经把这个异常当"这份内容不可信"处理。`exists()` 与 `get()` 采用相同的
+    fail-closed 语义(拒绝而非返回 False),避免两个方法对同一类非法输入给出
+    不一致的信号。"""
 
 
 def canonical_bytes(obj: dict | str) -> bytes:
@@ -49,6 +62,18 @@ def canonical_bytes(obj: dict | str) -> bytes:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _assert_valid_sha(sha: str) -> None:
+    """M3.1:`get()`/`exists()` 的公共入口校验——`sha` 必须精确匹配
+    `[0-9a-f]{64}`,不符一律 `BlobCorruption`,**在拼接路径/触碰文件系统之前**
+    就拒绝。这是 traversal-oracle 防线:没有这道校验,`"../../x"`/绝对路径
+    这类输入会被 `Path.__truediv__` 原样拼接后拿去 `read_bytes()`/`exists()`,
+    虽然当前调用方(scorer 等)只会传入自己 `put()` 算出的合法 sha、这条路径
+    理论上不可达,但便宜的输入校验不该省——错误的调用方或未来的新调用方都
+    不该有机会把非法字符串当 sha 传进来。"""
+    if not _SHA_RE.fullmatch(sha):
+        raise BlobCorruption(f"非法 sha 格式(应为 64 位小写十六进制): {sha!r}")
 
 
 class BlobStore:
@@ -102,6 +127,7 @@ class BlobStore:
         return sha
 
     def get(self, sha: str) -> str:
+        _assert_valid_sha(sha)
         target = self.blobs_dir / sha
         data = target.read_bytes()
         actual_sha = sha256_hex(data)
@@ -112,6 +138,7 @@ class BlobStore:
         return data.decode("utf-8")
 
     def exists(self, sha: str) -> bool:
+        _assert_valid_sha(sha)
         return (self.blobs_dir / sha).exists()
 
 

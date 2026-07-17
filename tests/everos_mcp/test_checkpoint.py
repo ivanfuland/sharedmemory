@@ -11,11 +11,14 @@
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -313,3 +316,84 @@ def test_cli_review_rejects_invalid_decision(tmp_path):
         timeout=30,
     )
     assert result.returncode != 0
+
+
+# ======================================================================
+# 跨进程锁:meta.lock flock(final-review 修复项,extends M5.x)
+#
+# 真正的双进程竞态难在单测里稳定复现;这里用"两个各自独立实例化的
+# Checkpoint、跑在两条线程里"作为最小可行证据——`Checkpoint` 本身没有任何
+# 进程内锁(server.py 的 `_CHECKPOINT_LOCK` 是调用方自己加的,不在本类里),
+# 所以哪怕是同进程的两个线程并发调用同一 root 上的两个独立 Checkpoint 实例,
+# 命中的竞态窗口与两个真实进程完全一致——串行化完全来自本模块新增的
+# `root/meta.lock` flock,不是靠 GIL 或任何 Python 级别的锁蒙混过关。
+# ======================================================================
+
+def test_meta_lock_serializes_concurrent_state_and_record_review_across_instances(tmp_path):
+    """两个独立 `Checkpoint` 实例(模拟 server 进程 vs CLI 进程)并发触发
+    `state()` 的首次 due_since 持久化与 `record_review()` 的追加——若读-改-写
+    没有互斥,先读到的一方会用自己内存里的旧 meta 覆盖掉另一方已经落盘的字段
+    (丢更新)。用 `_atomic_write_json` 打个可控延迟撑大竞态窗口,断言两次写
+    的结果最终都完整可见(不管谁先拿到锁)。"""
+    root = tmp_path / "root"
+    seed = checkpoint.Checkpoint(root)
+    seed.init_or_load(ledger_has_rows=False, now=_T0)
+
+    due_ts = _T0 + 30 * _DAY
+    barrier = threading.Barrier(2)
+    orig_atomic_write = checkpoint._atomic_write_json
+
+    def _slow_atomic_write(path, obj):
+        # 在真正落盘前人为撑开一个窗口,放大"两边都基于旧快照改"的竞态概率
+        time.sleep(0.05)
+        orig_atomic_write(path, obj)
+
+    def _state_worker():
+        cp = checkpoint.Checkpoint(root)  # 独立实例,模拟另一个进程
+        barrier.wait()
+        cp.state(real_query_count=0, now=due_ts)
+
+    def _review_worker():
+        cp = checkpoint.Checkpoint(root)  # 独立实例,模拟 CLI 进程
+        barrier.wait()
+        cp.record_review(decision="continue", by="race-probe", note="并发探针", now=due_ts)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(checkpoint, "_atomic_write_json", _slow_atomic_write)
+        t1 = threading.Thread(target=_state_worker)
+        t2 = threading.Thread(target=_review_worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+
+    on_disk = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    # 不管谁先拿到 flock,两次写入都必须完整体现——没有一方的更新被另一方
+    # 基于旧快照的写覆盖掉。
+    assert on_disk["due_since"] == due_ts
+    assert len(on_disk["reviews"]) == 1
+    assert on_disk["reviews"][0]["by"] == "race-probe"
+
+
+def test_meta_lock_file_permission_0600(tmp_path):
+    cp = checkpoint.Checkpoint(tmp_path / "root")
+    cp.init_or_load(ledger_has_rows=False, now=_T0)
+    mode = stat.S_IMODE(cp.lock_path.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_meta_lock_released_after_each_operation(tmp_path):
+    """每次操作后锁必须释放——用一个独立 fd 以非阻塞 flock 去抢同一把锁,
+    只要不抛异常就证明上一次操作没有把锁遗留在持有状态。"""
+    cp = checkpoint.Checkpoint(tmp_path / "root")
+    cp.init_or_load(ledger_has_rows=False, now=_T0)
+    cp.state(real_query_count=0, now=_T0 + 1)
+    cp.record_review(decision="continue", by="ivan", note="x", now=_T0 + 2)
+
+    probe_fd = os.open(cp.lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 拿不到就会抛 OSError
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(probe_fd)

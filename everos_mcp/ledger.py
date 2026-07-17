@@ -685,6 +685,9 @@ class Ledger:
         # 新开一个空的当前段——新段文件创建后同样父目录 fsync(spec 两处都锁死)。
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, _FILE_MODE)
         os.close(fd)
+        os.chmod(path, _FILE_MODE)  # umask 可能已冲掉 os.open 的 mode,显式再钉一次(M4.2:
+        # 与 blobstore.put / checkpoint 的写协议同一纪律,防病态 umask 下自我
+        # DoS——_verify_permissions 后续重启会校验这份权限,不符直接拒启)
         _fsync_dir(path.parent)
 
     def _verify_permissions(self) -> None:

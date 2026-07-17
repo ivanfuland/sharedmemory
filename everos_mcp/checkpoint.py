@@ -34,10 +34,21 @@ server 一律对外返回 error `review_overdue`(gating 本身是 Task 8 的活,
   calibrate|stop> --by <who> --note <text>` —— overdue 恢复的生产操作
   路径。root 经 `everos_mcp.config.load().ledger_dir` 取得,不直读
   env(config.py 铁律:SHADOW_*/EVEROS_* 只能在 config.py 里读)。
+- 跨进程锁(final-review 修复项,extends M5.x):server.py 用进程内
+  `threading.Lock`(`_CHECKPOINT_LOCK`)串行化同进程内对 `state()` 的并发
+  调用,但 CLI `review` 子命令跑在**独立进程**,不共享那把锁——首次到点的
+  `due_since` 落盘(在 `state()` 内)可能与 `record_review()` 的追加写竞态
+  (两者都是读-改-rename 同一份 `meta.json`)。本模块用 `root/meta.lock` 上的
+  `fcntl.flock`(阻塞式 `LOCK_EX`,不设超时——单次读-改-写是毫秒级操作)包住
+  三处读-改-写:`init_or_load()` 的首次原子创建、`state()` 的 due_since 首次
+  持久化、`record_review()` 的追加。server 与 CLI 都走这三个方法,一份 flock
+  helper 天然覆盖两侧,不需要分别在两处调用方实现。
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -93,6 +104,26 @@ class Checkpoint:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.root / "meta.json"
+        self.lock_path = self.root / "meta.lock"
+
+    # ------------------------------------------------------------
+    @contextlib.contextmanager
+    def _locked(self):
+        """跨进程互斥:`root/meta.lock` 上的阻塞式 `flock(LOCK_EX)`,包住一次
+        完整的"读 meta -> 决定 -> 写 meta"。文件不存在则以 0600 新建;
+        `os.chmod` 显式再钉一次(umask 可能冲掉 `os.open` 的 mode,与
+        blobstore/ledger 的写协议同一纪律)。退出时无论是否异常都
+        `LOCK_UN` + 关闭 fd——不留跨调用持有的锁。"""
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, _FILE_MODE)
+        try:
+            os.chmod(self.lock_path, _FILE_MODE)
+            fcntl.flock(fd, fcntl.LOCK_EX)  # 阻塞式,不设超时——单次操作是毫秒级
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     # ------------------------------------------------------------
     def _try_load(self) -> dict | None:
@@ -130,33 +161,35 @@ class Checkpoint:
         """无 meta 且无账行 -> 原子创建;有账行但 meta 缺失/损坏/launched_ts
         晚于最早账行 ts -> `CheckpointCorrupt`。`earliest_ledger_ts` 只在
         `ledger_has_rows=True` 时才有意义,由调用方(持有 Ledger 实例)算好
-        传入——本模块不读账本文件。"""
+        传入——本模块不读账本文件。整个读-改-写在 `root/meta.lock` flock 下
+        进行,与 CLI 进程的 `record_review()` 互斥(见类文档跨进程锁段)。"""
         now = time.time() if now is None else now
-        meta = self._try_load()
+        with self._locked():
+            meta = self._try_load()
 
-        if meta is None:
+            if meta is None:
+                if ledger_has_rows:
+                    raise CheckpointCorrupt(
+                        f"{self.meta_path} 缺失,但账本已有行——fail-closed 拒启"
+                        "(疑似 meta 被误删/换了新实例目录)"
+                    )
+                meta = {"launched_ts": now, "due_since": None, "reviews": []}
+                _atomic_write_json(self.meta_path, meta)
+                return meta
+
             if ledger_has_rows:
-                raise CheckpointCorrupt(
-                    f"{self.meta_path} 缺失,但账本已有行——fail-closed 拒启"
-                    "(疑似 meta 被误删/换了新实例目录)"
-                )
-            meta = {"launched_ts": now, "due_since": None, "reviews": []}
-            _atomic_write_json(self.meta_path, meta)
+                if earliest_ledger_ts is None:
+                    raise ValueError(
+                        "init_or_load: ledger_has_rows=True 时必须提供 earliest_ledger_ts"
+                        "(否则回拨校验会被静默跳过)"
+                    )
+                if meta["launched_ts"] > earliest_ledger_ts:
+                    raise CheckpointCorrupt(
+                        f"{self.meta_path} 的 launched_ts={meta['launched_ts']!r} 晚于"
+                        f"最早账行 ts={earliest_ledger_ts!r}——疑似时钟回拨或 meta 被"
+                        "替换,fail-closed 拒启"
+                    )
             return meta
-
-        if ledger_has_rows:
-            if earliest_ledger_ts is None:
-                raise ValueError(
-                    "init_or_load: ledger_has_rows=True 时必须提供 earliest_ledger_ts"
-                    "(否则回拨校验会被静默跳过)"
-                )
-            if meta["launched_ts"] > earliest_ledger_ts:
-                raise CheckpointCorrupt(
-                    f"{self.meta_path} 的 launched_ts={meta['launched_ts']!r} 晚于"
-                    f"最早账行 ts={earliest_ledger_ts!r}——疑似时钟回拨或 meta 被"
-                    "替换,fail-closed 拒启"
-                )
-        return meta
 
     # ------------------------------------------------------------
     def state(self, real_query_count: int, now: float | None = None) -> str:
@@ -169,46 +202,53 @@ class Checkpoint:
         到点那一刻(把 due_since 从 None 变成一个具体时间戳)。已经持久化的
         due_since 不因为某次调用传入的 `real_query_count` 更低(计数上报非
         单调、重启抖动等)就被无视——不然就是一次静默的"already-due 又被原谅"
-        ,违反 fail-closed 的合规控制意图。"""
+        ,违反 fail-closed 的合规控制意图。首次到点的 due_since 持久化在
+        `root/meta.lock` flock 下进行,与 CLI 进程的 `record_review()` 互斥
+        (见类文档跨进程锁段)——两者都是同一份 meta.json 的读-改-写。"""
         now = time.time() if now is None else now
-        meta = self._require_loaded()
+        with self._locked():
+            meta = self._require_loaded()
 
-        due_since = meta.get("due_since")
-        if due_since is None:
-            launched_ts = meta["launched_ts"]
-            is_due = (now - launched_ts >= DUE_SECONDS) or (real_query_count >= DUE_QUERY_COUNT)
-            if not is_due:
+            due_since = meta.get("due_since")
+            if due_since is None:
+                launched_ts = meta["launched_ts"]
+                is_due = (now - launched_ts >= DUE_SECONDS) or (real_query_count >= DUE_QUERY_COUNT)
+                if not is_due:
+                    return "ok"
+                due_since = now
+                meta["due_since"] = due_since
+                _atomic_write_json(self.meta_path, meta)
+
+            reviews = meta.get("reviews", [])
+            reviewed_after_due = any(
+                isinstance(r.get("ts"), (int, float)) and r["ts"] >= due_since for r in reviews
+            )
+            if reviewed_after_due:
                 return "ok"
-            due_since = now
-            meta["due_since"] = due_since
-            _atomic_write_json(self.meta_path, meta)
 
-        reviews = meta.get("reviews", [])
-        reviewed_after_due = any(
-            isinstance(r.get("ts"), (int, float)) and r["ts"] >= due_since for r in reviews
-        )
-        if reviewed_after_due:
-            return "ok"
-
-        if now - due_since >= OVERDUE_GRACE_SECONDS:
-            return "overdue"
-        return "due"
+            if now - due_since >= OVERDUE_GRACE_SECONDS:
+                return "overdue"
+            return "due"
 
     # ------------------------------------------------------------
     def record_review(self, decision: str, by: str, note: str, now: float | None = None) -> dict:
         """追加一条复审记录,原子写回整份 meta。`decision` 必须是
-        continue/calibrate/stop 之一——不接受任意字符串滑进账本。"""
+        continue/calibrate/stop 之一——不接受任意字符串滑进账本。读-改-写在
+        `root/meta.lock` flock 下进行——这是 CLI `review` 子命令(独立进程)
+        与 server 进程内 `state()` 首次到点持久化互斥的关键一环(见类文档跨
+        进程锁段)。"""
         if decision not in VALID_DECISIONS:
             raise ValueError(
                 f"record_review: decision 必须是 {VALID_DECISIONS} 之一,实际 {decision!r}"
             )
         now = time.time() if now is None else now
-        meta = self._require_loaded()
+        with self._locked():
+            meta = self._require_loaded()
 
-        entry = {"ts": now, "decision": decision, "by": by, "note": note}
-        meta.setdefault("reviews", []).append(entry)
-        _atomic_write_json(self.meta_path, meta)
-        return meta
+            entry = {"ts": now, "decision": decision, "by": by, "note": note}
+            meta.setdefault("reviews", []).append(entry)
+            _atomic_write_json(self.meta_path, meta)
+            return meta
 
 
 # ======================================================================

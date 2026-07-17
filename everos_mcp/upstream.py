@@ -76,7 +76,7 @@ def search(cfg: Config, query: str) -> dict:
     try:
         return http.post_json(url, payload, timeout=10)
     except HTTPError as e:
-        body = e.read()[:_HTTP_ERROR_BODY_CAP]
+        body = e.read(_HTTP_ERROR_BODY_CAP)
         raise UpstreamHTTPError(f"EverOS search HTTP {e.code}: {body!r}") from e
     except http.BadJson as e:
         raise UpstreamBadResponse(f"EverOS search 响应解析失败: {e}") from e

@@ -104,6 +104,31 @@ def test_target_exists_but_content_differs_raises_on_put(tmp_path):
         store.put("real content")  # 同样内容,算出同一个 sha,读回校验发现对不上
 
 
+@pytest.mark.parametrize("bad_sha", ["../../x", "/etc/hostname", "zz", "", "A" * 64, "0" * 63])
+def test_get_rejects_malformed_or_traversal_shaped_sha(tmp_path, bad_sha):
+    """M3.1:`get()` 必须在拼路径/碰文件系统之前拒绝任何不是 64 位小写十六进制
+    的输入——traversal-shaped(`../../x`/绝对路径)、长度不对、大写字母都算。"""
+    store = blobstore.BlobStore(tmp_path / "ledger")
+    with pytest.raises(blobstore.BlobCorruption):
+        store.get(bad_sha)
+
+
+@pytest.mark.parametrize("bad_sha", ["../../x", "/etc/hostname", "zz"])
+def test_exists_rejects_malformed_or_traversal_shaped_sha_without_touching_fs(tmp_path, bad_sha):
+    """`exists()` 与 `get()` 同一 fail-closed 语义(拒绝而非静默返回 False)。"""
+    store = blobstore.BlobStore(tmp_path / "ledger")
+    with pytest.raises(blobstore.BlobCorruption):
+        store.exists(bad_sha)
+
+
+def test_get_and_exists_accept_well_formed_sha_unchanged(tmp_path):
+    """回归防护:合法 sha(自己 put() 算出的那种)不受新增校验影响。"""
+    store = blobstore.BlobStore(tmp_path / "ledger")
+    sha = store.put("normal content")
+    assert store.exists(sha) is True
+    assert store.get(sha) == "normal content"
+
+
 def test_stray_tmp_files_harmless(tmp_path):
     store = blobstore.BlobStore(tmp_path / "ledger")
     blobs_dir = tmp_path / "ledger" / "blobs"

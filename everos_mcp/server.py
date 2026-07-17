@@ -14,7 +14,9 @@
      进函数体,不落任何账)。
   ③ checkpoint overdue 短路,在 upstream 调用之前(gated stage,
      error_code=review_overdue,query 已 strip 记入)。
-  ④ upstream.search + normalize_candidates,按失败矩阵映射 error_code/retryable。
+  ④ upstream.search + normalize_candidates,按失败矩阵映射 error_code/retryable
+     (含 `http.RedirectRefused` → everos_bad_response/不可重试——spec §8-1:
+     重定向按上游故障处理,final-review fix wave 前曾误落 internal,已改判)。
   ⑤ 空结果 → abstain_empty;否则 `probe_metrics.compute_returned`
      (allowed=`lambda x: True`,shadow 期零过滤)取 limit。
   ⑥ 每候选 build_snapshots → blobstore.put ×2 → accepted 行 submit(deadline
@@ -80,6 +82,7 @@ from everos_mcp.blobstore import BlobCorruption, BlobStore, build_snapshots
 from everos_mcp.checkpoint import Checkpoint
 from everos_mcp.config import Config
 from everos_mcp.contract import ContractError
+from everos_mcp.http import RedirectRefused
 from everos_mcp.ledger import (
     Ledger,
     LedgerTimeout,
@@ -93,7 +96,7 @@ from everos_mcp.ledger import (
     read_abort_rids,
     response_aborted_row,
 )
-from everos_mcp.materialize import fold, healthy, score_eligible
+from everos_mcp.materialize import _ORPHAN_AGE_SECONDS, fold, healthy, score_eligible
 from everos_mcp.scorer import ScoreWorker, collect_config_fp
 
 _LOG = logging.getLogger("everos_mcp.server")
@@ -203,6 +206,11 @@ def _apply_mcp_handle_message_patch() -> None:
     _mcp_lowlevel_server.Server._handle_message = _patched_handle_message
 
 
+# M9.3:本调用在模块 import 时执行,直接改写 mcp SDK 的进程全局 `Server` 类
+# ——生产是专属 systemd 进程,该类在进程内只有一份,改全局即改本进程唯一
+# 实例,是有意为之(见上方长注释)。这个 monkeypatch 因此也会"泄漏"进任何
+# `import everos_mcp.server` 的进程,包括 pytest——这是 import-time 全局补丁
+# 的固有代价,不是缺陷,不需要额外隔离/清理。
 _apply_mcp_handle_message_patch()
 
 
@@ -231,7 +239,8 @@ _SEARCH_TOOL_DESC = (
 _STARTUP_PROBE_QUERY = "everos-mcp-startup-self-check-probe-query"  # 固定合成 query,非真实用户输入
 
 _WATCHDOG_PERIOD_SECONDS = 60.0
-_ORPHAN_AGE_SECONDS = 24 * 3600  # 与 materialize.py 同口径(独立常量,避免依赖其私有名)
+# M8.3:orphan age 阈值直接引用 materialize 的单一常量(见上方 import),不再
+# 在本模块维护第二份字面量——避免两处独立数值将来悄悄漂移。
 _DISK_USAGE_ALERT_BYTES = 5 * 1024 * 1024 * 1024
 
 
@@ -759,6 +768,14 @@ def _handle_search(state: AppState, task_in: Any, limit_in: Any) -> dict:
         return _finish_upstream_fail(
             state, rid, clean_task, "everos_bad_response", False, _pre_commit_ms(),
             "EverOS 响应不合法，本次检索未返回结果。",
+        )
+    except RedirectRefused:
+        # M9.1/final-review:重定向属于上游异常行为(spec §8-1),不是本进程的
+        # 未预期内部错误——与 UpstreamBadResponse 同码 everos_bad_response、
+        # 不可重试(第二个请求本就永不发出,opener 层已经拒绝跟随)。
+        return _finish_upstream_fail(
+            state, rid, clean_task, "everos_bad_response", False, _pre_commit_ms(),
+            "EverOS 返回重定向响应，视为异常上游行为，本次检索未返回结果。",
         )
     except upstream.UpstreamHTTPError as e:
         status_code = getattr(e.__cause__, "code", None)

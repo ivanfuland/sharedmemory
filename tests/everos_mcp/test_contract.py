@@ -7,7 +7,7 @@ def test_linebreak_checked_before_strip():
         contract.validate_task("fix inngest retry\n")
     assert e.value.code == "task_has_linebreak"
 
-@pytest.mark.parametrize("ch", ["\r", "\v", "\f", "\x1c", "\x1d", "\x1e", " ", " ", "\x85"])
+@pytest.mark.parametrize("ch", ["\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\u2028", "\u2029", "\x85"])
 def test_all_splitlines_boundaries_rejected(ch):
     with pytest.raises(contract.ContractError):
         contract.validate_task(f"a{ch}b")

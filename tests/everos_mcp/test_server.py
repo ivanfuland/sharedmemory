@@ -192,9 +192,10 @@ def fake_docker(monkeypatch):
 class _EverosState:
     def __init__(self):
         self.requests: list[dict] = []
-        self.mode = "normal"  # normal | http_error | bad_json
+        self.mode = "normal"  # normal | http_error | bad_json | redirect
         self.http_status = 500
         self.envelope = None  # 非 None 时覆盖默认空信封
+        self.redirect_target = "http://127.0.0.1:1/dest"  # 从不会被真的请求到
 
     def record(self, payload):
         self.requests.append(payload)
@@ -230,6 +231,13 @@ class _EverosHandler(http_server_mod.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if state.mode == "redirect":
+            self.send_response(302)
+            self.send_header("Location", state.redirect_target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
 
         envelope = state.envelope
@@ -683,6 +691,24 @@ def test_upstream_nan_native_score_maps_to_bad_response(
     result = server_mod.everos_search("查任务", 5)
     assert result["status"] == "error"
     assert result["meta"]["error_code"] == "everos_bad_response"
+
+
+def test_upstream_redirect_maps_to_bad_response_not_internal(
+    tmp_path, monkeypatch, fresh_server, infinity_stub, fake_docker, everos_stub,
+):
+    """final-review M9.1:EverOS 返回 30x 重定向必须落 everos_bad_response(spec
+    §8-1:按上游故障处理),不能落在外层 broad except 的 internal 分支——回归
+    此前 `http.RedirectRefused` 未被显式捕获、悄悄滑进 internal 的偏差。"""
+    everos_stub.state.mode = "redirect"
+    env, _ = _build_env(tmp_path, everos_stub.base_url, infinity_stub.base_url)
+    _apply_env(monkeypatch, env)
+    server_mod = fresh_server["reload"]()
+    server_mod.bootstrap(skip_probe=True, start_watchdog=False)
+
+    result = server_mod.everos_search("查任务", 5)
+    assert result["status"] == "error"
+    assert result["meta"]["error_code"] == "everos_bad_response"
+    assert result["meta"]["retryable"] is False
 
 
 def test_upstream_non_json_response_maps_to_bad_response_separately_from_internal(
