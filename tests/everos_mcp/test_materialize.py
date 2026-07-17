@@ -229,25 +229,66 @@ def test_healthy_false_per_card_value_string():
     assert materialize.healthy(row, accepted) is False
 
 
-def test_healthy_true_for_deeply_nested_finite_numerics():
-    """分数值形状不必是扁平 float 或一层 {"cos":..,"ce":..}——只要递归展开
-    后全是 finite 数值叶子,嵌套多深都算健康(_collect_numeric_leaves 对
-    Task 7 尚未落地的真实形状保持中立)。"""
+def test_healthy_true_for_nested_finite_numerics_under_cos_and_ce():
+    """card 值必须直接含 "cos"/"ce" 两个键(P1a),但这两个键各自的值仍可以是
+    嵌套结构——只要递归展开后全是 finite 数值叶子(_collect_numeric_leaves
+    对 cos/ce 各自的内部形状保持中立,不要求裸 float)。"""
     accepted = _hit_accepted("r1")
     per_card = {
-        materialize._card_key(c): {"scores": {"cos": [0.8], "ce": [0.7, 0.6]}}
+        materialize._card_key(c): {"cos": [0.8], "ce": [0.7, 0.6]}
         for c in accepted["candidates"]
     }
     row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
     assert materialize.healthy(row, accepted) is True
 
 
-def test_healthy_false_nan_at_depth():
+def test_healthy_false_nan_at_depth_inside_ce():
     accepted = _hit_accepted("r1")
     per_card = {
-        materialize._card_key(c): {"scores": {"cos": [0.8], "ce": [math.nan]}}
+        materialize._card_key(c): {"cos": [0.8], "ce": [math.nan]}
         for c in accepted["candidates"]
     }
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+# ---- P1a:card 值必须直接含 "cos" AND "ce" 两个键,不是"任意一个数值叶子" ----
+
+def test_healthy_false_cos_only_missing_ce():
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = {"cos": 0.8}  # 只有 cos,缺 ce
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+def test_healthy_false_arbitrary_key_not_cos_or_ce():
+    """`{"foo": 1}` 曾经因为"至少一个数值叶子"这条旧规则被判健康——旧规则
+    只要求"存在任意数值叶子",不管键名是不是 cos/ce。P1a 收紧为必须直接是
+    cos 和 ce 两个键。"""
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = {"foo": 1}
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is False
+
+
+def test_healthy_true_cos_and_ce_both_finite():
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = {"cos": 0.42, "ce": 0.13}
+    row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
+    assert materialize.healthy(row, accepted) is True
+
+
+def test_healthy_false_ce_nan():
+    accepted = _hit_accepted("r1")
+    per_card = _per_card(accepted["candidates"])
+    key = materialize._card_key(accepted["candidates"][0])
+    per_card[key] = {"cos": 0.8, "ce": math.nan}
     row = _scored("r1", "realtime", "ok", accepted, 0, per_card=per_card)
     assert materialize.healthy(row, accepted) is False
 
@@ -487,6 +528,40 @@ def test_materialize_dod_counter_example_2_late_abort_not_in_h(tmp_path):
     assert stats.total_real == 30
     assert stats.H == 29
     assert stats.error_rate == pytest.approx(1 / 30)
+
+
+def test_materialize_dod_fails_with_one_orphan_even_if_other_gates_pass(tmp_path):
+    """P1b:dod_pass 必须并入 orphan 门(orphan_count==0)——此前该谓词漏了这
+    一项,其余四门(样本量/error_rate/在线健康率/最终闭合率)即使全过,只要
+    存在一条 >24h 未终态的 score_eligible 查询,dod_pass 也必须是 False。
+
+    构造:99 条健康 hit(H 分母的绝大多数)+ 1 条 accepted.ts 在 25 小时前、
+    从未落 scored 行的 hit 查询——online_health_rate=99/100=0.99>=0.90、
+    final_closure_rate=99/100=0.99>=ceil(0.99*100)/100(边界恰好达标)、
+    error_rate=0、样本量/streak 都不是瓶颈,唯独 orphan_count=1。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    for i in range(99):
+        _full_query(root, f"hit-{i}")
+
+    rid = "orphan-old"
+    old_ts = time.time() - 25 * 3600  # 超过 24h orphan 门槛
+    _write_stream(root, "ops", [
+        ledger.ops_started(rid, "real"),
+        ledger.ops_terminal(rid, "hit"),
+    ])
+    accepted = _hit_accepted(rid, ts=old_ts)
+    _write_stream(root, "accepted", [accepted])
+    # 故意不写任何 scored 行——这是待补打的孤儿。
+
+    out = root / "view.jsonl"
+    stats = materialize.materialize(root, out)
+    assert stats.H == 100
+    assert stats.orphan_count == 1
+    assert stats.online_health_rate >= 0.90
+    assert stats.final_closure_count >= 99  # 其余四门(样本/error_rate/在线/闭合)全过
+    assert stats.error_rate == 0.0
+    assert stats.dod_pass is False
 
 
 def test_materialize_synthetic_bench_rows_excluded(tmp_path):

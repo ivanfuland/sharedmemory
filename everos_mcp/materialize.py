@@ -142,15 +142,30 @@ def _collect_numeric_leaves(value) -> list | None:
     return None
 
 
+_REQUIRED_SCORE_KEYS = ("cos", "ce")
+
+
 def _card_score_valid(value) -> bool:
-    """单张卡的 per_card 值是否合法:递归展开后必须**至少含一个数值叶子**
-    (空 dict `{}`/空 list `[]`/`None`/字符串都不能冒充"这张卡有分数"——
-    值缺失不能靠"没有不合规的数字"这种真空状态蒙混过关健康谓词),且全部
-    数值叶子都 `math.isfinite`。"""
-    leaves = _collect_numeric_leaves(value)
-    if not leaves:  # None(遇到杂质叶子)或 []([]/{} 递归下来零个数值叶子)
+    """单张卡的 per_card 值是否合法(P1a 收紧,原规则"任意数值叶子存在即可"
+    会放行 `{"foo": 1}` 或只有 cos 缺 ce 的畸形行,不是真的"这张卡三信号都
+    打完了"):
+
+    - `value` 必须是 dict,且**直接包含 "cos" 和 "ce" 两个键**(两者都要有,
+      不接受任意其他键名冒充,也不接受只有其中一个);
+    - `cos`/`ce` 各自的值可以是裸数值,也可以是嵌套结构(list/dict)——递归
+      展开后必须**至少含一个数值叶子**,且全部数值叶子都 `math.isfinite`。
+    """
+    if not isinstance(value, dict):
         return False
-    return all(math.isfinite(x) for x in leaves)
+    if not all(key in value for key in _REQUIRED_SCORE_KEYS):
+        return False
+    for key in _REQUIRED_SCORE_KEYS:
+        leaves = _collect_numeric_leaves(value[key])
+        if not leaves:  # None(遇到杂质叶子)或 []([]/{} 递归下来零个数值叶子)
+            return False
+        if not all(math.isfinite(x) for x in leaves):
+            return False
+    return True
 
 
 # ======================================================================
@@ -416,6 +431,7 @@ def materialize(root: Path, out) -> Stats:
         and online_health_count >= math.ceil(_ONLINE_HEALTH_GATE * H)
         and final_closure_count >= math.ceil(_FINAL_CLOSURE_GATE * H)
         and max_streak < _ERROR_STREAK_INCIDENT
+        and orphan_count == 0  # P1b:DoD 文本"无 age>24h 非终态 score_eligible accepted 行"
     )
 
     stats = Stats(
