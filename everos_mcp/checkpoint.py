@@ -149,7 +149,13 @@ class Checkpoint:
         检查(`isinstance(..., float)`)对 NaN 也返回 True,必须显式
         `math.isfinite` 校验,否则这类值会静默污染 due/overdue 时间算术
         (`now - NaN` 恒为 NaN,比较运算恒为 False,状态机悄悄卡死而不报错)。
-        """
+
+        P2(R4 阻断项 #5):`obj.get("reviews") or []` 对"falsy 但非列表"的值
+        (`{}`/`""`/`0`/`False`)会静默当成"没有复审记录"处理——`or []` 这个
+        写法只在乎真假值,不在乎类型,`reviews` 字段本该是列表却被塞了这类
+        杂质时,循环体压根不会跑,篡改/损坏被悄悄放行而不是 fail-closed。
+        修法:显式区分"键缺失"(视为空列表,与 `setdefault` 行为一致)与
+        "键存在但值非列表"(不论真假值,一律 `CheckpointCorrupt`)。"""
         if not self.meta_path.exists():
             return None
         try:
@@ -165,7 +171,14 @@ class Checkpoint:
         if due_since is not None:
             _require_finite_ts(due_since, field="due_since")
 
-        reviews = obj.get("reviews") or []
+        if "reviews" in obj:
+            reviews = obj["reviews"]
+            if not isinstance(reviews, list):
+                raise CheckpointCorrupt(
+                    f"{self.meta_path} 字段 reviews 非列表(实际 {type(reviews).__name__}): {reviews!r}"
+                )
+        else:
+            reviews = []
         for i, review in enumerate(reviews):
             if not isinstance(review, dict):
                 raise CheckpointCorrupt(f"{self.meta_path} reviews[{i}] 非对象: {review!r}")
@@ -173,7 +186,7 @@ class Checkpoint:
                 _require_finite_ts(review["ts"], field=f"reviews[{i}].ts")
 
         obj.setdefault("due_since", None)
-        obj.setdefault("reviews", [])
+        obj["reviews"] = reviews
         return obj
 
     def _require_loaded(self) -> dict:

@@ -131,6 +131,36 @@ def test_state_refuses_on_due_since_nan(tmp_path):
         cp.state(real_query_count=0, now=_T0 + 10)
 
 
+@pytest.mark.parametrize("bad_reviews", [{}, "", 0, False])
+def test_init_or_load_refuses_on_reviews_falsy_non_list(tmp_path, bad_reviews):
+    """R4 阻断项 #5:`obj.get("reviews") or []` 对 falsy 但非列表的值
+    (`{}`/`""`/`0`/`False`)会被静默当成"没有复审记录",篡改/损坏因此被悄悄
+    放行而不是 fail-closed。`reviews` 键存在但不是列表 -> 必须
+    `CheckpointCorrupt`,不论这个值真假。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({"launched_ts": _T0, "due_since": None, "reviews": bad_reviews}),
+        encoding="utf-8",
+    )
+    cp = checkpoint.Checkpoint(root)
+    with pytest.raises(checkpoint.CheckpointCorrupt):
+        cp.init_or_load(ledger_has_rows=False, now=_T0)
+
+
+def test_init_or_load_refuses_on_reviews_truthy_non_list(tmp_path):
+    """真值但非列表(如非空字符串)同样必须 fail-closed——不是只挡 falsy 值。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({"launched_ts": _T0, "due_since": None, "reviews": "not-a-list"}),
+        encoding="utf-8",
+    )
+    cp = checkpoint.Checkpoint(root)
+    with pytest.raises(checkpoint.CheckpointCorrupt):
+        cp.init_or_load(ledger_has_rows=False, now=_T0)
+
+
 def test_state_refuses_on_review_ts_nan(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
