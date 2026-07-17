@@ -439,8 +439,68 @@ def test_score_eligible_false_for_none_accepted():
 
 
 # ======================================================================
-# materialize(): join + DoD 指标
+# P2(R4 #2):物化行必须是"一查询一行的标定输入",不能只有 status/health/
+# fold 元数据——hit 行须携带全部标定字段,早期 error 行(contract_reject)按
+# 判别联合语义省去 candidates 相关字段。
 # ======================================================================
+
+def test_materialize_hit_row_carries_full_calibration_input(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    accepted = _full_query(root, "hit-1")
+    out = root / "view.jsonl"
+    materialize.materialize(root, out)
+    with open(out, encoding="utf-8") as f:
+        row = json.loads(f.readline())
+
+    assert row["rid"] == "hit-1"
+    assert row["effective_status"] == "hit"
+    assert row["query"] == accepted["query"]
+    assert row["q_len"] == accepted["q_len"]
+    assert row["ts"] == pytest.approx(accepted["ts"])
+    assert row["search_ms"] == accepted["search_ms"]
+    assert row["config_fp"] == accepted["config_fp"]
+    assert row["candidates"] == accepted["candidates"]
+    assert row["returned_ids"] == accepted["returned_ids"]
+    assert "error_code" not in row  # hit 行本就没有 error_code
+
+    # 折叠选中的 scored attempt 标定字段(_full_query 默认写一条健康 realtime 行)
+    assert set(row["per_card"].keys()) == {materialize._card_key(c) for c in accepted["candidates"]}
+    assert row["pins"] == _full_pins()
+    assert row["producer"] == "realtime"
+    assert row["attempt_no"] == 0
+    assert "score_error_code" not in row  # 健康行没有 score_error_code
+
+
+def test_materialize_contract_reject_row_omits_candidate_fields(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    rid = "reject-1"
+    _write_stream(root, "ops", [
+        ledger.ops_started(rid, "real"),
+        ledger.ops_terminal(rid, "error", error_code="task_empty"),
+    ])
+    accepted = ledger.accepted_row(
+        "contract_reject", rid, time.time(), "real",
+        error_code="task_empty", pre_commit_ms=1.0, config_fp={"v": 1},
+    )
+    _write_stream(root, "accepted", [accepted])
+
+    out = root / "view.jsonl"
+    materialize.materialize(root, out)
+    with open(out, encoding="utf-8") as f:
+        row = json.loads(f.readline())
+
+    assert row["effective_status"] == "error"
+    assert row["error_code"] == "task_empty"
+    assert row["config_fp"] == {"v": 1}
+    assert row["query"] is None  # contract_reject 的 query 是固定字段 None(存在但值为 None)
+    # 判别联合语义:contract_reject 的 accepted 行里这些字段本就缺席,物化行
+    # 也必须缺席,不能用 None/[] 占位假装"有这个字段"。
+    for key in ("q_len", "search_ms", "candidates", "returned_ids",
+                "per_card", "pins", "producer", "attempt_no", "score_error_code"):
+        assert key not in row
+
 
 def test_materialize_basic_hit_counts_into_h_and_closure(tmp_path):
     root = tmp_path / "root"

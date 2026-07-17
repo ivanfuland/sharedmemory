@@ -225,6 +225,48 @@ def fold(scored_rows: list[dict], accepted_row: dict) -> dict | None:
 # score_eligible()
 # ======================================================================
 
+# ======================================================================
+# 一查询一行的标定输入字段(P2/R4 阻断项 #2)——materialize() 输出行必须是
+# "一查询一行的标定输入",不能只有 status/health/fold 元数据。
+# ======================================================================
+
+# 从 accepted 行原样搬进物化行的字段——刻意不含 everos_rid(任务简报未列入
+# 这份清单,判别联合语义决定了它是否存在,但物化行不主动暴露)。判别联合
+# 语义原样保留:某字段在该 stage 的 accepted 行里本就缺席(如 contract_reject
+# 没有 candidates/search_ms),物化行也缺席,不用 None 占位假装"有这个字段"
+# ——与 `ledger.accepted_row` 的判别联合纪律(禁止伪值糊账)一致。
+_ACCEPTED_CALIBRATION_FIELDS = (
+    "query", "q_len", "error_code", "search_ms", "config_fp",
+    "candidates", "returned_ids",
+)
+
+
+def _enrich_from_accepted(row_out: dict, accepted_row: dict | None) -> None:
+    """把 accepted 行里的标定字段原样搬进物化行。`accepted_row` 为 None
+    (accepted 落账彻底失败,只有 ops started+terminal)时无字段可搬,物化行
+    只保留 rid/traffic_class/effective_status 这些基础信封字段。"""
+    if accepted_row is None:
+        return
+    for key in _ACCEPTED_CALIBRATION_FIELDS:
+        if key in accepted_row:
+            row_out[key] = accepted_row[key]
+
+
+def _enrich_from_folded_scored(row_out: dict, folded: dict | None) -> None:
+    """把折叠选中的 scored 行(健康优先,退化到 permanent_failure/
+    retryable_error)的标定字段原样搬进物化行——`per_card`/`pins`/`producer`/
+    `attempt_no`/`score_error_code`。`folded is None`(从未打过分,如新鲜孤儿)
+    时整组字段缺席,不糊空字典/占位值。"""
+    if folded is None:
+        return
+    row_out["per_card"] = folded.get("per_card")
+    row_out["pins"] = folded.get("pins")
+    row_out["producer"] = folded.get("producer")
+    row_out["attempt_no"] = folded.get("attempt_no")
+    if folded.get("score_error_code") is not None:
+        row_out["score_error_code"] = folded["score_error_code"]
+
+
 def score_eligible(effective: str, accepted_row: dict | None) -> bool:
     """`effective=="hit"` 且候选非空。`accepted_row` 缺失(数据损坏/未落账)
     视为不可打分,不 raise——物化是离线只读分析层,不应该因为一行数据形状
@@ -343,8 +385,14 @@ def materialize(root: Path, out) -> Stats:
         row_out = {
             "rid": rid,
             "traffic_class": "real",
+            "ts": started_by_rid[rid].get("ts"),
             "effective_status": effective,
         }
+        # P2(R4 #2):物化视图必须是"一查询一行的标定输入",不能只有
+        # status/health/fold 元数据——把 accepted 行原样携带的标定字段搬进来。
+        # 判别联合语义原样保留:accepted 为 None,或某字段在该 stage 本就
+        # 缺席时,物化行也缺席对应键(见 `_enrich_from_accepted`)。
+        _enrich_from_accepted(row_out, accepted)
 
         if effective == "error":
             error_count += 1
@@ -397,6 +445,11 @@ def materialize(root: Path, out) -> Stats:
                     "folded_attempt_no": folded.get("attempt_no") if folded else None,
                     "folded_score_error_code": folded.get("score_error_code") if folded else None,
                 })
+                # 折叠选中的 scored attempt(健康优先,退化到 permanent_failure/
+                # retryable_error)的完整标定字段——per_card/pins/producer/
+                # attempt_no/score_error_code,folded is None(从未打过分)时
+                # 整组缺席。
+                _enrich_from_folded_scored(row_out, folded)
             else:
                 row_out.update({
                     "healthy_final": False,
