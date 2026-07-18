@@ -293,6 +293,178 @@ def test_run_once_demotes_to_failed_when_accept_never_succeeds(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# max-attempts dead-lettering (T8 review follow-up, Option A)
+# ---------------------------------------------------------------------------
+
+
+def test_permanently_failing_row_dead_letters_after_max_attempts(tmp_path):
+    """T8 follow-up (Option A): a row whose accept() never succeeds must not
+    retry forever. After MAX_GENERATION_ATTEMPTS (3) failed attempts in the
+    same generation, run_once() dead-letters it (failed -> dead) instead of
+    retrying a 4th time.
+
+    Before this fix, a permanently-failing row could starve an unrelated
+    healthy pending row indefinitely: _claim_next() always prioritizes
+    indexing rows over pending/failed rows, and a.md kept re-entering
+    indexing on every retry -- so b.md (pending) never got a turn while
+    a.md was alive in the pending/failed/indexing rotation. This test
+    proves both halves of the fix: (1) the bad row terminalizes at exactly
+    3 attempts and is never reclaimed afterward, and (2) once it does, the
+    previously-starved healthy row makes it all the way to `synced`, and
+    the probe eventually reaches a genuine no-op turn (run_once() -> None)
+    instead of looping forever."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    (vault / "a.md").write_text("always fails")
+    (vault / "b.md").write_text("healthy")
+
+    d = Driver(":memory:", _RelDirFakeRemote(), str(vault), memory_root=str(store))
+    d.scan_result(mk_scan(["a.md", "b.md"], vault))
+    assert d.row("a.md")["status"] == "pending"
+    assert d.row("b.md")["status"] == "pending"
+
+    # a.md never gets a store fixture written, so accept() can never verify
+    # it -- every attempt ends in indexing -> failed. Drive exactly 3 fail
+    # cycles (post -> accept-fails -> failed), 2 run_once() calls each.
+    for attempt in range(1, 4):
+        r1 = d.run_once()  # a.md: (failed->)pending -> in_flight -> indexing
+        assert r1["path"] == "a.md" and r1["status"] == "indexing"
+        r2 = d.run_once()  # a.md: indexing -> accept-fails -> failed
+        assert r2["path"] == "a.md" and r2["status"] == "failed"
+        assert d.row("a.md")["generation_attempts"] == attempt
+        # b.md is a healthy pending row sitting right next to a.md the
+        # whole time -- it does not get a turn while a.md is still alive
+        # (indexing outranks pending in _claim_next()), which is exactly
+        # the starvation this dead-letter fix resolves once a.md dies.
+        assert d.row("b.md")["status"] == "pending"
+
+    # 4th reclaim of a.md: MAX_GENERATION_ATTEMPTS (3) already reached ->
+    # dead-lettered instead of retried a 4th time.
+    last_error_before_dead = d.row("a.md")["last_error"]
+    r3 = d.run_once()
+    assert r3["path"] == "a.md" and r3["status"] == "dead"
+    assert r3["reason"] == last_error_before_dead
+    row_a = d.row("a.md")
+    assert row_a["status"] == "dead"
+    assert row_a["dead_reason"] == last_error_before_dead
+    assert row_a["generation_attempts"] == 3  # not bumped again on dead-letter
+
+    # a.md is TERMINAL: with it excluded from _claim_next(), the
+    # previously-starved b.md finally gets its turn -- proving the
+    # dead-letter is what unblocks it, not luck.
+    r4 = d.run_once()  # b.md: pending -> in_flight -> indexing
+    assert r4["path"] == "b.md" and r4["status"] == "indexing"
+    assert d.row("a.md")["status"] == "dead"  # untouched, never reclaimed
+
+    row_b = d.row("b.md")
+    token = identity.source_token("b.md", row_b["generation"])
+    doc_id = row_b["staging_doc_id"]
+    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "healthy")
+    r5 = d.run_once()  # b.md: indexing -> accept -> synced
+    assert r5["path"] == "b.md" and r5["status"] == "synced"
+
+    # Nothing left to do: a.md is dead (excluded forever), b.md is synced
+    # (also excluded from claiming). The probe genuinely terminates instead
+    # of looping on the dead row.
+    assert d.run_once() is None
+    assert d.row("a.md")["status"] == "dead"  # still never reclaimed
+
+
+def test_dead_row_revives_on_new_generation(tmp_path):
+    """T8 follow-up: a dead-lettered row is not gone forever. If the file it
+    tracks genuinely changes (an edit, not a ghost retry), the next
+    whitelist scan revives dead -> pending at a new generation with
+    generation_attempts reset to 0, so it gets a fresh
+    MAX_GENERATION_ATTEMPTS budget. Mirrors the existing synced -> pending
+    "new generation picked up by a scan" path, but starting from the
+    terminal `dead` status instead of `synced`."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    (vault / "a.md").write_text("always fails v1")
+
+    d = Driver(":memory:", _RelDirFakeRemote(), str(vault), memory_root=str(store))
+    d.scan_result(mk_scan(["a.md"], vault))
+    for _ in range(3):
+        d.run_once()  # -> indexing
+        d.run_once()  # -> accept-fails -> failed
+    assert d.row("a.md")["generation_attempts"] == 3
+    d.run_once()  # 4th reclaim: dead-letters
+    row = d.row("a.md")
+    assert row["status"] == "dead"
+    assert row["dead_reason"]
+    old_generation = row["generation"]
+
+    # Edit the file -- the next whitelist scan must revive it.
+    (vault / "a.md").write_text("edited content, deserves a fresh attempt budget")
+    diff = d.scan_result(mk_scan(["a.md"], vault))
+    assert "a.md" in diff["updated"]
+    row2 = d.row("a.md")
+    assert row2["status"] == "pending"
+    assert row2["generation"] == old_generation + 1
+    assert row2["generation_attempts"] == 0
+    assert row2["dead_reason"] is None
+    assert row2["operation"] == "create"  # this path never had an active_doc_id
+
+    # And it can retry cleanly: write the store fixture this time and let
+    # it succeed on the very first attempt of the new generation.
+    d.run_once()  # pending -> in_flight -> indexing
+    row3 = d.row("a.md")
+    token = identity.source_token("a.md", row3["generation"])
+    doc_id = row3["staging_doc_id"]
+    _write_three_store_fixture(
+        store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1,
+        "edited content, deserves a fresh attempt budget",
+    )
+    d.run_once()  # indexing -> accept -> synced
+    row4 = d.row("a.md")
+    assert row4["status"] == "synced"
+    assert row4["generation_attempts"] == 0  # never had to fail this generation
+
+
+def test_failed_row_recovers_within_max_attempts_still_reaches_synced(tmp_path):
+    """T8 follow-up regression guard: dead-lettering must only kick in once
+    MAX_GENERATION_ATTEMPTS is truly exhausted. A row that fails twice
+    (generation_attempts stays below 3) and then succeeds on the third try
+    must still reach `synced` via the pre-existing failed -> pending retry
+    path (spec'd by test_failed_row_retries_without_blocking_unrelated_
+    pending_row), not get dead-lettered early."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    (vault / "a.md").write_text("eventually ok")
+
+    d = Driver(":memory:", _RelDirFakeRemote(), str(vault), memory_root=str(store))
+    d.scan_result(mk_scan(["a.md"], vault))
+
+    # Two genuine failures (no store fixture written yet) -- must retry via
+    # failed -> pending, not dead-letter (2 < MAX_GENERATION_ATTEMPTS=3).
+    for _ in range(2):
+        d.run_once()  # -> indexing
+        d.run_once()  # -> accept-fails -> failed
+    row = d.row("a.md")
+    assert row["status"] == "failed"
+    assert row["generation_attempts"] == 2
+
+    # Third attempt: write the store fixture before accept() runs, so this
+    # retry actually succeeds.
+    d.run_once()  # failed -> pending -> in_flight -> indexing
+    row = d.row("a.md")
+    assert row["status"] == "indexing"
+    token = identity.source_token("a.md", row["generation"])
+    doc_id = row["staging_doc_id"]
+    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "eventually ok")
+    d.run_once()  # indexing -> accept -> synced
+    row = d.row("a.md")
+    assert row["status"] == "synced"
+    assert row["generation_attempts"] == 2  # unchanged by a successful accept
+
+
+# ---------------------------------------------------------------------------
 # demote_for_coverage()
 # ---------------------------------------------------------------------------
 

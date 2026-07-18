@@ -200,11 +200,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS cleanup_pending_doc
 # fencing — see module docstring). Anything not listed here is illegal,
 # including e.g. synced -> indexing directly (must go through
 # synced -> pending -> in_flight -> indexing to pick up a new generation).
+#
+# T8 review follow-up (Option A, decided by Ivan): a permanently-failing row
+# used to be retried forever via failed -> pending -> in_flight -> ... ,
+# which — because _claim_next() prioritizes indexing/pending/failed rows
+# every turn — could starve unrelated healthy rows and kept the probe from
+# ever terminating. failed -> dead is the escape hatch once
+# generation_attempts reaches MAX_GENERATION_ATTEMPTS for this generation;
+# `dead` is TERMINAL (deliberately has no outgoing edge except the revival
+# below) and is never returned by `_claim_next()`, so a dead row can never
+# be reclaimed. dead -> pending is new-generation revival only (the file
+# changed under a dead row -- fresh content deserves a fresh attempt
+# budget; see scan_result()'s dead-row branch, which also resets
+# generation_attempts to 0).
 _ALLOWED_TRANSITIONS = {
     ("pending", "in_flight"),
     ("in_flight", "indexing"),
     ("in_flight", "failed"),
     ("failed", "pending"),
+    ("failed", "dead"),  # max-attempts dead-letter (T8 follow-up)
+    ("dead", "pending"),  # new-generation revival (T8 follow-up)
     ("indexing", "synced"),
     ("indexing", "failed"),
     ("synced", "pending"),  # new generation (update) picked up by a scan
@@ -212,6 +227,11 @@ _ALLOWED_TRANSITIONS = {
     ("retiring", "deleted"),
     ("retiring", "failed"),  # demote_for_coverage: reason=coverage
 }
+
+# T8 follow-up (Option A): per-generation retry budget. A row that fails
+# accept/post this many times in the same generation is dead-lettered
+# instead of retried again — see Driver._dead_letter().
+MAX_GENERATION_ATTEMPTS = 3
 
 
 class Ledger:
@@ -235,6 +255,20 @@ class Ledger:
     def all_rows(self) -> dict[str, sqlite3.Row]:
         cur = self._conn.execute("SELECT * FROM notes_ledger")
         return {r["path"]: r for r in cur.fetchall()}
+
+    def dead_rows(self) -> list[sqlite3.Row]:
+        """门4 accounting hook (Task 11 wires the reporting): rows that hit
+        MAX_GENERATION_ATTEMPTS and were dead-lettered — permanent
+        rejections, distinct from transient `failed` rows a retry could
+        still recover."""
+        cur = self._conn.execute("SELECT * FROM notes_ledger WHERE status='dead'")
+        return cur.fetchall()
+
+    def count_by_status(self, status: str) -> int:
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM notes_ledger WHERE status=?", (status,)
+        )
+        return cur.fetchone()[0]
 
     def is_cleanup_queued(self, doc_id: str) -> bool:
         cur = self._conn.execute(
@@ -309,6 +343,13 @@ class Ledger:
         if (from_status, to_status) not in _ALLOWED_TRANSITIONS:
             raise IllegalTransition(
                 f"{from_status!r} -> {to_status!r} is not an allowed M0 transition"
+            )
+        if to_status == "dead" and not fields.get("dead_reason"):
+            # Postgres spec's `dead_needs_reason` CHECK constraint, enforced
+            # in Python here (module docstring: SQL-only invariants are
+            # re-implemented in Ledger.transition() for the SQLite subset).
+            raise IllegalTransition(
+                f"{path}: transition to 'dead' requires a non-empty dead_reason"
             )
         set_cols = ["status = ?"]
         values: list = [to_status]
@@ -798,8 +839,29 @@ class Driver:
                         desired_hash=ref.vault_raw_hash,
                         desired_fingerprint="",
                         generation=row["generation"] + 1,
+                        generation_attempts=0,  # fresh generation, fresh retry budget
                         operation="update",
                         missing_streak=0,
+                    )
+                    diff["updated"].append(path)
+                elif row["status"] == "dead":
+                    # T8 follow-up: new-generation revival. A `dead` row is
+                    # terminal for its own generation, but fresh content
+                    # (the file got edited) deserves a fresh attempt budget
+                    # -- mirrors the synced->pending new-generation branch
+                    # above, plus clearing dead_reason since the row is no
+                    # longer dead.
+                    self.ledger.transition(
+                        path,
+                        "dead",
+                        "pending",
+                        desired_hash=ref.vault_raw_hash,
+                        desired_fingerprint="",
+                        generation=row["generation"] + 1,
+                        generation_attempts=0,
+                        operation="update" if row["active_doc_id"] else "create",
+                        missing_streak=0,
+                        dead_reason=None,
                     )
                     diff["updated"].append(path)
                 else:
@@ -837,11 +899,21 @@ class Driver:
         """Claim exactly one ledger row and advance it one worker turn:
         pending/failed -> POST -> indexing; indexing -> accept -> synced (or
         failed); retiring -> delete -> deleted. Returns None if there was
-        nothing to do."""
+        nothing to do.
+
+        T8 follow-up (Option A): a `failed` row that has already exhausted
+        MAX_GENERATION_ATTEMPTS for its generation is dead-lettered instead
+        of retried -- this is checked *before* delegating to
+        `_claim_and_post`, so a permanently-failing row converges to the
+        terminal `dead` status (excluded from `_claim_next()`) rather than
+        looping pending<->failed forever and starving unrelated rows.
+        """
         row = self._claim_next()
         if row is None:
             return None
         status = row["status"]
+        if status == "failed" and row["generation_attempts"] >= MAX_GENERATION_ATTEMPTS:
+            return self._dead_letter(row)
         if status in ("pending", "failed"):
             return self._claim_and_post(row)
         if status == "indexing":
@@ -849,6 +921,20 @@ class Driver:
         if status == "retiring":
             return self._complete_delete(row)
         return None
+
+    def _dead_letter(self, row):
+        """failed -> dead once generation_attempts has reached
+        MAX_GENERATION_ATTEMPTS for this generation (T8 review follow-up,
+        Option A). Terminal: `_claim_next()` never returns a dead row, so
+        this ends the retry loop for good instead of starving unrelated
+        pending/failed rows."""
+        path = row["path"]
+        reason = row["last_error"] or "max_attempts_exhausted"
+        self.ledger.transition(path, "failed", "dead", dead_reason=reason)
+        self.ledger.record_attempt(
+            path, row["operation"], row["generation"], outcome="dead-lettered"
+        )
+        return {"path": path, "status": "dead", "reason": reason}
 
     def _claim_and_post(self, row):
         path = row["path"]
@@ -862,9 +948,13 @@ class Driver:
             # the caller and starve every other row in the ledger).
             self.ledger.transition(path, "failed", "pending")
             from_status = "pending"
-        self.ledger.transition(
-            path, from_status, "in_flight", generation_attempts=row["generation_attempts"] + 1
-        )
+        # T8 follow-up: generation_attempts is now incremented on entering
+        # `failed` (see the drift-abort transition below and
+        # _accept_and_promote's accept-failed transition), not on entering
+        # in_flight -- it counts completed failed attempts, which is what
+        # run_once()'s dead-letter check compares against
+        # MAX_GENERATION_ATTEMPTS.
+        self.ledger.transition(path, from_status, "in_flight")
         ref = self._refs.get(path)
         if ref is None:
             data = safe_open.read_within(self.vault_root, path)
@@ -878,7 +968,11 @@ class Driver:
         staged_bytes = safe_open.read_within(self.vault_root, ref.staged_relpath)
         if hashlib.sha256(staged_bytes).hexdigest() != ref.staged_sha256:
             self.ledger.transition(
-                path, "in_flight", "failed", last_error="source drifted before POST"
+                path,
+                "in_flight",
+                "failed",
+                last_error="source drifted before POST",
+                generation_attempts=row["generation_attempts"] + 1,
             )
             self.ledger.record_attempt(
                 path, row["operation"], row["generation"], outcome="drift-abort"
@@ -918,6 +1012,7 @@ class Driver:
                 last_error=reason or "accept failed",
                 staging_doc_id=None,
                 staging_doc_dir=None,
+                generation_attempts=row["generation_attempts"] + 1,
             )
             self.ledger.record_attempt(
                 path, row["operation"], row["generation"], outcome="accept-failed"
