@@ -37,10 +37,21 @@ def _walk_fallback(dirfd: int, rel: str) -> int:
                 nfd = os.open(part, flags, dir_fd=fd)
             except OSError as e:
                 raise UnsafePathError(f"{rel}: {e}") from e
-            os.close(fd); fd = nfd
+            # codex hygiene finding：先把 fd 前移到新描述符,再关旧的——这样
+            # except 分支里的单次 os.close(fd) 永远只对准"当前活着"的描述符,
+            # 不会双关、也不会漏关刚 open 出来的 nfd。
+            old, fd = fd, nfd
+            try:
+                os.close(old)
+            except OSError:
+                pass    # 关闭被替换掉的目录 fd 是尽力而为；fd 已前移，无影响
         return fd
     except Exception:
-        os.close(fd); raise
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
 
 def read_within(root: str, rel: str) -> bytes:
     if "\x00" in rel:
