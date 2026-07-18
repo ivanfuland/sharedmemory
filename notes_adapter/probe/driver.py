@@ -21,9 +21,7 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -571,6 +569,17 @@ def parse_source_token(token: str):
     return m.group(1), int(m.group(2))
 
 
+def _resolve_doc_dir(root: str, doc_dir: str) -> str:
+    """Normalize a doc_dir (which may be store-root-relative like
+    'documents/<id>' or already absolute) to a single comparable absolute
+    path, so a relative vs. absolute spelling of the *same* location isn't
+    mistaken for a real divergence."""
+    if not doc_dir:
+        return ""
+    full = doc_dir if os.path.isabs(doc_dir) else os.path.join(root, doc_dir.lstrip("/"))
+    return os.path.normpath(full)
+
+
 class StoreReader:
     """Direct reader over the three on-disk EverOS stores. M0 note: unit
     tested here against small synthetic on-disk fixtures (a temp SQLite with
@@ -843,8 +852,18 @@ class Driver:
 
     def _claim_and_post(self, row):
         path = row["path"]
+        from_status = row["status"]
+        if from_status == "failed":
+            # Retry re-pickup (spec §5.4 step 8): the transition table only
+            # has failed->pending, not failed->in_flight directly. Reset the
+            # row through pending first so the single legal entry to
+            # in_flight stays pending->in_flight — a failed row must never
+            # raise IllegalTransition out of run_once() (that would crash
+            # the caller and starve every other row in the ledger).
+            self.ledger.transition(path, "failed", "pending")
+            from_status = "pending"
         self.ledger.transition(
-            path, row["status"], "in_flight", generation_attempts=row["generation_attempts"] + 1
+            path, from_status, "in_flight", generation_attempts=row["generation_attempts"] + 1
         )
         ref = self._refs.get(path)
         if ref is None:
@@ -934,11 +953,49 @@ class Driver:
                 self.remote.request_cleanup(old_doc_id)
         return {"path": path, "status": "synced"}
 
+    def _doc_gone(self, doc_id: str, doc_dir) -> bool:
+        """Confirm-before-terminal-state check (spec §5.4 step 7's "确认三
+        件套": GET absent + no residual topic rows + doc_dir gone).
+        Mirrors run_cleanup()'s still-present check, extended with the
+        store-side legs when a store_reader is configured."""
+        exists_fn = getattr(self.remote, "exists", None)
+        still_present = (
+            exists_fn(doc_id) if exists_fn else doc_id in getattr(self.remote, "docs", {})
+        )
+        if still_present:
+            return False
+        if self.store_reader is None:
+            return True
+        if self.store_reader.document_row(doc_id) is not None:
+            return False
+        if self.store_reader.sqlite_topics(doc_id):
+            return False
+        if doc_dir:
+            full = _resolve_doc_dir(self.store_reader.root, doc_dir)
+            if os.path.isdir(full):
+                return False
+        return True
+
     def _complete_delete(self, row):
         path = row["path"]
         doc_id = row["active_doc_id"]
+        doc_dir = row["active_doc_dir"]
         if doc_id:
             self.remote.delete(doc_id)
+            if not self._doc_gone(doc_id, doc_dir):
+                # Not confirmed gone yet -- do NOT mark deleted (a silently
+                # no-op'd or transiently-failed delete must not be recorded
+                # as terminal). Leave the row in retiring so a later
+                # run_once()/repair pass retries the delete.
+                self.ledger.record_attempt(
+                    path, "delete", row["generation"], outcome="delete-not-confirmed"
+                )
+                return {
+                    "path": path,
+                    "status": "retiring",
+                    "confirmed": False,
+                    "reason": "doc still present after delete",
+                }
         self.ledger.transition(
             path,
             "retiring",
@@ -979,14 +1036,39 @@ class Driver:
         doc_row = self.store_reader.document_row(doc_id)
         if doc_row is None:
             return False, "document row missing"
+
+        # R5 #P0-4: document and topic are independent cascade handlers that
+        # can diverge. A row present in knowledge_documents is not enough —
+        # it must actually be *this* attempt's document (same source_token
+        # the ledger expects for this path/generation) and its doc_dir must
+        # agree with what the ledger believes it posted to. Cross-check both
+        # before trusting anything read from doc_dir.
+        expected_token = identity.source_token(row["path"], row["generation"])
+        if doc_row["source_token"] != expected_token:
+            return False, (
+                f"source_token mismatch: doc_row={doc_row['source_token']!r} "
+                f"expected={expected_token!r}"
+            )
+
+        # staging_doc_dir is populated during accept() (status=indexing);
+        # active_doc_dir is what's populated once synced — repair()
+        # reverifies an already-synced doc, so it needs the latter.
+        believed_dir = row["staging_doc_dir"] or row["active_doc_dir"] or ""
+        authoritative_dir = doc_row["doc_dir"] or ""
+        if believed_dir and _resolve_doc_dir(
+            self.store_reader.root, authoritative_dir
+        ) != _resolve_doc_dir(self.store_reader.root, believed_dir):
+            return False, (
+                f"doc_dir mismatch: sqlite={authoritative_dir!r} ledger-believed={believed_dir!r}"
+            )
+        # SQLite's doc_dir is authoritative (not the ledger's belief) — read
+        # topic markdown from where the document row actually says it is.
+        doc_dir = authoritative_dir or believed_dir
+
         sqlite_rows = self.store_reader.sqlite_topics(doc_id)
         if not sqlite_rows:
             return False, "no topic rows"
         lance = self.store_reader.lance_digests(doc_id)
-        # staging_doc_dir is populated during accept() (status=indexing);
-        # active_doc_dir is what's populated once synced — repair()
-        # reverifies an already-synced doc, so it needs the latter.
-        doc_dir = row["staging_doc_dir"] or row["active_doc_dir"] or ""
         md = self.store_reader.topic_markdowns(doc_dir)
         bad = verify_rows(sqlite_rows, lance, md)
         if bad:

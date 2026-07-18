@@ -155,6 +155,70 @@ def test_accept_fails_when_topic_digest_drifts(tmp_path):
     assert ok is False and "verify_rows" in reason
 
 
+def test_accept_fails_when_source_token_diverges_from_ledger_expectation(tmp_path):
+    """R5 #P0-4 (Important, T8 review): a knowledge_documents row can exist
+    for `doc_id` yet not actually be *this* attempt's document -- document
+    and topic are independent cascade handlers that can diverge. A
+    source_token belonging to a different generation than the ledger's
+    current intent must fail verification, not silently pass."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    (vault / "a.md").write_text("---\ntitle: t\n---\nhello world")
+
+    d = Driver(":memory:", _RelDirFakeRemote(), str(vault), memory_root=str(store))
+    d.scan_result(mk_scan(["a.md"], vault))
+    d.run_once()
+    row = d.row("a.md")
+    doc_id = row["staging_doc_id"]
+
+    wrong_token = identity.source_token("a.md", row["generation"] + 1)
+    _write_three_store_fixture(
+        store, doc_id, wrong_token, "n1", "s", "tn", "tp", "Others", 1, "hello world"
+    )
+
+    ok, reason = d.accept("a.md", max_attempts=1)
+    assert ok is False
+    assert "source_token mismatch" in reason
+
+
+def test_accept_fails_when_doc_dir_diverges_from_ledger_expectation(tmp_path):
+    """R5 #P0-4 (Important, T8 review): SQLite's doc_dir column is the
+    authoritative location, but it must agree with what the ledger believes
+    it posted to. If they diverge, accept() must surface the divergence
+    rather than silently reading the ledger-believed (possibly wrong)
+    location."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    (vault / "a.md").write_text("---\ntitle: t\n---\nhello world")
+
+    d = Driver(":memory:", _RelDirFakeRemote(), str(vault), memory_root=str(store))
+    d.scan_result(mk_scan(["a.md"], vault))
+    d.run_once()
+    row = d.row("a.md")
+    doc_id = row["staging_doc_id"]
+    token = identity.source_token("a.md", row["generation"])
+    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "hello world")
+
+    # Corrupt the document row's doc_dir to point somewhere else than the
+    # ledger believes, while the markdown itself stays at the original
+    # location.
+    conn = sqlite3.connect(store / "system.db")
+    conn.execute(
+        "UPDATE knowledge_documents SET doc_dir=? WHERE doc_id=?",
+        ("documents/somewhere-else", doc_id),
+    )
+    conn.commit()
+    conn.close()
+
+    ok, reason = d.accept("a.md", max_attempts=1)
+    assert ok is False
+    assert "doc_dir mismatch" in reason
+
+
 def test_accept_raises_outside_indexing_status(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -163,6 +227,54 @@ def test_accept_raises_outside_indexing_status(tmp_path):
     d.scan_result(mk_scan(["a.md"], vault))  # status is 'pending', not 'indexing'
     with pytest.raises(IllegalTransition):
         d.accept("a.md")
+
+
+def test_failed_row_retries_without_blocking_unrelated_pending_row(tmp_path):
+    """Regression for the CRITICAL state-machine bug (T8 review): a `failed`
+    row used to make run_once() raise IllegalTransition uncaught, because
+    `_claim_and_post` unconditionally attempted `transition(path, "failed",
+    "in_flight", ...)` -- not in `_ALLOWED_TRANSITIONS` (only
+    ("failed","pending") is). Since `_claim_next()` claims pending and
+    failed together, a single failed row crashed run_once() even with a
+    healthy, unrelated pending row sitting right next to it -- livelocking
+    the whole ledger. Fix: retry re-picks-up via the existing
+    failed->pending edge before proceeding pending->in_flight."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    (vault / "a.md").write_text("x")
+
+    d = Driver(":memory:", _RelDirFakeRemote(), str(vault), memory_root=str(store))
+    d.scan_result(mk_scan(["a.md"], vault))
+    d.run_once()  # a.md: pending -> in_flight -> indexing
+    d.run_once()  # accept exhausts retries (no store fixture written) -> failed
+    assert d.row("a.md")["status"] == "failed"
+
+    # Second, unrelated pending row in the same ledger.
+    (vault / "b.md").write_text("y")
+    d.scan_result(mk_scan(["a.md", "b.md"], vault))
+    assert d.row("a.md")["status"] == "failed"  # untouched by the rescan
+    assert d.row("b.md")["status"] == "pending"
+
+    # This call used to raise IllegalTransition and crash -- that is exactly
+    # the bug this test guards against.
+    result = d.run_once()
+    row_a = d.row("a.md")
+    assert result is not None
+    assert row_a["status"] == "indexing"  # failed -> pending -> in_flight -> indexing, one turn
+
+    # Let the retried attempt actually succeed this time.
+    token = identity.source_token("a.md", row_a["generation"])
+    doc_id = row_a["staging_doc_id"]
+    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "x")
+    d.run_once()  # a.md: indexing -> accept -> synced
+    assert d.row("a.md")["status"] == "synced"
+
+    # The unrelated pending row must still be progressable -- proves the
+    # failed row never blocked it.
+    d.run_once()  # b.md: pending -> in_flight -> indexing
+    assert d.row("b.md")["status"] == "indexing"
 
 
 def test_run_once_demotes_to_failed_when_accept_never_succeeds(tmp_path):

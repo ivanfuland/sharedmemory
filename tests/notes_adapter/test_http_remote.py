@@ -8,7 +8,7 @@ PUBLIC repo. Live contract validation against a real instance is Task 11.
 import pytest
 
 from notes_adapter.frontmatter import PreparedDocument
-from notes_adapter.probe.driver import HttpRemote
+from notes_adapter.probe.driver import HttpRemote, _build_multipart
 
 
 def _doc():
@@ -21,6 +21,50 @@ def _doc():
         redacted_hash="redhash",
         fingerprint="fp",
     )
+
+
+# ---------------------------------------------------------------------------
+# _build_multipart() (Minor, T8 review: previously zero coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_build_multipart_encodes_title_category_id_and_filename_parts():
+    boundary = "testboundary123"
+    doc = PreparedDocument(
+        source_token="nabc12345-g0.md",
+        title="My Title",
+        category_id="Others",
+        redacted=b"---\ntitle: t\n---\nbody text",
+        raw_hash="rawhash",
+        redacted_hash="redhash",
+        fingerprint="fp",
+    )
+    body = _build_multipart(boundary, doc)
+
+    assert body.startswith(f"--{boundary}\r\n".encode("utf-8"))
+    assert body.endswith(f"--{boundary}--\r\n".encode("utf-8"))
+
+    # Split into the delimited parts, dropping the empty preamble chunk
+    # (before the first delimiter) and the "--\r\n" closing-delimiter
+    # suffix, leaving exactly the three form-data field bodies.
+    raw_parts = body.split(f"--{boundary}".encode("utf-8"))
+    parts = [p.lstrip(b"\r\n") for p in raw_parts if p not in (b"", b"--\r\n")]
+    assert len(parts) == 3  # title, category_id, file
+
+    title_part, category_part, file_part = parts
+
+    assert b'Content-Disposition: form-data; name="title"' in title_part
+    assert title_part.rstrip(b"\r\n").endswith(b"My Title")
+
+    assert b'Content-Disposition: form-data; name="category_id"' in category_part
+    assert category_part.rstrip(b"\r\n").endswith(b"Others")
+
+    assert (
+        b'Content-Disposition: form-data; name="file"; filename="nabc12345-g0.md"'
+        in file_part
+    )
+    assert b"Content-Type: text/markdown" in file_part
+    assert file_part.rstrip(b"\r\n").endswith(doc.redacted)
 
 
 def test_post_parses_envelope_and_nested_doc_fields(monkeypatch):

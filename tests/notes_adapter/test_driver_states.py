@@ -90,6 +90,42 @@ def test_delete_two_scan_confirm(tmp_path):
     assert d.row("a.md")["status"] == "deleted"
 
 
+class _NoopDeleteRemote(FakeRemote):
+    """FakeRemote whose delete() silently no-ops -- the doc stays in
+    self.docs, simulating a remote DELETE that returns success without
+    actually removing anything (or a transient non-raising failure)."""
+
+    def delete(self, doc_id: str) -> int:
+        return 0
+
+
+def test_complete_delete_does_not_mark_deleted_when_remote_delete_noops(tmp_path):
+    """Important (T8 review): unlike run_cleanup() (which checks
+    still_present before marking a cleanup job done), _complete_delete()
+    used to call remote.delete(doc_id) and unconditionally transition
+    retiring->deleted regardless of result -- violating spec §5.4 step 7
+    (confirm-before-terminal-state). A delete() that silently no-ops must
+    NOT be recorded as deleted while the doc may still be live."""
+    (tmp_path / "a.md").write_text("x")
+    d = Driver(":memory:", _NoopDeleteRemote(), str(tmp_path))
+    d.scan_result(mk_scan(["a.md"], tmp_path))
+    d.run_once()
+    d.run_once()
+    assert d.row("a.md")["status"] == "synced"
+    doc_id = d.row("a.md")["active_doc_id"]
+
+    d.scan_result(mk_scan([], tmp_path))  # miss 1 -> streak=1
+    d.scan_result(mk_scan([], tmp_path))  # miss 2 -> retiring
+    assert d.row("a.md")["status"] == "retiring"
+
+    result = d.run_once()  # attempts delete; remote no-ops -- must not reach deleted
+    assert d.row("a.md")["status"] != "deleted"
+    assert d.row("a.md")["status"] == "retiring"
+    assert result["status"] == "retiring"
+    assert result["confirmed"] is False
+    assert doc_id in d.remote.docs  # still present -- not silently dropped
+
+
 # ---------------------------------------------------------------------------
 # Step 3a: schema + transition()
 # ---------------------------------------------------------------------------
