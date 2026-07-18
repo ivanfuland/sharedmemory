@@ -45,6 +45,33 @@ def test_dotdot_rejected(tmp_path):
     with pytest.raises(UnsafePathError): read_within(str(root), "../secret.md")
 
 
+def test_embedded_nul_rejected(tmp_path):
+    # 嵌入 NUL 字节的 rel 会让 os.open()/openat2 的底层 syscall 抛
+    # ValueError("embedded null byte")，若不在 read_within 入口统一拦截，
+    # 该 ValueError 会绕过 UnsafePathError 契约直接冒泡给调用方（fallback
+    # 路径的 except OSError 接不住 ValueError）。必须在两条路径上都是
+    # UnsafePathError，不是 ValueError。
+    root = _mk(tmp_path)
+    # 上报原文里的样例路径：它同时含一个独立的 ".." 分量，会被既有的
+    # dotdot pre-check 提前拦下——这条断言本身仍然成立，但不足以单独证明
+    # NUL 拒绝逻辑生效（pre-fix 就已经是 UnsafePathError 了，见下一条）。
+    with pytest.raises(UnsafePathError):
+        read_within(str(root), "legit\x00/../secret.md")
+    # 不含任何 ".." 分量、纯粹靠嵌入 NUL 触发的路径 —— 只有 Fix 1 的显式
+    # NUL 拒绝才能拦住它；pre-fix 会从 _walk_fallback 的 os.open() 冒出
+    # 未包装的 ValueError（已用上面的裸调用实测确认：RED pre-fix）。
+    with pytest.raises(UnsafePathError):
+        read_within(str(root), "legit\x00hidden.md")
+
+
+def test_directory_as_target_rejected(tmp_path):
+    # S_ISREG 检查必须拒绝目录本身作为最终目标 —— 目录不能被当作字节读取。
+    root = _mk(tmp_path)
+    (root / "d" / "sub").mkdir()
+    with pytest.raises(UnsafePathError):
+        read_within(str(root), "d/sub")
+
+
 def test_dotdot_lookalike_component_allowed(tmp_path):
     # a..b 是合法文件名分量，不含独立的 ".." 分量 —— 不应被 dotdot 守卫误伤
     # （R7 P2-13：分量级判定，"a..b" != ".."）。
