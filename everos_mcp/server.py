@@ -123,10 +123,14 @@ _LOG = logging.getLogger("everos_mcp.server")
 # (不是资源耗尽),但新连接从某个时刻起全部排队等到超时——本仓 Task 9 用
 # session-churn 压测 + `asyncio.all_tasks()` 计数实测复现。
 #
-# 上游状态(2026-07-17 用 `gh issue/pr view` 核实,非猜测):
+# 上游状态(2026-07-17 用 `gh issue/pr view` 核实;2026-07-18 codex 复核补正):
 #   - modelcontextprotocol/python-sdk#2064(本 bug 本体)与 #1967(同一根因的
-#     另一触发路径)均已确认、均已提修复 PR(#2072 等),**但该 PR 从未合并**
-#     (`mergedAt: null`,issue 被关闭为 COMPLETED 但代码从未进 v1.x 分支)。
+#     另一触发路径)均已确认。早期修复 PR #2072("捕获发送失败"思路)**从未
+#     合并**;上游**正式修复是已合并的 PR #2257**(思路是整个移除
+#     `send_log_message` 回报),但只进了 2.x 线,v1.x 分支从未回携。
+#     本补丁沿用 #2072 思路(对 1.28.1 既有结构侵入最小),与 #2257 语义等效:
+#     两者都保证断连回报不再炸服务。cass_mcp/_mcp_sdk_patch.py 是本块的移植
+#     (AST 等价),两份同升同删。
 #   - `mcp` PyPI 最新版就是本仓当前锁定的 1.28.1(v1.x 分支已无更新);修复
 #     只存在于 v2.0.0 alpha/beta 预发布线,而 fastmcp 3.4.2 的
 #     `pyproject`/METADATA 显式要求 `mcp<2.0,>=1.24.0`——升级 mcp 到 2.x 会

@@ -1,13 +1,18 @@
 """mcp SDK 1.28.1 `Server._handle_message` 运行时补丁(python-sdk#2064)。
 
-**Canonical 源 = `everos_mcp/server.py` 的同名补丁块**(逐字核对/对抗审通过的
-原版,含完整背景长注释)。本文件是它面向 cass_mcp 的忠实拷贝——两份必须
-同升同删:上游修掉 #2064 或本仓升级 mcp 版本时,一起处理,不允许单边漂移。
+**Canonical 源 = `everos_mcp/server.py` 的同名补丁块**(对抗审通过的原版,含
+完整背景长注释)。本文件是它面向 cass_mcp 的移植:**核心函数 AST 等价/语义
+一致**(命名、docstring、日志文案按本包调整,非逐字节相同——一致性由
+tests/test_cass_mcp_sdk_patch.py 的 AST 漂移断言钉住)。两份必须同升同删:
+上游修掉 #2064 或本仓升级 mcp 版本时,一起处理,不允许单边漂移。
 
 为什么打补丁(极简版,详见 canonical 源):客户端断连瞬间,`_handle_message`
 往已关闭的写流回报错误会抛未捕获 `ClosedResourceError`,把"通知失败"级别的
-次生异常升级成服务瘫痪。上游修复(PR #2072)只存在于 mcp 2.x 预发布线,而
-fastmcp 3.4.2 钉死 `mcp<2.0`——无可用上游发行版,只能运行时最小替换。
+次生异常升级成服务瘫痪。上游正式修复是**已合并的 PR #2257**(思路是整个移除
+`send_log_message` 回报),但只进了 mcp 2.x 线;fastmcp 3.4.2 钉死 `mcp<2.0`,
+1.28.1 仍含旧代码——无可用上游发行版,只能运行时最小替换。本补丁采用的是
+早期未合并 PR #2072 的"捕获发送失败"思路(对 1.28.1 的既有结构侵入最小,与
+#2257 的移除式修复语义等效:两者都保证断连回报不再炸服务)。
 
 版本钉死断言:仅在 mcp == 补丁逐字核对过的版本时生效;版本不符 **跳过打
 补丁**(不是警告后照打)+ CRITICAL 日志,不阻断启动——版本不符 = 核对已
@@ -25,6 +30,10 @@ import mcp.server.lowlevel.server as _mcp_lowlevel_server
 _LOG = logging.getLogger("cass_mcp.mcp_sdk_patch")
 
 MCP_HANDLE_MESSAGE_PATCH_VERIFIED_VERSION = "1.28.1"
+
+# 模块加载时(任何 apply 之前)留存的上游原始实现——测试用它做"未打补丁"的
+# 可靠基线,不受"别的测试先 import 了 server 已把补丁打上"的进程内顺序污染。
+ORIGINAL_HANDLE_MESSAGE = _mcp_lowlevel_server.Server._handle_message
 
 
 async def _patched_handle_message(
