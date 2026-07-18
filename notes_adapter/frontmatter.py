@@ -20,6 +20,9 @@ from . import identity
 class DuplicateKeyError(ValueError): ...
 
 
+class MalformedFrontmatterError(ValueError): ...
+
+
 class _StrictLoader(yaml.SafeLoader): ...
 
 
@@ -107,12 +110,27 @@ def ingest_fingerprint(redacted_hash: str, cfg: dict) -> str:
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
     """Split a staged markdown file into (yaml_frontmatter_text, body).
-    No/unclosed frontmatter → ("", text) so parse_strict("") -> {}."""
+
+    No frontmatter opener → ("", text): a legitimately frontmatter-less
+    document (prepare_document then parse_strict("") -> {} -> category
+    "Others", which is correct).
+
+    Frontmatter opener present but the closing delimiter is never found →
+    raises MalformedFrontmatterError. A file that opens frontmatter but
+    never closes it is a truncation/corruption signal, not a legitimate
+    no-frontmatter file — it must fail loud, because prepare_document is
+    the sole paid ingest entry point.
+
+    Search starts at index 3 (not 4) so an empty frontmatter block
+    "---\n---\nbody\n" is detected: the closing "\n---\n" for an empty
+    block begins at index 3 (the trailing \n of the opener is shared with
+    the leading \n of the closer), which a search starting at 4 would miss.
+    """
     if not text.startswith("---\n"):
         return "", text
-    end = text.find("\n---\n", 4)
+    end = text.find("\n---\n", 3)
     if end == -1:
-        return "", text
+        raise MalformedFrontmatterError("unterminated frontmatter delimiter")
     return text[4 : end + 1], text[end + 5 :]
 
 
@@ -135,6 +153,8 @@ def prepare_document(ref, staged_bytes: bytes, generation: int, taxonomy, cfg) -
             f"staged_sha256 mismatch for {ref.canonical_path!r}: staged bytes do not match SampleRef"
         )
 
+    # Invalid UTF-8 intentionally raises UnicodeDecodeError (a ValueError
+    # subclass) — fail-loud is intended; staged files are guaranteed UTF-8 markdown.
     text = staged_bytes.decode("utf-8")
     fm_text, _body = _split_frontmatter(text)
     fm = parse_strict(fm_text)

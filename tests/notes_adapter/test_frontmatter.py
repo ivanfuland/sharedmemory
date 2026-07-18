@@ -168,3 +168,48 @@ def test_prepare_document_rejects_sha256_mismatch():
             "provider": "p", "model": "m", "params": {}, "pins": {},
             "taxonomy_hash": "t", "adapter_version": "a", "strategy_version": "s",
         })
+
+
+def test_prepare_document_no_frontmatter():
+    # No "---\n" opener at all → legitimately frontmatter-less document.
+    staged_bytes = b"# Just a heading\n\nbody text\n"
+    staged_sha256 = hashlib.sha256(staged_bytes).hexdigest()
+    ref = I.SampleRef(
+        canonical_path="misc/no-fm.md",
+        staged_relpath="staged/no-fm.md",
+        vault_raw_hash="cd" * 16,
+        staged_sha256=staged_sha256,
+    )
+    cfg = {
+        "provider": "p", "model": "m", "params": {}, "pins": {},
+        "taxonomy_hash": "t", "adapter_version": "a", "strategy_version": "s",
+    }
+    doc = F.prepare_document(ref, staged_bytes, generation=3, taxonomy=TAX, cfg=cfg)
+    assert doc.category_id == "Others"
+    assert "-g3" in doc.source_token
+
+
+def test_split_frontmatter_unterminated_raises():
+    with pytest.raises(F.MalformedFrontmatterError):
+        F._split_frontmatter("---\ntitle: a\nno closing here\n")
+
+    staged_bytes = b"---\ntitle: a\nno closing here\n"
+    staged_sha256 = hashlib.sha256(staged_bytes).hexdigest()
+    ref = I.SampleRef(
+        canonical_path="broken.md",
+        staged_relpath="staged/broken.md",
+        vault_raw_hash="ef" * 16,
+        staged_sha256=staged_sha256,
+    )
+    cfg = {
+        "provider": "p", "model": "m", "params": {}, "pins": {},
+        "taxonomy_hash": "t", "adapter_version": "a", "strategy_version": "s",
+    }
+    with pytest.raises(F.MalformedFrontmatterError):
+        F.prepare_document(ref, staged_bytes, generation=1, taxonomy=TAX, cfg=cfg)
+
+
+def test_split_frontmatter_empty_block():
+    yaml_text, body = F._split_frontmatter("---\n---\nbody\n")
+    assert yaml_text == ""
+    assert body == "body\n"
