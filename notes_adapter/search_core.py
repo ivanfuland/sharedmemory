@@ -235,9 +235,14 @@ def search(
             raise ValueError(f"search: hit missing document.doc_id: {h!r}")
         flat.append({"doc_id": doc["doc_id"], "score": h.get("score"), "document": doc})
 
-    folded, partial = fold_and_filter(flat, ledger, top_k)
+    # Fold+admitted-filter over the FULL overfetched pool (request_top_k, not
+    # the caller-facing top_k) — truncating to top_k here, before eligibility
+    # is known, would let admitted-but-ineligible docs (status=dead/retiring/
+    # pending_repair, operation=delete) occupy top_k slots and starve out
+    # eligible docs the overfetch_mult fetched precisely to avoid losing.
+    folded, _ = fold_and_filter(flat, ledger, request_top_k)
 
-    hits: list[Hit] = []
+    eligible: list[Hit] = []
     for f in folded:
         entry = ledger[f["doc_id"]]
         elig = eligibility(
@@ -258,18 +263,26 @@ def search(
         if date_range and not _frontmatter_in_date_range(synced_fm, date_range):
             continue
 
-        hits.append(
+        eligible.append(
             Hit(
                 path=f["path"],
                 doc_id=f["doc_id"],
                 best_score=f["best_score"],
                 cards=f["cards"],
                 synced_frontmatter=synced_fm,
-                partial=partial,
                 stale=elig.stale,
                 status=entry.get("status"),
                 metadata_stale=metadata_stale,
             )
         )
+
+    # Only NOW truncate to the caller-facing top_k, over the fully-eligible
+    # set — and recompute `partial` from this final list (not the pre-
+    # eligibility fold_and_filter result), so `partial` reflects whether we
+    # actually handed back top_k eligible hits.
+    hits = eligible[:top_k]
+    partial = len(hits) < top_k
+    for hit in hits:
+        hit.partial = partial
 
     return hits

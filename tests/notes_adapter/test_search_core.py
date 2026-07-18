@@ -231,3 +231,72 @@ def test_search_hit_missing_nested_document_doc_id_raises():
 
     with pytest.raises(ValueError):
         search("http://127.0.0.1:9", {}, "q", http_post=fake_post)
+
+
+def test_search_eligibility_runs_over_full_overfetch_pool_not_pretruncated_top_k():
+    """Task 10 review Fix 1 (CRITICAL): if `fold_and_filter` were truncated to
+    the caller-facing `top_k` (5) *before* eligibility is applied, the two
+    top-ranked-but-ineligible docs below (status=dead, operation=delete) would
+    occupy 2 of the 5 pre-eligibility slots and get dropped only afterward —
+    starving the result down to 3 hits even though overfetch_mult=4 fetched
+    20 candidates, plenty to backfill. The fix must fold+filter over the full
+    `request_top_k` pool, run eligibility over that, and only then truncate to
+    `top_k`.
+    """
+
+    def fake_post(base_url, path, body):
+        return _envelope(
+            [
+                # Top-ranked by the API, but both ineligible for search.
+                {"score": 0.99, "document": {"doc_id": "doc-dead"}},
+                {"score": 0.98, "document": {"doc_id": "doc-deleted"}},
+                # Eligible docs the overfetch pool has plenty of room for.
+                {"score": 0.90, "document": {"doc_id": "doc-1"}},
+                {"score": 0.80, "document": {"doc_id": "doc-2"}},
+                {"score": 0.70, "document": {"doc_id": "doc-3"}},
+                {"score": 0.60, "document": {"doc_id": "doc-4"}},
+                {"score": 0.50, "document": {"doc_id": "doc-5"}},
+            ]
+        )
+
+    def _eligible_entry(n):
+        return {
+            "path": f"{n}.md",
+            "admitted": True,
+            "active_doc_id": f"doc-{n}",
+            "operation": "none",
+            "status": "synced",
+            "synced_frontmatter": {},
+        }
+
+    ledger = {
+        "doc-dead": {
+            "path": "dead.md",
+            "admitted": True,
+            "active_doc_id": None,
+            "operation": "none",
+            "status": "dead",
+            "synced_frontmatter": {},
+        },
+        "doc-deleted": {
+            "path": "deleted.md",
+            "admitted": True,
+            "active_doc_id": "doc-deleted",  # 旧代残留但 operation=delete
+            "operation": "delete",
+            "status": "in_flight",
+            "synced_frontmatter": {},
+        },
+        "doc-1": _eligible_entry(1),
+        "doc-2": _eligible_entry(2),
+        "doc-3": _eligible_entry(3),
+        "doc-4": _eligible_entry(4),
+        "doc-5": _eligible_entry(5),
+    }
+
+    hits = search("http://127.0.0.1:9", ledger, "q", top_k=5, overfetch_mult=4, http_post=fake_post)
+
+    # The 2 ineligible docs must not starve out eligible docs the overfetch
+    # pool had room for: all 5 eligible docs come back, none of them
+    # partial (the pool had exactly enough after eligibility filtering).
+    assert [h.path for h in hits] == ["1.md", "2.md", "3.md", "4.md", "5.md"]
+    assert all(h.partial is False for h in hits)

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from cass_corpus.redact import redact_secrets
 
 from . import identity, safe_open
-from .search_core import eligibility
+from .search_core import _frontmatter_in_date_range, eligibility
 
 DEFAULT_BODY_MAX_CHARS = 4000
 
@@ -60,16 +60,6 @@ def body(vault_root: str, path: str, row: dict, *, max_chars: int = DEFAULT_BODY
         synced_hash=synced_hash,
         content_stale=content_stale,
     )
-
-
-def _frontmatter_in_date_range(fm: dict | None, date_range: tuple[str, str]) -> bool:
-    if not fm:
-        return False
-    d = fm.get("date")
-    if not d:
-        return False
-    lo, hi = date_range
-    return lo <= d <= hi
 
 
 def lookup(
