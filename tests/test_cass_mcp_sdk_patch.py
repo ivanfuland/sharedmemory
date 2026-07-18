@@ -128,6 +128,26 @@ def test_patch_ast_identical_to_canonical_everos_copy():
     assert cass == everos
 
 
+# ---------------------------------------------------------------- 生产入口钉死
+def test_production_entrypoint_runs_stateless_http(monkeypatch):
+    # codex R2 P1:测试必须执行真实的 `python -m cass_mcp.server` 入口路径,
+    # 钉住 mcp.run 收到 stateless_http=True——删掉生产参数本测试即红。
+    import runpy
+    import fastmcp
+
+    monkeypatch.setenv("CASS_MCP_BEARER", "synthetic-test-bearer")
+    captured: dict = {}
+
+    def fake_run(self, *args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(fastmcp.FastMCP, "run", fake_run)
+    runpy.run_module("cass_mcp.server", run_name="__main__")
+    assert captured.get("stateless_http") is True
+    assert captured.get("transport") == "http"
+    assert captured.get("host") == "127.0.0.1"
+
+
 # ---------------------------------------------------------------- stateless HTTP 回归
 @pytest.fixture()
 def cass_app(monkeypatch):
@@ -158,17 +178,40 @@ def test_stateless_http_bearer_and_tool_roundtrip(cass_app):
                 # 错 token → 401
                 r = await hc.post("/mcp", json={}, headers={"Authorization": "Bearer wrong"})
                 assert r.status_code == 401
-                # 对 token → 非 401(协议层进得去;MCP 握手细节由 fastmcp 客户端
-                # 测试覆盖,这里钉 stateless 模式下 StaticTokenVerifier 鉴权路径完好)
-                r = await hc.post(
-                    "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                                   "params": {"protocolVersion": "2025-03-26",
-                                              "capabilities": {},
-                                              "clientInfo": {"name": "t", "version": "0"}}},
-                    headers={"Authorization": "Bearer synthetic-test-bearer",
-                             "Accept": "application/json, text/event-stream",
-                             "Content-Type": "application/json"},
-                )
-                assert r.status_code != 401, r.text
-
     asyncio.run(run_httpx())
+
+
+def test_stateless_real_tool_roundtrip_with_audit(cass_app, monkeypatch, tmp_path):
+    # codex R2 P1 后半:正确 bearer 必须完成**成功的 MCP 初始化 + 真实工具调用**
+    # (不能只判非 401),且真实审计路径写出 token_id="hub"(get_access_token 在
+    # stateless 模式下工作)。工具语义层面 cass 二进制不在测试环境,cass_triage
+    # 返回 not_ready 结构也算完整往返——断言的是 stateless 模式下
+    # 协议握手/鉴权上下文/工具执行/审计 四层全通,不打任何桩。
+    import json as _json
+    import httpx
+    from fastmcp.client import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    audit_file = tmp_path / "audit.log"
+    monkeypatch.setenv("CASS_MCP_AUDIT", str(audit_file))
+
+    app = cass_app.mcp.http_app(stateless_http=True)
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            transport = StreamableHttpTransport(
+                "http://cass-test.internal/mcp",
+                headers={"Authorization": "Bearer synthetic-test-bearer"},
+                httpx_client_factory=lambda **kw: httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), **{k: v for k, v in kw.items() if k != "transport"}
+                ),
+            )
+            async with Client(transport) as c:      # 进得来 = initialize 成功
+                r = await c.call_tool("cass_triage", {})
+                assert r is not None                # 工具真实执行并返回
+
+    asyncio.run(run())
+    recs = [_json.loads(l) for l in audit_file.read_text().splitlines()]
+    assert recs, "工具调用未写审计"
+    assert recs[-1]["tool"] == "cass_triage"
+    assert recs[-1]["token_id"] == "hub"            # bearer→client_id 审计链在 stateless 下完好
