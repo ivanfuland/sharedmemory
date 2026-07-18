@@ -1,7 +1,20 @@
 """Identity primitives frozen by spec §5.1 — do not change without spec bump."""
 import hashlib, unicodedata
+from dataclasses import dataclass
 
 class TokenCollisionError(RuntimeError): ...
+
+
+@dataclass(frozen=True)
+class SampleRef:
+    """Frozen reference to a staged vault file, produced by the staging task
+    (Task 2's counterpart, upstream of Task 3's prepare_document). Carries the
+    identity needed to verify staging integrity and to feed the ledger's
+    desired_hash without re-deriving it from staged bytes."""
+    canonical_path: str
+    staged_relpath: str
+    vault_raw_hash: str
+    staged_sha256: str
 
 def canonical_path(p: str) -> str:
     if "\\" in p:
