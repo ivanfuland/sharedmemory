@@ -152,9 +152,10 @@ def test_production_entrypoint_runs_stateless_http(monkeypatch):
 @pytest.fixture()
 def cass_app(monkeypatch):
     monkeypatch.setenv("CASS_MCP_BEARER", "synthetic-test-bearer")
+    monkeypatch.setenv("CASS_MCP_TOKEN_ID", "hub")  # 显式钉死,防外部环境非 hub 值假红(codex R3 nit)
     import importlib
     import cass_mcp.server as srv
-    importlib.reload(srv)  # 让模块级 bearer 读到本测试的合成值
+    importlib.reload(srv)  # 让模块级 bearer/token_id 读到本测试的合成值
     return srv
 
 
