@@ -5,6 +5,13 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier   # B0 auth_ap
 from fastmcp.server.dependencies import get_access_token
 from cass_mcp import runner, contract, config                       # config import 即设语义 env 默认
 from cass_mcp.diversify import overfetch_limit, apply_search_postprocess
+from cass_mcp._mcp_sdk_patch import apply_mcp_handle_message_patch
+
+# mcp SDK #2064 运行时补丁(版本钉死,不符则跳过+CRITICAL;canonical 源在
+# everos_mcp/server.py,两份同升同删)。import 时改写进程全局 Server 类——
+# 生产是专属 systemd 进程,有意为之;会泄漏进 import 本模块的 pytest 进程,
+# 是 import-time 全局补丁的固有代价,非缺陷。
+apply_mcp_handle_message_patch()
 
 # bearer fail-fast：模块加载即强制 CASS_MCP_BEARER，缺失即 raise——覆盖 import/ASGI/main 全路径，杜绝 fail-open
 _BEARER = os.environ.get("CASS_MCP_BEARER")
@@ -186,4 +193,11 @@ def cass_timeline(since: str = "7d", until: str = "", agent: str = ""):
     return _call("cass_timeline", args)
 
 if __name__ == "__main__":        # bearer 已在模块加载强制
-    mcp.run(transport="http", host="127.0.0.1", port=config.CASS_PORT)
+    # stateless_http=True:fastmcp 3.4.2 默认有状态模式下,断开的客户端 session
+    # 永不清理(底层 StreamableHTTPSessionManager 仅在 session_idle_timeout 配置
+    # 时清理,而 fastmcp 未透传该参数)——每次客户端重连都在事件循环里攒一个
+    # 卡在 app.run() 的僵尸协程,累计后 _session_creation_lock 永久阻塞,新连接
+    # 全部超时(everos-mcp 实装期 session-churn 压测实证,2026-07-18)。本服务
+    # 全部工具都是纯 request/response 检索(同步 def,零 session 状态依赖),
+    # stateless 语义无损,且让"session 永不清理"的泄漏资源类别不存在。
+    mcp.run(transport="http", host="127.0.0.1", port=config.CASS_PORT, stateless_http=True)
