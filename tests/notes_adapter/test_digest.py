@@ -21,3 +21,23 @@ def test_verify_rows_detects_single_leg_drift(mut):
     drifted = {**base, **mut}
     bad = verify_rows([TopicRow(**drifted, content_sha256="")], {"n1": good_digest}, {"n1": md})
     assert bad, f"drift {mut} not detected"
+
+
+def test_verify_rows_all_consistent():
+    from notes_adapter.digest import TopicRow, verify_rows, canonical_digest as cd
+    base = dict(node_id="n1", summary="s", topic_name="n", topic_path="p",
+                category_id="c", depth=1, content="b")
+    good_digest = cd("s", "n", "p", "c", 1, "b")
+    md = "---\nsummary: s\ntopic_name: n\ntopic_path: p\ncategory_id: c\ndepth: 1\n---\nb"
+    bad = verify_rows([TopicRow(**base, content_sha256="")], {"n1": good_digest}, {"n1": md})
+    assert bad == []
+
+
+def test_verify_rows_node_id_mismatch():
+    from notes_adapter.digest import TopicRow, verify_rows, canonical_digest as cd
+    base = dict(node_id="n1", summary="s", topic_name="n", topic_path="p",
+                category_id="c", depth=1, content="b")
+    good_digest = cd("s", "n", "p", "c", 1, "b")
+    md = "---\nsummary: s\ntopic_name: n\ntopic_path: p\ncategory_id: c\ndepth: 1\n---\nb"
+    bad = verify_rows([TopicRow(**base, content_sha256="")], {"n2": good_digest}, {"n1": md})
+    assert bad == ["node_id sets differ"]

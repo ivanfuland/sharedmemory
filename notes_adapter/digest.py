@@ -6,8 +6,6 @@ genuinely catch single-leg drift (a mismatch confined to one of the three
 stores), not just agree when all three already match.
 """
 import hashlib
-import re
-import unicodedata
 from dataclasses import dataclass
 
 
@@ -34,10 +32,6 @@ class TopicRow:
     depth: int
     content: str
     content_sha256: str
-
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", s)).strip()
 
 
 def verify_rows(sqlite_rows, lance_digests, topic_markdowns) -> list[str]:
