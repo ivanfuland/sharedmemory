@@ -8,12 +8,18 @@ dependencies = [
     "msgpack>=1.0",          # 解 CASS canonical 的 messages.extra_bin(rmp_serde msgpack)
 ]
 
+[project.optional-dependencies]
+# notes_adapter 运行态依赖（R9 nit6）：frontmatter.py 的严格 YAML loader 需要
+# pyyaml，此前只靠 dev/probe 依赖组的传递依赖凑巧满足，干净安装会导入失败。
+# tiktoken/lancedb 等只在 probe 环境用的重依赖不进此 extra。
+notes = ["pyyaml>=6"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["distill", "cass_mcp"]
+packages = ["distill", "cass_mcp", "notes_adapter"]
 
 [dependency-groups]
 dev = [
