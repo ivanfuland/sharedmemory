@@ -1,17 +1,21 @@
-"""Step 3e: accept() (bounded poll over three stores + digest + coverage,
-first-round measure-only), demote_for_coverage(), and adopt_snapshot()'s four
-scenarios. Uses StoreReader against synthetic on-disk fixtures (constructed
-here) — never a real EverOS store (Task 11's job).
+"""Step 3e / Task 11 reconciliation: accept() (bounded poll over three
+stores + digest + coverage, first-round measure-only), demote_for_coverage(),
+and adopt_snapshot()'s four scenarios. Uses StoreReader against synthetic
+on-disk fixtures matching the REAL EverOS shapes (see
+docs/projects/notes-memory/.../task-11-report.md "Shape validation") via
+the shared `_store_fixture` helper module.
 """
 import hashlib
-import json
 import sqlite3
 
+import lancedb
+
 from notes_adapter import identity
-from notes_adapter.digest import canonical_digest
 from notes_adapter.probe.driver import Driver, FakeRemote, IllegalTransition, ScanResult
 
 import pytest
+
+from _store_fixture import write_index_only, write_three_store_fixture
 
 
 def mk_scan(paths, root):
@@ -42,55 +46,8 @@ class _RelDirFakeRemote(FakeRemote):
         return doc_id, doc_dir, 1
 
 
-def _write_three_store_fixture(
-    store_root, doc_id, source_token, node_id, summary, topic_name, topic_path, category_id, depth, content
-):
-    conn = sqlite3.connect(store_root / "system.db")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS knowledge_documents (doc_id TEXT PRIMARY KEY, source_token TEXT, doc_dir TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS knowledge_topics (node_id TEXT, doc_id TEXT, summary TEXT, "
-        "topic_name TEXT, topic_path TEXT, category_id TEXT, depth INT, content TEXT, content_sha256 TEXT)"
-    )
-    doc_dir = f"documents/{doc_id}"
-    conn.execute("INSERT OR REPLACE INTO knowledge_documents VALUES (?,?,?)", (doc_id, source_token, doc_dir))
-    conn.execute(
-        "INSERT INTO knowledge_topics VALUES (?,?,?,?,?,?,?,?,?)",
-        (node_id, doc_id, summary, topic_name, topic_path, category_id, depth, content,
-         hashlib.sha256(content.encode()).hexdigest()),
-    )
-    conn.commit()
-    conn.close()
-
-    (store_root / "lance").mkdir(exist_ok=True)
-    digest = canonical_digest(summary, topic_name, topic_path, category_id, depth, content)
-    (store_root / "lance" / f"{doc_id}.json").write_text(json.dumps({node_id: digest}))
-
-    ddir = store_root / doc_dir
-    ddir.mkdir(parents=True, exist_ok=True)
-    (ddir / "index.md").write_text(f"---\nsource_token: {source_token}\n---\n")
-    md = (
-        f"---\nsummary: {summary}\ntopic_name: {topic_name}\ntopic_path: {topic_path}\n"
-        f"category_id: {category_id}\ndepth: {depth}\n---\n{content}"
-    )
-    (ddir / f"{node_id}.md").write_text(md)
-    return doc_dir
-
-
-def _write_index_only(store_root, doc_id, source_token):
-    conn = sqlite3.connect(store_root / "system.db")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS knowledge_documents (doc_id TEXT PRIMARY KEY, source_token TEXT, doc_dir TEXT)"
-    )
-    doc_dir = f"documents/{doc_id}"
-    conn.execute("INSERT OR REPLACE INTO knowledge_documents VALUES (?,?,?)", (doc_id, source_token, doc_dir))
-    conn.commit()
-    conn.close()
-    ddir = store_root / doc_dir
-    ddir.mkdir(parents=True, exist_ok=True)
-    (ddir / "index.md").write_text(f"---\nsource_token: {source_token}\n---\n")
-    return doc_dir
+_write_three_store_fixture = write_three_store_fixture
+_write_index_only = write_index_only
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +69,7 @@ def test_accept_succeeds_with_consistent_three_stores(tmp_path):
     doc_id = row["staging_doc_id"]
     token = identity.source_token("a.md", row["generation"])
 
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "hello world")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "hello world")
 
     ok, reason = d.accept("a.md")
     assert ok is True and reason is None
@@ -146,10 +103,13 @@ def test_accept_fails_when_topic_digest_drifts(tmp_path):
     row = d.row("a.md")
     doc_id = row["staging_doc_id"]
     token = identity.source_token("a.md", row["generation"])
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "hello world")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "hello world")
 
-    # corrupt the Lance sidecar digest to simulate single-leg drift
-    (store / "lance" / f"{doc_id}.json").write_text(json.dumps({"n1": "wrong-digest"}))
+    # corrupt the real LanceDB row's digest to simulate single-leg drift
+    db = lancedb.connect(str(store / ".index" / "lancedb"))
+    db.open_table("knowledge_topic").update(
+        where=f"id = '{doc_id}_1'", values={"content_sha256": "wrong-digest"}
+    )
 
     ok, reason = d.accept("a.md", max_attempts=1)
     assert ok is False and "verify_rows" in reason
@@ -175,7 +135,7 @@ def test_accept_fails_when_source_token_diverges_from_ledger_expectation(tmp_pat
 
     wrong_token = identity.source_token("a.md", row["generation"] + 1)
     _write_three_store_fixture(
-        store, doc_id, wrong_token, "n1", "s", "tn", "tp", "Others", 1, "hello world"
+        store, doc_id, wrong_token, 1, "s", "tn", "tp", "Others", 1, "hello world"
     )
 
     ok, reason = d.accept("a.md", max_attempts=1)
@@ -201,15 +161,15 @@ def test_accept_fails_when_doc_dir_diverges_from_ledger_expectation(tmp_path):
     row = d.row("a.md")
     doc_id = row["staging_doc_id"]
     token = identity.source_token("a.md", row["generation"])
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "hello world")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "hello world")
 
-    # Corrupt the document row's doc_dir to point somewhere else than the
-    # ledger believes, while the markdown itself stays at the original
-    # location.
-    conn = sqlite3.connect(store / "system.db")
+    # Corrupt the document row's md_path (doc_dir's real source column, see
+    # StoreReader.document_row) to point somewhere else than the ledger
+    # believes, while the markdown itself stays at the original location.
+    conn = sqlite3.connect(store / ".index" / "sqlite" / "system.db")
     conn.execute(
-        "UPDATE knowledge_documents SET doc_dir=? WHERE doc_id=?",
-        ("documents/somewhere-else", doc_id),
+        "UPDATE knowledge_documents SET md_path=? WHERE doc_id=?",
+        ("documents/somewhere-else/index.md", doc_id),
     )
     conn.commit()
     conn.close()
@@ -267,7 +227,7 @@ def test_failed_row_retries_without_blocking_unrelated_pending_row(tmp_path):
     # Let the retried attempt actually succeed this time.
     token = identity.source_token("a.md", row_a["generation"])
     doc_id = row_a["staging_doc_id"]
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "x")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "x")
     d.run_once()  # a.md: indexing -> accept -> synced
     assert d.row("a.md")["status"] == "synced"
 
@@ -361,7 +321,7 @@ def test_permanently_failing_row_dead_letters_after_max_attempts(tmp_path):
     row_b = d.row("b.md")
     token = identity.source_token("b.md", row_b["generation"])
     doc_id = row_b["staging_doc_id"]
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "healthy")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "healthy")
     r5 = d.run_once()  # b.md: indexing -> accept -> synced
     assert r5["path"] == "b.md" and r5["status"] == "synced"
 
@@ -416,7 +376,7 @@ def test_dead_row_revives_on_new_generation(tmp_path):
     token = identity.source_token("a.md", row3["generation"])
     doc_id = row3["staging_doc_id"]
     _write_three_store_fixture(
-        store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1,
+        store, doc_id, token, 1, "s", "tn", "tp", "Others", 1,
         "edited content, deserves a fresh attempt budget",
     )
     d.run_once()  # indexing -> accept -> synced
@@ -457,7 +417,7 @@ def test_failed_row_recovers_within_max_attempts_still_reaches_synced(tmp_path):
     assert row["status"] == "indexing"
     token = identity.source_token("a.md", row["generation"])
     doc_id = row["staging_doc_id"]
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "eventually ok")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "eventually ok")
     d.run_once()  # indexing -> accept -> synced
     row = d.row("a.md")
     assert row["status"] == "synced"
@@ -481,7 +441,7 @@ def test_demote_for_coverage_moves_synced_to_failed_and_clears_active(tmp_path):
     row = d.row("a.md")
     doc_id = row["staging_doc_id"]
     token = identity.source_token("a.md", row["generation"])
-    _write_three_store_fixture(store, doc_id, token, "n1", "s", "tn", "tp", "Others", 1, "hello world")
+    _write_three_store_fixture(store, doc_id, token, 1, "s", "tn", "tp", "Others", 1, "hello world")
     d.run_once()  # -> synced
     assert d.row("a.md")["status"] == "synced"
 

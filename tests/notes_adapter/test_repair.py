@@ -1,17 +1,21 @@
-"""Step 3f: repair() — four mechanical preconditions (spec §5.5), the fence
-re-check, and the injectable `repair_runner` seam. The real `force_enqueue`
-subprocess + real Lance deletion under an isolated env are validated in
-Task 13's fault injection; here everything live is a stub the test controls.
+"""Step 3f / Task 11 reconciliation: repair() — four mechanical
+preconditions (spec §5.5), the fence re-check, and the injectable
+`repair_runner` seam. Uses the shared `_store_fixture` helper for the
+real-shaped on-disk fixtures (see test_store_reader.py's module docstring).
+The real `force_enqueue` subprocess + real Lance deletion under an isolated
+env are validated in Task 13's fault injection; here everything live is a
+stub the test controls.
 """
 import hashlib
-import json
 import sqlite3
 
+import lancedb
 import pytest
 
 from notes_adapter import identity
-from notes_adapter.digest import canonical_digest
 from notes_adapter.probe.driver import Driver, FakeRemote, RepairPreconditionError, ScanResult
+
+from _store_fixture import write_three_store_fixture
 
 
 def mk_scan(paths, root):
@@ -38,34 +42,14 @@ class _RelDirFakeRemote(FakeRemote):
 
 
 def _write_three_store_fixture(store_root, doc_id, source_token, node_id, content):
-    conn = sqlite3.connect(store_root / "system.db")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS knowledge_documents (doc_id TEXT PRIMARY KEY, source_token TEXT, doc_dir TEXT)"
+    """Thin wrapper over the shared helper preserving this file's original
+    call shape (node_id str "n1" -> topic_index int 1 -- the two tests below
+    that use it don't care about the specific node_id, only that repair()'s
+    node_ids list comes back non-empty and matches)."""
+    topic_index = 1
+    return write_three_store_fixture(
+        store_root, doc_id, source_token, topic_index, "s", "tn", "tp", "Others", 1, content,
     )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS knowledge_topics (node_id TEXT, doc_id TEXT, summary TEXT, "
-        "topic_name TEXT, topic_path TEXT, category_id TEXT, depth INT, content TEXT, content_sha256 TEXT)"
-    )
-    doc_dir = f"documents/{doc_id}"
-    conn.execute("INSERT OR REPLACE INTO knowledge_documents VALUES (?,?,?)", (doc_id, source_token, doc_dir))
-    conn.execute(
-        "INSERT INTO knowledge_topics VALUES (?,?,?,?,?,?,?,?,?)",
-        (node_id, doc_id, "s", "tn", "tp", "Others", 1, content, hashlib.sha256(content.encode()).hexdigest()),
-    )
-    conn.commit()
-    conn.close()
-
-    (store_root / "lance").mkdir(exist_ok=True)
-    digest = canonical_digest("s", "tn", "tp", "Others", 1, content)
-    (store_root / "lance" / f"{doc_id}.json").write_text(json.dumps({node_id: digest}))
-
-    ddir = store_root / doc_dir
-    ddir.mkdir(parents=True, exist_ok=True)
-    (ddir / "index.md").write_text(f"---\nsource_token: {source_token}\n---\n")
-    (ddir / f"{node_id}.md").write_text(
-        f"---\nsummary: s\ntopic_name: tn\ntopic_path: tp\ncategory_id: Others\ndepth: 1\n---\n{content}"
-    )
-    return doc_dir
 
 
 def _synced_driver(tmp_path, content="hello world"):
@@ -121,9 +105,11 @@ def test_repair_rejects_spacing_too_short(tmp_path):
 
 def test_repair_rejects_when_cascade_queue_not_empty(tmp_path):
     d, store = _synced_driver(tmp_path)
-    conn = sqlite3.connect(store / "md_change_state.db")
-    conn.execute("CREATE TABLE md_change_state (path TEXT, processed INT)")
-    conn.execute("INSERT INTO md_change_state VALUES ('other.md', 0)")
+    # Real cascade queue is the `md_change_state` TABLE inside the same
+    # system.db (not a separate file), with a `status` column -- the shared
+    # fixture already creates this table empty, so just insert a row.
+    conn = sqlite3.connect(store / ".index" / "sqlite" / "system.db")
+    conn.execute("INSERT INTO md_change_state VALUES ('other.md', 'pending')")
     conn.commit()
     conn.close()
     with pytest.raises(RepairPreconditionError, match="cascade queue not empty"):
@@ -187,7 +173,7 @@ def test_repair_happy_path_calls_injected_runner_and_reverifies(tmp_path):
     assert len(calls) == 1
     called_path, called_node_ids, called_root = calls[0]
     assert called_path == "a.md"
-    assert called_node_ids == ["n1"]
+    assert called_node_ids == [f"{doc_id}_1"]  # real node_id = f"{doc_id}_{topic_index}"
     assert called_root == everos_root
 
 
@@ -213,7 +199,10 @@ def test_repair_runner_failure_reports_escalate_delete_recreate(tmp_path):
 
     # break the store AFTER sync so repair's reverify fails (simulating a
     # repair that didn't converge)
-    (store / "lance" / f"{doc_id}.json").write_text(json.dumps({"n1": "wrong-digest"}))
+    db = lancedb.connect(str(store / ".index" / "lancedb"))
+    db.open_table("knowledge_topic").update(
+        where=f"id = '{doc_id}_1'", values={"content_sha256": "wrong-digest"}
+    )
 
     result = d.repair(
         "a.md",

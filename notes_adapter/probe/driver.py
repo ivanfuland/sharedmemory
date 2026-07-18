@@ -22,7 +22,7 @@ import os
 import re
 import sqlite3
 import time
-import urllib.parse
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -539,20 +539,50 @@ def _build_multipart(boundary: str, doc: PreparedDocument) -> bytes:
     return b"".join(parts)
 
 
+class HttpRemoteError(RuntimeError):
+    """Raised when a real EverOS instance returns a non-2xx response.
+    Carries status + method + path + raw body so the caller (or a human
+    reading the traceback) can diagnose without a second network call —
+    Task 11 finding: a real 503 (MultimodalNotEnabledError, see harness
+    launch_m0.sh's multimodal-client fix) previously crashed as a bare
+    uncaught `urllib.error.HTTPError` with none of this context."""
+
+    def __init__(self, status: int, method: str, path: str, body: str):
+        self.status = status
+        self.method = method
+        self.path = path
+        self.body = body
+        super().__init__(f"{method} {path} -> HTTP {status}: {body}")
+
+
 class HttpRemote:
-    """Thin HTTP client for a real EverOS instance. Contract-tested against
-    hand-written synthetic same-shape fixtures (Task 8) — never exercised
-    against a live instance in this task's test suite (that's Task 11)."""
+    """Thin HTTP client for a real EverOS instance. Reconciled against the
+    real API shapes (Task 11 live 1-note run + source read — see
+    docs/projects/notes-memory/.../task-11-report.md "Shape validation"
+    #1/#5). Unit-tested here against synthetic fixtures matching the *real*
+    envelope now, not the Task 8 design-guess shapes."""
 
     def __init__(self, base_url: str, timeout: float = 10.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def _request(self, method: str, path: str, data: bytes | None = None, headers=None) -> dict:
+    def _request(self, method: str, path: str, data: bytes | None = None, headers=None) -> dict | None:
+        """Returns the parsed JSON body, or None for a bare empty body (the
+        real DELETE route returns 204 No Content with zero bytes when
+        deleted_topics==0 — see delete() below). A non-2xx response raises
+        `HttpRemoteError` with the status + body attached rather than
+        propagating a bare `urllib.error.HTTPError` (Task 11 finding #1:
+        this is not hypothetical — a real 503 was hit live)."""
         url = f"{self.base_url}{path}"
         req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            body = resp.read()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            raise HttpRemoteError(e.code, method, path, error_body) from e
+        if not body:
+            return None
         return json.loads(body.decode("utf-8"))
 
     def post(self, doc: PreparedDocument):
@@ -563,37 +593,45 @@ class HttpRemote:
             "POST", "/api/v1/knowledge/documents", data=body, headers=headers
         )
         data = _unwrap_envelope(payload)
-        doc_id, doc_dir = data.get("doc_id"), data.get("doc_dir")
+        doc_id = data.get("doc_id")
+        # Real DocumentCreateResponse has no `doc_dir` field at all -- the
+        # absolute doc directory is returned under the confusingly-named
+        # `md_path` key (service/knowledge.py::_write_document assigns
+        # KnowledgeWriter.write()'s doc_dir return value to a variable it
+        # calls md_path). This is NOT the same value as the persisted DB
+        # row's `md_path` column (root-relative path to index.md, see
+        # StoreReader.document_row) -- same field name, two different real
+        # meanings at two different layers. Task 11 finding #1.
+        doc_dir = data.get("md_path")
         if not doc_id or not doc_dir:
-            raise ValueError(f"HttpRemote.post: response missing doc_id/doc_dir: {payload!r}")
+            raise ValueError(f"HttpRemote.post: response missing doc_id/md_path: {payload!r}")
         return doc_id, doc_dir, data.get("topic_count")
 
     def delete(self, doc_id: str) -> int:
         payload = self._request("DELETE", f"/api/v1/knowledge/documents/{doc_id}")
+        if payload is None:
+            # Real route returns bare 204 No Content (empty body) when
+            # deleted_topics==0 -- Task 11 finding #5.
+            return 0
         data = _unwrap_envelope(payload)
-        return int(data.get("deleted", 0))
+        return int(data.get("deleted_topics", 0))
 
     def list_docs(self, page: int = 1):
         payload = self._request("GET", f"/api/v1/knowledge/documents?page={page}")
         data = _unwrap_envelope(payload)
-        items = data.get("items")
-        if not isinstance(items, list):
-            raise ValueError(f"HttpRemote.list_docs: response missing items array: {payload!r}")
-        return items
+        documents = data.get("documents")
+        if not isinstance(documents, list):
+            raise ValueError(f"HttpRemote.list_docs: response missing documents array: {payload!r}")
+        return documents
 
-    def search(self, query: str, **kwargs):
-        payload = self._request(
-            "GET", f"/api/v1/knowledge/search?q={urllib.parse.quote(query)}"
-        )
-        data = _unwrap_envelope(payload)
-        hits = data.get("hits")
-        if not isinstance(hits, list):
-            raise ValueError(f"HttpRemote.search: response missing hits array: {payload!r}")
-        for h in hits:
-            doc = h.get("document") if isinstance(h, dict) else None
-            if not isinstance(doc, dict) or not doc.get("doc_id"):
-                raise ValueError(f"HttpRemote.search: hit missing document.doc_id: {h!r}")
-        return hits
+    # NOTE: no search() method here. The real retrieval path is
+    # notes_adapter.search_core.search() (POST /api/v1/knowledge/search with
+    # a JSON {query, top_k} body, top_k not limit) -- already shape-correct
+    # and independently tested. A prior HttpRemote.search() (GET .../search?q=)
+    # was wrong on both HTTP method and param encoding (Task 11 finding #5)
+    # and, per a repo-wide grep, had zero callers outside its own now-removed
+    # tests -- dead code duplicating a contract that's already implemented
+    # correctly elsewhere, so it was deleted rather than fixed in place.
 
 
 # ---------------------------------------------------------------------------
@@ -621,26 +659,43 @@ def _resolve_doc_dir(root: str, doc_dir: str) -> str:
     return os.path.normpath(full)
 
 
-class StoreReader:
-    """Direct reader over the three on-disk EverOS stores. M0 note: unit
-    tested here against small synthetic on-disk fixtures (a temp SQLite with
-    the expected columns, a temp markdown dir, a JSON sidecar standing in
-    for the real Lance table) — real-store shape validation is Task 11's
-    job against a live instance.
+_TOPIC_FILENAME_RE = re.compile(r"^(\d+)_")
 
-    Expected layout under `root`:
-      root/system.db                    - knowledge_documents, knowledge_topics
-      root/lance/<doc_id>.json          - {node_id: canonical_digest} sidecar
-      root/documents/<doc_id>/index.md  - frontmatter incl. `source_token:`
-      root/documents/<doc_id>/<node_id>.md
-      root/md_change_state.db           - cascade queue (processed flag)
+
+class StoreReader:
+    """Direct reader over the three on-disk EverOS stores. Reconciled
+    against the real shapes (Task 11 live 1-note run + source read, see
+    docs/projects/notes-memory/.../task-11-report.md "Shape validation"
+    #2/#3/#4). Unit-tested here against synthetic fixtures matching the
+    *real* schema/paths now, not the Task 8 design-guess shapes.
+
+    Real layout under `root` (`core/persistence/memory_root.py`):
+      root/.index/sqlite/system.db      - knowledge_documents, knowledge_topics,
+                                           md_change_state (cascade queue)
+      root/.index/lancedb/              - LanceDB dataset; table `knowledge_topic`
+                                           is ONE table shared across all docs
+                                           (filter by doc_id), row id `id` holds
+                                           node_id, digest is `content_sha256`
+      root/<app>/<project>/knowledge/<category>/<slug>_<doc_id>/index.md
+      root/<app>/<project>/knowledge/<category>/<slug>_<doc_id>/<topic_index>_<slug>.md
+        (real node_id = f"{doc_id}_{topic_index}", NOT derived from the
+        filename stem -- see topic_markdowns())
+
+    Fail-loud contract (controller decision, Task 11 concern #5): once
+    `_sqlite_path()` points at the *correct* location, "the db file doesn't
+    exist yet" is a legitimate transient state (async cascade hasn't landed
+    -- callers like `accept()` poll and retry) and stays a quiet empty/None
+    return. A missing TABLE or COLUMN against an *existing* db is a real bug
+    (wrong assumption, not a timing window) and must raise
+    `sqlite3.OperationalError` uncaught -- none of the methods below catch
+    or suppress that exception once the path-existence guard has passed.
     """
 
     def __init__(self, root: str):
         self.root = root
 
     def _sqlite_path(self) -> str:
-        return os.path.join(self.root, "system.db")
+        return os.path.join(self.root, ".index", "sqlite", "system.db")
 
     def sqlite_topics(self, doc_id: str) -> list[TopicRow]:
         path = self._sqlite_path()
@@ -649,12 +704,18 @@ class StoreReader:
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         try:
+            # Real knowledge_topics has no content_sha256 column -- that
+            # digest lives only on the LanceDB row (lance_digests()). It's
+            # unused by digest.verify_rows() (recomputed via
+            # canonical_digest() from the other fields), so TopicRow's
+            # dataclass field is filled with a placeholder here rather than
+            # queried.
             cur = conn.execute(
                 "SELECT node_id, summary, topic_name, topic_path, category_id, depth, "
-                "content, content_sha256 FROM knowledge_topics WHERE doc_id=?",
+                "content FROM knowledge_topics WHERE doc_id=?",
                 (doc_id,),
             )
-            return [TopicRow(**dict(r)) for r in cur.fetchall()]
+            return [TopicRow(**dict(r), content_sha256="") for r in cur.fetchall()]
         finally:
             conn.close()
 
@@ -665,8 +726,14 @@ class StoreReader:
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         try:
+            # Real knowledge_documents has no source_token/doc_dir columns.
+            # source_name is where HttpRemote.post's multipart `filename=
+            # doc.source_token` actually lands (same value, different
+            # column name); md_path is a root-relative path to index.md,
+            # not a directory -- callers must os.path.dirname() it to get
+            # the doc dir (see Driver._verify_staging).
             cur = conn.execute(
-                "SELECT doc_id, source_token, doc_dir FROM knowledge_documents WHERE doc_id=?",
+                "SELECT doc_id, source_name, md_path FROM knowledge_documents WHERE doc_id=?",
                 (doc_id,),
             )
             return cur.fetchone()
@@ -681,7 +748,7 @@ class StoreReader:
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.execute(
-                "SELECT doc_id, source_token, doc_dir FROM knowledge_documents WHERE source_token=?",
+                "SELECT doc_id, source_name, md_path FROM knowledge_documents WHERE source_name=?",
                 (source_token,),
             )
             return cur.fetchone()
@@ -689,13 +756,38 @@ class StoreReader:
             conn.close()
 
     def lance_digests(self, doc_id: str) -> dict:
-        path = os.path.join(self.root, "lance", f"{doc_id}.json")
-        if not os.path.exists(path):
+        """Real Lance storage is a genuine LanceDB dataset (not a per-doc
+        JSON sidecar) -- one shared `knowledge_topic` table across every
+        document, filtered here by doc_id. Directory absence is a
+        legitimate "cascade hasn't landed yet" state (return {}); once the
+        directory/table exist, a missing column is a real bug and is left
+        to raise naturally (fail-loud contract, class docstring)."""
+        lancedb_dir = os.path.join(self.root, ".index", "lancedb")
+        if not os.path.isdir(lancedb_dir):
             return {}
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        import lancedb
 
-    def topic_markdowns(self, doc_dir: str) -> dict:
+        db = lancedb.connect(lancedb_dir)
+        table = db.open_table("knowledge_topic")  # raises if table missing/misnamed
+        # doc_id is server-generated (d_<hex>) but escape defensively anyway
+        # -- .where() takes a raw SQL-ish filter string, no bind params.
+        safe_doc_id = doc_id.replace("'", "''")
+        rows = (
+            table.search()
+            .where(f"doc_id = '{safe_doc_id}'")
+            .select(["id", "content_sha256"])
+            .to_list()
+        )
+        return {r["id"]: r["content_sha256"] for r in rows}
+
+    def topic_markdowns(self, doc_dir: str, doc_id: str) -> dict:
+        """Real topic filenames are `{topic_index}_{slug}.md` (e.g.
+        `4_创建任务分支.md`), not `{node_id}.md` -- the real node_id
+        (`{doc_id}_{topic_index}`) is never present in the filename by
+        itself, so it must be reconstructed from doc_id + the leading
+        integer index (hence the new `doc_id` parameter). Files that don't
+        match the `<int>_` prefix convention are skipped, not crashed on
+        (e.g. a future non-topic file dropped in the same dir)."""
         full = doc_dir if os.path.isabs(doc_dir) and os.path.isdir(doc_dir) else os.path.join(
             self.root, doc_dir.lstrip("/")
         )
@@ -705,7 +797,10 @@ class StoreReader:
         for name in os.listdir(full):
             if not name.endswith(".md") or name == "index.md":
                 continue
-            node_id = name[: -len(".md")]
+            m = _TOPIC_FILENAME_RE.match(name)
+            if not m:
+                continue
+            node_id = f"{doc_id}_{int(m.group(1))}"
             with open(os.path.join(full, name), "r", encoding="utf-8") as f:
                 out[node_id] = f.read()
         return out
@@ -714,7 +809,16 @@ class StoreReader:
         """Markdown-first enumeration (R9 nit5): walk doc dirs on disk rather
         than the SQLite documents table, so a POST that landed markdown but
         crashed before the document-row commit is still discoverable —
-        covers the "document row missing, markdown present" adoption window."""
+        covers the "document row missing, markdown present" adoption window.
+
+        KNOWN GAP (not covered by Task 11's feed-only stage, so not fixed
+        here): this still assumes `root/documents/<doc_id>/index.md` and a
+        bare `source_token:` frontmatter key. The real layout is
+        `root/<app>/<project>/knowledge/<category>/<slug>_<doc_id>/index.md`
+        (see class docstring) and the real frontmatter key may differ too
+        (index.md's own frontmatter was never captured live). adopt_snapshot()
+        callers relying on this method have not been live-validated —
+        flagged for whichever task next exercises the adopt/crud phases."""
         base = os.path.join(self.root, "documents")
         if not os.path.isdir(base):
             return
@@ -733,12 +837,24 @@ class StoreReader:
             yield m.group(1), full
 
     def cascade_pending(self) -> int:
-        path = os.path.join(self.root, "md_change_state.db")
+        """Cascade queue depth. Real schema (source-verified via
+        `infra/persistence/sqlite/tables/md_change_state.py` -- not itself
+        live-run exercised by Task 11's feed-only stage, but it shares the
+        exact wrong-path/wrong-column bug class the rest of this class had,
+        so fixed alongside them): `md_change_state` is a TABLE inside the
+        same `system.db` (not a separate `md_change_state.db` file), with a
+        `status` column (`pending`/`processing`/`done`/`failed`), not a
+        `path`/`processed` pair. `pending`+`processing` both count as
+        "still queued" -- `processing` is a worker's internal in-progress
+        claim, not a terminal state."""
+        path = self._sqlite_path()
         if not os.path.exists(path):
             return 0
         conn = sqlite3.connect(path)
         try:
-            cur = conn.execute("SELECT COUNT(*) FROM md_change_state WHERE processed=0")
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM md_change_state WHERE status IN ('pending','processing')"
+            )
             return cur.fetchone()[0]
         finally:
             conn.close()
@@ -1138,18 +1254,29 @@ class Driver:
         # the ledger expects for this path/generation) and its doc_dir must
         # agree with what the ledger believes it posted to. Cross-check both
         # before trusting anything read from doc_dir.
+        #
+        # Task 11 finding: the real column is `source_name`, not
+        # `source_token` -- HttpRemote.post's multipart `filename=
+        # doc.source_token` lands there under that different column name.
+        # Error text below keeps saying "source_token" deliberately: that's
+        # the ledger/identity.py domain concept on both sides of this
+        # comparison, the DB column name is just an EverOS-internal detail.
         expected_token = identity.source_token(row["path"], row["generation"])
-        if doc_row["source_token"] != expected_token:
+        if doc_row["source_name"] != expected_token:
             return False, (
-                f"source_token mismatch: doc_row={doc_row['source_token']!r} "
+                f"source_token mismatch: doc_row={doc_row['source_name']!r} "
                 f"expected={expected_token!r}"
             )
 
         # staging_doc_dir is populated during accept() (status=indexing);
         # active_doc_dir is what's populated once synced — repair()
         # reverifies an already-synced doc, so it needs the latter.
+        #
+        # Task 11 finding: the real `md_path` column is a root-relative path
+        # to index.md, not a directory -- dirname() it to recover the doc
+        # dir (same "doc_dir" domain concept, different real column + shape).
         believed_dir = row["staging_doc_dir"] or row["active_doc_dir"] or ""
-        authoritative_dir = doc_row["doc_dir"] or ""
+        authoritative_dir = os.path.dirname(doc_row["md_path"]) if doc_row["md_path"] else ""
         if believed_dir and _resolve_doc_dir(
             self.store_reader.root, authoritative_dir
         ) != _resolve_doc_dir(self.store_reader.root, believed_dir):
@@ -1164,7 +1291,7 @@ class Driver:
         if not sqlite_rows:
             return False, "no topic rows"
         lance = self.store_reader.lance_digests(doc_id)
-        md = self.store_reader.topic_markdowns(doc_dir)
+        md = self.store_reader.topic_markdowns(doc_dir, doc_id)
         bad = verify_rows(sqlite_rows, lance, md)
         if bad:
             return False, f"verify_rows: {bad}"
