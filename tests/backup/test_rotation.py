@@ -105,11 +105,11 @@ def _write_curl_stub(stub_dir: pathlib.Path) -> None:
 
 
 def _non_today_dow() -> str:
-    """一个保证 != 今天的 `date +%u`（1-7）。用于给不测周校验的测试固定 `VERIFY_DOW`，
-    避免今天恰好命中默认 7（周日）时 step 18 周深度校验对合成夹具触发（同 `test_weekly.py`
+    """一个保证 != 今天的 `date -u +%u`（1-7）。用于给不测周校验的测试固定 `VERIFY_DOW`，
+    避免今天恰好命中默认 6（周六）时 step 18 周深度校验对合成夹具触发（同 `test_weekly.py`
     的 `int(today) % 7 + 1` 惯用法：恒为今天 +1、7→1，永不等于今天）。"""
     today = subprocess.run(
-        ["date", "+%u"], capture_output=True, text=True, timeout=5
+        ["date", "-u", "+%u"], capture_output=True, text=True, timeout=5
     ).stdout.strip()
     return str(int(today) % 7 + 1)
 
@@ -127,7 +127,7 @@ def _run(tmp_home, run_backup, synth_dd, cass_stub, dest, staging, stamp, extra_
         "CASS_BACKUP_ADOPT_SESSIONS": "1",
         "CASS_BACKUP_ADOPT_REASON": "test fixture — sessions channel not under test here",
         # 轮转测试不测周校验（step 18）；固定 VERIFY_DOW 到非今天，避免今天恰好命中
-        # 默认 7（周日）时周深度校验对合成 fake-published 夹具 FAIL、污染轮转判据
+        # 默认 6（UTC 周六）时周深度校验对合成 fake-published 夹具 FAIL、污染轮转判据
         # （合成夹具无有效周校验数据）。需要测周校验的用例在 test_weekly.py 里显式覆写。
         "CASS_BACKUP_VERIFY_DOW": _non_today_dow(),
         "PATH": f"{cass_stub}{os.pathsep}{os.environ.get('PATH', '')}",

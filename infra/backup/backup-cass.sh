@@ -30,7 +30,7 @@ LIB="$ROOT/infra/backup/cass"
 CASS_DATA_DIR="${CASS_DATA_DIR:-$HOME/.local/share/coding-agent-search}"
 DEST="${CASS_BACKUP_DEST:-$HOME/nas/openclaw/backups/cass}"
 KEEP="${CASS_BACKUP_KEEP:-7}"
-VERIFY_DOW="${CASS_BACKUP_VERIFY_DOW:-7}"
+VERIFY_DOW="${CASS_BACKUP_VERIFY_DOW:-6}"
 STAGING="${CASS_BACKUP_STAGING:-${TMPDIR:-/tmp}}"
 LOCK_WAIT="${CASS_BACKUP_LOCK_WAIT:-900}"
 DB_TIMEOUT="${CASS_BACKUP_DB_TIMEOUT:-600}"
@@ -100,7 +100,7 @@ if ! [[ "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
   echo "[backup] FATAL: CASS_BACKUP_KEEP must be a positive integer, got '$KEEP'"; exit 1
 fi
 if ! [[ "$VERIFY_DOW" =~ ^[1-7]$ ]]; then
-  echo "[backup] FATAL: CASS_BACKUP_VERIFY_DOW must be an integer 1-7 (date +%u), got '$VERIFY_DOW'"; exit 1
+  echo "[backup] FATAL: CASS_BACKUP_VERIFY_DOW must be an integer 1-7 (date -u +%u), got '$VERIFY_DOW'"; exit 1
 fi
 
 _pair_or_die() {  # $1=人读名字 $2=A 值 $3=B(reason) 值 —— 缺一即拒绝运行（fail-closed）
@@ -948,7 +948,7 @@ if [ "$ROTATE_FAIL" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# step 18 — 周深度校验（spec §6.5，Task 16）：`date +%u` 命中 `VERIFY_DOW` 才跑。
+# step 18 — 周深度校验（spec §6.5，Task 16）：`date -u +%u` 命中 `VERIFY_DOW` 才跑。
 # 备份本身已发布，周校验失败不回滚它，但必须让脚本 exit 非零（同 ROTATE_FAIL/
 # TG_ALERT 的「告警不能被主线成功吞掉」构型）。`cass_weekly.py` 内部五件事全部
 # 用 `cass_common.sha256_file(fadvise=True)`/`blake3_file(fadvise=True)` 读 NAS，
@@ -956,7 +956,7 @@ fi
 # 缓存）。
 # ---------------------------------------------------------------------------
 WEEKLY_FAIL=0
-TODAY_DOW="$(date +%u)"
+TODAY_DOW="$(date -u +%u)"
 if [ "$TODAY_DOW" = "$VERIFY_DOW" ]; then
   echo "[backup] weekly verify: running (today dow=$TODAY_DOW == VERIFY_DOW=$VERIFY_DOW)"
   "$VENV_PY" "$LIB/cass_weekly.py" --dest "$DEST" --keep "$KEEP" 8>&- || WEEKLY_FAIL=1

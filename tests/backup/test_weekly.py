@@ -28,7 +28,7 @@
     损坏 → 均 FAIL。
   - `sessions.state.tsv` 首行篡改 → FAIL（⑤）。
   - CLI 对空 DEST（无任何已发布备份）exit 1，stdout 含 `[weekly] FAIL`。
-  - bash 层（`backup-cass.sh` step 18）：`CASS_BACKUP_VERIFY_DOW=$(date +%u)`
+  - bash 层（`backup-cass.sh` step 18）：`CASS_BACKUP_VERIFY_DOW=$(date -u +%u)`
     时——① 健康态：stdout 含 weekly 标记 + exit 0；② 注入孤儿 blob 篡改（不影响
     nightly 各门，只有周校验能抓）：exit 非零 + stdout 含 `[weekly] FAIL` +
     备份本身仍已发布（`COMPLETE` 仍在）；`VERIFY_DOW` 设为明天（`dow%7+1`）→
@@ -45,6 +45,8 @@ import os
 import pathlib
 import shutil
 import subprocess
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import blake3
 import pytest
@@ -613,8 +615,25 @@ def test_cli_exit_1_on_empty_dest(tmp_path):
 
 def _today_dow() -> str:
     return subprocess.run(
-        ["date", "+%u"], capture_output=True, text=True, timeout=5
+        ["date", "-u", "+%u"], capture_output=True, text=True, timeout=5
     ).stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "instant",
+    ["2026-01-17T16:30:00Z", "2026-07-18T16:30:00Z"],
+)
+def test_weekly_gate_uses_utc_saturday_for_same_absolute_run(instant):
+    run = datetime.fromisoformat(instant.replace("Z", "+00:00"))
+    shanghai = run.astimezone(ZoneInfo("Asia/Shanghai"))
+    utc = run.astimezone(ZoneInfo("UTC"))
+
+    assert (shanghai.isoweekday(), shanghai.hour, shanghai.minute) == (7, 0, 30)
+    assert (utc.isoweekday(), utc.hour, utc.minute) == (6, 16, 30)
+
+    script = (REPO / "infra" / "backup" / "backup-cass.sh").read_text()
+    assert 'VERIFY_DOW="${CASS_BACKUP_VERIFY_DOW:-6}"' in script
+    assert 'TODAY_DOW="$(date -u +%u)"' in script
 
 
 @requires_cass
