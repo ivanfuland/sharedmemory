@@ -6,6 +6,8 @@
 # OOM-loop 规避），若词法摄入被杀于水位推进后/落库前，下轮 delta 扫描会跳过未落库文件→静默漏会话
 # （codex P0#2）。本脚本词法失败时回滚水位；SIGKILL 无解但拆分后词法极快、窗口极小。
 set -euo pipefail
+# 该逃生阀只属于下面的词法命令；拒绝继承父进程的同名值污染 semantic/backfill。
+unset CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES
 CANON="${CASS_DATA_DIR:-$HOME/.local/share/coding-agent-search}"
 URL="${CASS_INFINITY_URL:-http://127.0.0.1:7997}"
 BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
@@ -48,7 +50,8 @@ restore_wm() {
 trap restore_wm EXIT
 
 # 1) 词法 + DB 增量 index（不带 --semantic）。失败→trap 回滚水位。
-CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" index >"$RUN_LOG" 2>&1 \
+CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1 \
+  "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
 
