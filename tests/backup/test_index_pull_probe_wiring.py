@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import sqlite3
 import stat
 import subprocess
 
@@ -87,3 +88,78 @@ def test_healthy_db_passes_probe_and_rotation_is_nul_safe(tmp_path: pathlib.Path
     assert "STRUCTURE_PROBE_FAIL" not in r.stdout
     kept = sorted(log_dir.glob("run-*.log"))
     assert len(kept) == 48, f"轮转应留 48 份(47 旧+本次),实得 {len(kept)}"
+
+
+def test_preflight_bypass_is_scoped_to_lexical_index(tmp_path: pathlib.Path) -> None:
+    """即使父环境带 hostile 值，也只允许词法 index 收到 preflight bypass。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db = data_dir / "agent_search.db"
+    _mk_multipage_db(tmp_path).rename(db)
+
+    sentinel = tmp_path / "sentinel.jsonl"
+    sentinel.write_text("{}\n")
+    with sqlite3.connect(db) as con:
+        con.execute("ALTER TABLE conversations ADD COLUMN source_path TEXT")
+        con.execute(
+            "UPDATE conversations SET source_path = ? WHERE id = 2000",
+            (str(sentinel),),
+        )
+
+    vector_dir = data_dir / "vector_index"
+    vector_dir.mkdir()
+    manifest = vector_dir / "semantic_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "quality_tier": {
+                    "ready": False,
+                    "db_fingerprint": "content-v1:stale",
+                }
+            }
+        )
+    )
+    home = tmp_path / "home"
+    (home / ".local" / "share").mkdir(parents=True)
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    calls = tmp_path / "cass-calls.tsv"
+    _stub(stub_bin, "curl", "exit 0")
+    _stub(
+        stub_bin,
+        "cass-stub",
+        r"""
+printf '%s\t%s\n' "${CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES-unset}" "$*" >> "$CASS_STUB_CALLS"
+if [ "${1:-}" = "models" ] && [ "${2:-}" = "backfill" ]; then
+  printf '{"published":true,"last_offset":0}\n'
+fi
+exit 0
+""".strip(),
+    )
+
+    env = {
+        "PATH": f"{stub_bin}:{os.environ['PATH']}",
+        "HOME": str(home),
+        "CASS_DATA_DIR": str(data_dir),
+        "CASS_BIN": str(stub_bin / "cass-stub"),
+        "CASS_PULL_LOG_DIR": str(tmp_path / "logs"),
+        "CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES": "hostile-parent",
+        "CASS_STUB_CALLS": str(calls),
+    }
+    r = subprocess.run(
+        ["bash", str(SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+
+    assert r.returncode == 0, f"wrapper 应完整成功:\n{r.stdout}\n{r.stderr}"
+    assert json.loads(r.stdout.strip().splitlines()[-1])["ok"] is True
+    observed = [line.split("\t", 1) for line in calls.read_text().splitlines()]
+    assert observed[0] == ["1", "index"]
+    assert observed[1][0] == "unset"
+    assert observed[1][1].startswith("index --semantic --embedder infinity --watch-once ")
+    assert observed[2][0] == "unset"
+    assert observed[2][1].startswith("models backfill --tier quality ")
+    assert len(observed) == 3
