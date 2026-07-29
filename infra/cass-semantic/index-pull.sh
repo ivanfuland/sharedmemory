@@ -50,17 +50,25 @@ restore_wm() {
 trap restore_wm EXIT
 
 # 1) 词法 + DB 增量 index（不带 --semantic）。失败→trap 回滚水位。
-# stall abort 放宽到 1800s：CASS 的 phase-2 判据是「零进展 300s 即 exit 70」，而首个 ingest
-# commit 前有一段固定前置开销——2026-07-29 实测 301s（同构手动 run：进程 09:26:47.898 起、
-# 首个 `Preparing commit` 09:31:48.413），骑在 300s 阈值上，越线即被掐、下轮从头再来，
-# 01:00/01:05/02:00/02:05 连续四轮 fatal。放开后 ingest 正常推进（openclaw 10 会话 →
-# claude 8 会话 9642 消息，每 20s 一批），故 300s 阈值本身才是卡死点、不是真 wedge。
-# 取 1800 而非 0：wedge 保护要留着（语义段的 =0 是因为它本就不推进 current 计数，词法段会推进）；
-# 且 1800 < cron 周期 3600，真 wedge 时 30 分钟掐掉、下一轮仍能跑，不靠 flock 堆积。
-# ⚠ 这是止血不是根治：该前置开销在长（07-28 01:50 起 193s → 292s → 301s），
-# 根因（那段无日志、无 I/O 的单线程 CPU 热循环在算什么）未定位，另行跟踪。
+# stall abort 放宽到 600s。CASS 的 phase-2 判据是「连续零进展 300s 即 exit 70」，而首个 ingest
+# commit 前有一段前置开销——2026-07-29 同构手动 run 实测 301s（进程 09:26:47.898 起、首个
+# `Preparing commit` 09:31:48.413）——正好骑在 300s 上，于是 300s 对它产生 false positive：
+# 2026-07-29 的 01:00 与 02:00 两个整点 cron、及各自约 5 分钟后的 retry，四次尝试全被掐。
+# 放开后本次复现跑了过去（openclaw 10 会话 → claude 8 会话 9642 消息，每 20s 一批）——
+# 这只证明「本次不是永久死锁、300s 误判了它」，**不证明**不存在慢循环或随库规模恶化的算法问题。
+#
+# 选 600 的预算依据（41 份 run 日志实测，不是拍脑袋）：stall abort 是零进展计时器、不是整轮时限，
+# 真实总耗时 = 前置 + 首个 commit 之后的工作；后者实测 min 1547s / 中位 1933s / p90 2589s / max 2699s。
+# 按最坏观测，阈值预算 = 3600(cron 周期) − 2699 = 901s；取 600 留余量，最坏整轮约 55 分钟。
+# **1800 会超周期**（约 75 分钟）：调度侧 `concurrency: {limit: 1}` 会让下一轮在 Inngest 排队，
+# 根本进不到本脚本的 flock；且历史最坏整轮已达 7115s，距 runner 的两小时进程组 SIGKILL 仅差 85s，
+# 而 SIGKILL 无法触发上面的水位回滚 trap。取 600 而非 0：词法段会推进 current 计数，
+# wedge 保护应保留（semantic 段用 0 是 report-only，因为它本就不推进计数、watchdog 对它无意义）。
+#
+# ⚠ 止血不是根治，且窗口很短：该前置开销整体在上升（07-28 01:50 起 193s → 292s → 301s，中间有回落），
+# 按此速度 600 只够撑数天。根因——那段长时间无应用日志、无磁盘读的单线程 CPU 热循环在算什么——未定位。
 CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1 \
-  CASS_INDEX_STALL_ABORT_SECS=1800 \
+  CASS_INDEX_STALL_ABORT_SECS=600 \
   "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）

@@ -168,12 +168,11 @@ exit 0
 def test_lexical_stall_abort_threshold_is_scoped_to_lexical_index(
     tmp_path: pathlib.Path,
 ) -> None:
-    """词法 index 必须带放宽后的 stall abort 阈值,且不外溢到 semantic / backfill。
+    """契约:stall abort 阈值只作用于词法 index,不外溢到 semantic / backfill。
 
-    依据(2026-07-29 实测):首个 ingest commit 需 301 秒,而 CASS 的 phase-2 stall abort
-    默认 300 秒——固定前置开销骑在阈值上,越线即 exit 70,被 wrapper 包成
-    `lexical index failed (watermark rolled back)`,连续四轮 fatal。放宽阈值让它跑过那段;
-    semantic 段既有的 `=0`(report-only)语义不变,backfill 仍不设。
+    lexical=600、semantic=0(report-only)、backfill unset。
+    选值依据与生产事故经过见 PR 描述与运维记录——此处只锁接线契约,
+    避免叙事随时间过期而测试仍绿。
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -228,8 +227,8 @@ exit 0
     assert r.returncode == 0, f"wrapper 应完整成功:\n{r.stdout}\n{r.stderr}"
     observed = [line.split("\t", 1) for line in calls.read_text().splitlines()]
     assert observed[0][1] == "index", "第一次调用应是词法 index"
-    assert observed[0][0] == "1800", (
-        f"词法 index 必须带 CASS_INDEX_STALL_ABORT_SECS=1800,实得 {observed[0][0]!r}"
+    assert observed[0][0] == "600", (
+        f"词法 index 必须带 CASS_INDEX_STALL_ABORT_SECS=600,实得 {observed[0][0]!r}"
     )
     assert observed[1][0] == "0", "semantic watch-once 保持既有的 report-only(=0)"
     assert observed[1][1].startswith("index --semantic --embedder infinity --watch-once ")
