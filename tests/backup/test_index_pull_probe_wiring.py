@@ -163,3 +163,75 @@ exit 0
     assert observed[2][0] == "unset"
     assert observed[2][1].startswith("models backfill --tier quality ")
     assert len(observed) == 3
+
+
+def test_lexical_stall_abort_threshold_is_scoped_to_lexical_index(
+    tmp_path: pathlib.Path,
+) -> None:
+    """契约:stall abort 阈值只作用于词法 index,不外溢到 semantic / backfill。
+
+    lexical=600、semantic=0(report-only)、backfill unset。
+    选值依据与生产事故经过见 PR 描述与运维记录——此处只锁接线契约,
+    避免叙事随时间过期而测试仍绿。
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db = data_dir / "agent_search.db"
+    _mk_multipage_db(tmp_path).rename(db)
+
+    sentinel = tmp_path / "sentinel.jsonl"
+    sentinel.write_text("{}\n")
+    with sqlite3.connect(db) as con:
+        con.execute("ALTER TABLE conversations ADD COLUMN source_path TEXT")
+        con.execute(
+            "UPDATE conversations SET source_path = ? WHERE id = 2000",
+            (str(sentinel),),
+        )
+
+    vector_dir = data_dir / "vector_index"
+    vector_dir.mkdir()
+    (vector_dir / "semantic_manifest.json").write_text(
+        json.dumps({"quality_tier": {"ready": False, "db_fingerprint": "content-v1:stale"}})
+    )
+
+    home = tmp_path / "home"
+    (home / ".local" / "share").mkdir(parents=True)
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    calls = tmp_path / "cass-calls.tsv"
+    _stub(stub_bin, "curl", "exit 0")
+    _stub(
+        stub_bin,
+        "cass-stub",
+        r"""
+printf '%s\t%s\n' "${CASS_INDEX_STALL_ABORT_SECS-unset}" "$*" >> "$CASS_STUB_CALLS"
+if [ "${1:-}" = "models" ] && [ "${2:-}" = "backfill" ]; then
+  printf '{"published":true,"last_offset":0}\n'
+fi
+exit 0
+""".strip(),
+    )
+
+    env = {
+        "PATH": f"{stub_bin}:{os.environ['PATH']}",
+        "HOME": str(home),
+        "CASS_DATA_DIR": str(data_dir),
+        "CASS_BIN": str(stub_bin / "cass-stub"),
+        "CASS_PULL_LOG_DIR": str(tmp_path / "logs"),
+        "CASS_STUB_CALLS": str(calls),
+    }
+    r = subprocess.run(
+        ["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120, env=env
+    )
+
+    assert r.returncode == 0, f"wrapper 应完整成功:\n{r.stdout}\n{r.stderr}"
+    observed = [line.split("\t", 1) for line in calls.read_text().splitlines()]
+    assert observed[0][1] == "index", "第一次调用应是词法 index"
+    assert observed[0][0] == "600", (
+        f"词法 index 必须带 CASS_INDEX_STALL_ABORT_SECS=600,实得 {observed[0][0]!r}"
+    )
+    assert observed[1][0] == "0", "semantic watch-once 保持既有的 report-only(=0)"
+    assert observed[1][1].startswith("index --semantic --embedder infinity --watch-once ")
+    assert observed[2][0] == "unset", "backfill 不设该阈值"
+    assert observed[2][1].startswith("models backfill --tier quality ")
+    assert len(observed) == 3
