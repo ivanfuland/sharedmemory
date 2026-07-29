@@ -50,7 +50,17 @@ restore_wm() {
 trap restore_wm EXIT
 
 # 1) 词法 + DB 增量 index（不带 --semantic）。失败→trap 回滚水位。
+# stall abort 放宽到 1800s：CASS 的 phase-2 判据是「零进展 300s 即 exit 70」，而首个 ingest
+# commit 前有一段固定前置开销——2026-07-29 实测 301s（同构手动 run：进程 09:26:47.898 起、
+# 首个 `Preparing commit` 09:31:48.413），骑在 300s 阈值上，越线即被掐、下轮从头再来，
+# 01:00/01:05/02:00/02:05 连续四轮 fatal。放开后 ingest 正常推进（openclaw 10 会话 →
+# claude 8 会话 9642 消息，每 20s 一批），故 300s 阈值本身才是卡死点、不是真 wedge。
+# 取 1800 而非 0：wedge 保护要留着（语义段的 =0 是因为它本就不推进 current 计数，词法段会推进）；
+# 且 1800 < cron 周期 3600，真 wedge 时 30 分钟掐掉、下一轮仍能跑，不靠 flock 堆积。
+# ⚠ 这是止血不是根治：该前置开销在长（07-28 01:50 起 193s → 292s → 301s），
+# 根因（那段无日志、无 I/O 的单线程 CPU 热循环在算什么）未定位，另行跟踪。
 CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1 \
+  CASS_INDEX_STALL_ABORT_SECS=1800 \
   "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
