@@ -227,8 +227,8 @@ exit 0
     assert r.returncode == 0, f"wrapper 应完整成功:\n{r.stdout}\n{r.stderr}"
     observed = [line.split("\t", 1) for line in calls.read_text().splitlines()]
     assert observed[0][1] == "index", "第一次调用应是词法 index"
-    assert observed[0][0] == "600", (
-        f"词法 index 必须带 CASS_INDEX_STALL_ABORT_SECS=600,实得 {observed[0][0]!r}"
+    assert observed[0][0] == "1500", (
+        f"词法 index 必须带 CASS_INDEX_STALL_ABORT_SECS=1500,实得 {observed[0][0]!r}"
     )
     assert observed[1][0] == "0", "semantic watch-once 保持既有的 report-only(=0)"
     assert observed[1][1].startswith("index --semantic --embedder infinity --watch-once ")
