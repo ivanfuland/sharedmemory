@@ -62,9 +62,12 @@ trap restore_wm EXIT
 # 时限，真实总耗时 = 前置 + 首个 commit 之后的工作；后者推水位后实测 max 1462s
 # （13:00–20:00 八轮 1023–1462s）。三条边界按最坏观测反推：
 #   cron 3600s 周期（软）  → 阈值 ≤ 3600 − 1462 = 2138s，超了下一轮在 Inngest 排队，不坏数据
-#   夜备等锁 deadline（硬） → 阈值 ≤ 2439s，超了当天备份 FATAL（flock -w 900 超时 exit 1）
-#   runner SIGKILL 7200s（硬）→ 阈值 ≤ 5739s，超了进程组被杀、上面的水位回滚 trap 失效
-# 取 1500：距 cron 软上限尚有 638s、距夜备硬上限 939s；按 4–9 s/小时增速约买 5–11 天。
+#   夜备等锁 deadline（硬） → 阈值 ≤ 3900 − 1462 = 2438s（夜备 :50 起等锁 flock -w 900），超了当天备份 FATAL
+#   runner SIGKILL 7200s（硬）→ 阈值 ≤ 7200 − 1462 = 5738s，超了进程组被杀、上面的水位回滚 trap 失效
+# 注意：这些是按 8 轮实测 post max 反推的经验预算，不是运行时强制——post 回升（罕见的全量
+# backfill 回落、结构探针 150s 顶格等）就要重估，由每小时验收观测兜底。
+# 取 1500：距 cron 软上限 638s、距夜备 FATAL 线 938s（最坏 1500+1462=2962s 时夜备从 3000s 起
+# 等锁，只消耗 900s 等待窗的一小部分，不 FATAL）；按 4–9 s/小时增速约买 5–11 天。
 # 取 1500 而非 0：词法段会推进 current 计数，wedge 保护应保留
 # （semantic 段用 0 是 report-only，因为它本就不推进计数、watchdog 对它无意义）。
 #
@@ -140,7 +143,9 @@ else
   if [ "$pub" != "True" ]; then
     prev=-1
     for i in $(seq 1 200); do
-      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
+      # env -u:backfill 必须拿不到 stall abort 阈值——真实 runner 整份继承进程环境,
+      # 不显式清除的话父环境同名值会漏进来(接线契约由 wiring 测试带毒父环境锁定)。
+      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" env -u CASS_INDEX_STALL_ABORT_SECS "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
         || emit_fail "backfill errored"
       read -r pub off < <(printf '%s' "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('published'),d.get('last_offset'))" 2>/dev/null) \
         || emit_fail "backfill parse"

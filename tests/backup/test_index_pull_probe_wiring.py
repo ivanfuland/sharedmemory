@@ -170,7 +170,8 @@ def test_lexical_stall_abort_threshold_is_scoped_to_lexical_index(
 ) -> None:
     """契约:stall abort 阈值只作用于词法 index,不外溢到 semantic / backfill。
 
-    lexical=600、semantic=0(report-only)、backfill unset。
+    lexical=1500、semantic=0(report-only)、backfill unset——且父环境带同名值时
+    backfill 也必须拿到 unset(脚本显式清除;实际 runner 会整份继承进程环境)。
     选值依据与生产事故经过见 PR 描述与运维记录——此处只锁接线契约,
     避免叙事随时间过期而测试仍绿。
     """
@@ -219,6 +220,10 @@ exit 0
         "CASS_BIN": str(stub_bin / "cass-stub"),
         "CASS_PULL_LOG_DIR": str(tmp_path / "logs"),
         "CASS_STUB_CALLS": str(calls),
+        # 父环境泄漏哨兵:真实 runner 整份继承进程环境,若脚本不对 backfill
+        # 显式清除,这个值会漏进 backfill——"backfill unset" 断言必须在带毒
+        # 父环境下仍成立才算锁住契约(codex 对抗审 P0)。
+        "CASS_INDEX_STALL_ABORT_SECS": "999",
     }
     r = subprocess.run(
         ["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120, env=env
