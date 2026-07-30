@@ -50,25 +50,36 @@ restore_wm() {
 trap restore_wm EXIT
 
 # 1) 词法 + DB 增量 index（不带 --semantic）。失败→trap 回滚水位。
-# stall abort 放宽到 600s。CASS 的 phase-2 判据是「连续零进展 300s 即 exit 70」，而首个 ingest
-# commit 前有一段前置开销——2026-07-29 同构手动 run 实测 301s（进程 09:26:47.898 起、首个
-# `Preparing commit` 09:31:48.413）——正好骑在 300s 上，于是 300s 对它产生 false positive：
-# 2026-07-29 的 01:00 与 02:00 两个整点 cron、及各自约 5 分钟后的 retry，四次尝试全被掐。
-# 放开后本次复现跑了过去（openclaw 10 会话 → claude 8 会话 9642 消息，每 20s 一批）——
-# 这只证明「本次不是永久死锁、300s 误判了它」，**不证明**不存在慢循环或随库规模恶化的算法问题。
+# stall abort 放宽到 1500s。CASS 的 phase-2 判据是「连续零进展 N 秒即 exit 70」，而首个 ingest
+# commit 前有一段前置开销（单线程 CPU 热循环，根因未定位）。它持续增长：2026-07-29 实测
+# 05:00 轮 337.7s → 20:00 轮 429s（当日峰值 440s），14 轮线性拟合 4.01 s/小时（R²=0.765），
+# 最近区间更快（约 7–9 s/小时）。前值 600（PR #66 止血）按此增速一两天内必被再次击穿——
+# 300s 时代它已产生过 false positive：2026-07-29 的 01:00 与 02:00 两个整点 cron 及各自
+# 约 5 分钟后的 retry，四次尝试全被掐，wrapper 包装成 lexical index failed。
 #
-# 选 600 的预算依据（41 份 run 日志实测，不是拍脑袋）：stall abort 是零进展计时器、不是整轮时限，
-# 真实总耗时 = 前置 + 首个 commit 之后的工作；后者实测 min 1547s / 中位 1933s / p90 2589s / max 2699s。
-# 按最坏观测，阈值预算 = 3600(cron 周期) − 2699 = 901s；取 600 留余量，最坏整轮约 55 分钟。
-# **1800 会超周期**（约 75 分钟）：调度侧 `concurrency: {limit: 1}` 会让下一轮在 Inngest 排队，
-# 根本进不到本脚本的 flock；且历史最坏整轮已达 7115s，距 runner 的两小时进程组 SIGKILL 仅差 85s，
-# 而 SIGKILL 无法触发上面的水位回滚 trap。取 600 而非 0：词法段会推进 current 计数，
-# wedge 保护应保留（semantic 段用 0 是 report-only，因为它本就不推进计数、watchdog 对它无意义）。
+# 选 1500 的预算依据（2026-07-29 推 connector 水位后的新样本；旧样本 post max 2699s 属
+# 水位卡死期、重扫窗口 12 天的过期数据，勿再引用）：stall abort 是零进展计时器、不是整轮
+# 时限，真实总耗时 = 前置 + 首个 commit 之后的工作；后者推水位后实测 max 1462s
+# （13:00–20:00 八轮 1023–1462s）。三条边界按最坏观测反推：
+#   cron 3600s 周期（软）  → 阈值 ≤ 3600 − 1462 = 2138s，超了下一轮在 Inngest 排队，不坏数据
+#   夜备等锁 deadline（硬） → 完整式是「启动延迟 d + 阈值 + post ≤ 3900」（夜备 02:50 CST 起
+#     等锁 flock -w 900，锁不到 FATAL）。整点准时启动（d≈0，实测 cron 延迟秒级）时阈值上限
+#     = 3900 − 1462 = 2438s；但调度侧 admission 允许 cron 延迟至 90 分钟仍放行，延迟 d > 938s
+#     的 02:00(CST) 轮若再撞上最坏 pre+post 且先于夜备取得写锁，当晚夜备 FATAL（夜备先取锁则
+#     迟到的 index 轮 flock -n skip，无害）。**该残余风险 600 时代已存在
+#     （安全 d 上限 1838s），1500 把窗口收窄到 938s**——而 d > 15 分钟本身即前轮超时/积压信号，
+#     应触发预算重估。根治要么收窄 admission 窗要么夜备错峰，属调度侧另立改动。
+#   runner SIGKILL 7200s（硬）→ 阈值 ≤ 7200 − 1462 = 5738s，超了进程组被杀、上面的水位回滚 trap 失效
+# 注意：这些是按 8 轮实测 post max 反推的经验预算，不是运行时强制——post 回升（罕见的全量
+# backfill 回落、结构探针 150s 顶格等）就要重估，由每小时验收观测兜底。
+# 取 1500：d≈0 时距 cron 软上限 638s、距夜备 FATAL 线 938s；按 4–9 s/小时增速约买 5–11 天。
+# 取 1500 而非 0：词法段会推进 current 计数，wedge 保护应保留
+# （semantic 段用 0 是 report-only，因为它本就不推进计数、watchdog 对它无意义）。
 #
-# ⚠ 止血不是根治，且窗口很短：该前置开销整体在上升（07-28 01:50 起 193s → 292s → 301s，中间有回落），
-# 按此速度 600 只够撑数天。根因——那段长时间无应用日志、无磁盘读的单线程 CPU 热循环在算什么——未定位。
+# ⚠ 止血不是根治：继续抬阈值是死路，每抬一次买几天，且很快撞上夜备与 SIGKILL 两堵硬墙。
+# 根因——那段长时间无应用日志、无磁盘读的单线程 CPU 热循环在算什么——仍未定位，正在抓栈。
 CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1 \
-  CASS_INDEX_STALL_ABORT_SECS=600 \
+  CASS_INDEX_STALL_ABORT_SECS=1500 \
   "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
@@ -137,7 +148,9 @@ else
   if [ "$pub" != "True" ]; then
     prev=-1
     for i in $(seq 1 200); do
-      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
+      # env -u:backfill 必须拿不到 stall abort 阈值——真实 runner 整份继承进程环境,
+      # 不显式清除的话父环境同名值会漏进来(接线契约由 wiring 测试带毒父环境锁定)。
+      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" env -u CASS_INDEX_STALL_ABORT_SECS "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
         || emit_fail "backfill errored"
       read -r pub off < <(printf '%s' "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('published'),d.get('last_offset'))" 2>/dev/null) \
         || emit_fail "backfill parse"

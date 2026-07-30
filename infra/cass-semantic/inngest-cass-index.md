@@ -1,4 +1,9 @@
-# Phase C — CASS 增量拉取 Inngest cron（待部署到 jarvis-workflow-ts）
+# Phase C — CASS 增量拉取 Inngest cron（历史方案，已过期）
+
+> ⚠ **2026-07-29：本文档描述的「04:00 daily + spawnSync + jarvis app」是最初的部署方案，早已过期，
+> 仅保留作历史记录。** 现行部署：sharedmemory app **整点 hourly** cron + 异步进程组 runner
+> （2h 进程组超时 + stale cron run 跳过），代码以 my-inngest-workflow 仓
+> `functions/cass-index/{index,runner}.ts` 为准。`index-pull.sh` 的阈值预算注释按 hourly 现实撰写。
 
 > 状态：**PREPARED, 待协调部署**。jarvis-workflow-ts 当前在 `m3/distill-bridge-cron` 分支（M3 部署中），
 > 不在此 plan 内自动改它/重启 pm2。部署应在 jarvis 干净分支上做（M3 落地后或协调分支）。
