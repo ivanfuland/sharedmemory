@@ -240,3 +240,76 @@ exit 0
     assert observed[2][0] == "unset", "backfill 不设该阈值"
     assert observed[2][1].startswith("models backfill --tier quality ")
     assert len(observed) == 3
+
+
+def test_page_buffer_max_is_scoped_to_lexical_index(tmp_path: pathlib.Path) -> None:
+    """契约:fsqlite 页缓冲池上限只作用于词法 index,不外溢到 semantic / backfill。
+
+    lexical=524288(2 GiB)、semantic 与 backfill 均 unset。选值依据是 2026-08-05 的
+    A-B-A 实测(见脚本内注释与 cass-fork 侧根因报告)——此处只锁接线契约,不锁叙事。
+
+    ⚠ 与 CASS_INDEX_STALL_ABORT_SECS 不同,本变量脚本**不**对 semantic / backfill 做
+    显式清除:它是纯性能旋钮不是正确性门,父环境若带同名值,泄漏进那两段无害。故本测试
+    在干净父环境下断言 unset,锁的是"脚本自己没多设",不是"脚本会拦住父环境"。
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db = data_dir / "agent_search.db"
+    _mk_multipage_db(tmp_path).rename(db)
+
+    sentinel = tmp_path / "sentinel.jsonl"
+    sentinel.write_text("{}\n")
+    with sqlite3.connect(db) as con:
+        con.execute("ALTER TABLE conversations ADD COLUMN source_path TEXT")
+        con.execute(
+            "UPDATE conversations SET source_path = ? WHERE id = 2000",
+            (str(sentinel),),
+        )
+
+    vector_dir = data_dir / "vector_index"
+    vector_dir.mkdir()
+    (vector_dir / "semantic_manifest.json").write_text(
+        json.dumps({"quality_tier": {"ready": False, "db_fingerprint": "content-v1:stale"}})
+    )
+
+    home = tmp_path / "home"
+    (home / ".local" / "share").mkdir(parents=True)
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    calls = tmp_path / "cass-calls.tsv"
+    _stub(stub_bin, "curl", "exit 0")
+    _stub(
+        stub_bin,
+        "cass-stub",
+        r"""
+printf '%s\t%s\n' "${FSQLITE_PAGE_BUFFER_MAX-unset}" "$*" >> "$CASS_STUB_CALLS"
+if [ "${1:-}" = "models" ] && [ "${2:-}" = "backfill" ]; then
+  printf '{"published":true,"last_offset":0}\n'
+fi
+exit 0
+""".strip(),
+    )
+
+    env = {
+        "PATH": f"{stub_bin}:{os.environ['PATH']}",
+        "HOME": str(home),
+        "CASS_DATA_DIR": str(data_dir),
+        "CASS_BIN": str(stub_bin / "cass-stub"),
+        "CASS_PULL_LOG_DIR": str(tmp_path / "logs"),
+        "CASS_STUB_CALLS": str(calls),
+    }
+    r = subprocess.run(
+        ["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120, env=env
+    )
+
+    assert r.returncode == 0, f"wrapper 应完整成功:\n{r.stdout}\n{r.stderr}"
+    observed = [line.split("\t", 1) for line in calls.read_text().splitlines()]
+    assert observed[0][1] == "index", "第一次调用应是词法 index"
+    assert observed[0][0] == "524288", (
+        f"词法 index 必须带 FSQLITE_PAGE_BUFFER_MAX=524288,实得 {observed[0][0]!r}"
+    )
+    assert observed[1][0] == "unset", "semantic watch-once 不设页缓冲池上限"
+    assert observed[1][1].startswith("index --semantic --embedder infinity --watch-once ")
+    assert observed[2][0] == "unset", "backfill 不设页缓冲池上限"
+    assert observed[2][1].startswith("models backfill --tier quality ")
+    assert len(observed) == 3
