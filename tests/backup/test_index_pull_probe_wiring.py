@@ -245,12 +245,12 @@ exit 0
 def test_page_buffer_max_is_scoped_to_lexical_index(tmp_path: pathlib.Path) -> None:
     """契约:fsqlite 页缓冲池上限只作用于词法 index,不外溢到 semantic / backfill。
 
-    lexical=524288(2 GiB)、semantic 与 backfill 均 unset。选值依据是 2026-08-05 的
+    lexical=524288(2 GiB)、semantic 与 backfill 均 unset——**且父环境带同名值时仍须成立**
+    (脚本顶部显式 unset;真实 runner 会整份继承进程环境)。选值依据是 2026-08-05 的
     A-B-A 实测(见脚本内注释与 cass-fork 侧根因报告)——此处只锁接线契约,不锁叙事。
 
-    ⚠ 与 CASS_INDEX_STALL_ABORT_SECS 不同,本变量脚本**不**对 semantic / backfill 做
-    显式清除:它是纯性能旋钮不是正确性门,父环境若带同名值,泄漏进那两段无害。故本测试
-    在干净父环境下断言 unset,锁的是"脚本自己没多设",不是"脚本会拦住父环境"。
+    父环境哨兵是 codex R1-01 的直接产物:初版脚本不清除该变量,把"只作用于词法 index"
+    降成了只在干净父环境下成立的条件式声明。
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -297,6 +297,9 @@ exit 0
         "CASS_BIN": str(stub_bin / "cass-stub"),
         "CASS_PULL_LOG_DIR": str(tmp_path / "logs"),
         "CASS_STUB_CALLS": str(calls),
+        # 父环境泄漏哨兵:真实 runner 整份继承进程环境,若脚本不清除,这个值会漏进
+        # semantic / backfill——"只作用于词法 index"必须在带毒父环境下仍成立(codex R1-01)。
+        "FSQLITE_PAGE_BUFFER_MAX": "999999",
     }
     r = subprocess.run(
         ["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120, env=env

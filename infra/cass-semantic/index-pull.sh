@@ -8,6 +8,9 @@
 set -euo pipefail
 # 该逃生阀只属于下面的词法命令；拒绝继承父进程的同名值污染 semantic/backfill。
 unset CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES
+# 同理：页缓冲池上限也只属于词法命令。不清除的话父环境带同名值会漏进 semantic/backfill，
+# 下面「只作用于词法 index」那句就只在干净父环境下成立（codex R1-01）。
+unset FSQLITE_PAGE_BUFFER_MAX
 CANON="${CASS_DATA_DIR:-$HOME/.local/share/coding-agent-search}"
 URL="${CASS_INFINITY_URL:-http://127.0.0.1:7997}"
 BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
@@ -94,7 +97,9 @@ trap restore_wm EXIT
 #   262144（默认 1 GiB）CPU 442.9s / 393.0s ← A-B-A 两次，run-to-run 波动 11%
 #   524288（2 GiB）    CPU  15.3s          ← 工作集装得下，逐出几乎不发生，排序路径不执行
 # 四轮扫描工作量一致（同为 20 个 connector、scan_ms 合计约 1 秒），差异全落在扫描之后那段。
-# 缓冲区按需分配、不预留：2 GiB 档实测 RSS 仅比默认高约 150 MB。
+# 缓冲区按需分配、不预留（上限是天花板不是预留量）。RSS 代价按两次默认档分别对照：
+# 2 GiB 档在首个 commit 时刻比它们高 147 MiB 与 284 MiB。**这不是整轮峰值**——测量在首个
+# commit 后即 SIGTERM 收尾，峰值可能更高，部署后按真实整轮采样复核（codex R1-02）。
 #
 # ⚠ 这仍是止血，只是把缓存断崖往后挪，没有消除那个 O(n log n)：库继续长、工作集越过新池
 # 上限时会复发，且因池更大而每次排序更贵。根治是 fork/vendor fsqlite-pager 把全量排序换成
