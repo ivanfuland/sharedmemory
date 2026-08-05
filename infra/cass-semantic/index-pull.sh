@@ -8,6 +8,9 @@
 set -euo pipefail
 # 该逃生阀只属于下面的词法命令；拒绝继承父进程的同名值污染 semantic/backfill。
 unset CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES
+# 同理：页缓冲池上限也只属于词法命令。不清除的话父环境带同名值会漏进 semantic/backfill，
+# 下面「只作用于词法 index」那句就只在干净父环境下成立（codex R1-01）。
+unset FSQLITE_PAGE_BUFFER_MAX
 CANON="${CASS_DATA_DIR:-$HOME/.local/share/coding-agent-search}"
 URL="${CASS_INFINITY_URL:-http://127.0.0.1:7997}"
 BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
@@ -77,9 +80,36 @@ trap restore_wm EXIT
 # （semantic 段用 0 是 report-only，因为它本就不推进计数、watchdog 对它无意义）。
 #
 # ⚠ 止血不是根治：继续抬阈值是死路，每抬一次买几天，且很快撞上夜备与 SIGKILL 两堵硬墙。
-# 根因——那段长时间无应用日志、无磁盘读的单线程 CPU 热循环在算什么——仍未定位，正在抓栈。
+#
+# 根因已定位（2026-08-05）：那段热循环是 fsqlite-pager 的干净页逐出路径 take_clean_buffer——
+# 每逐出一页就对整个页缓存做一次全量快照 + 全量排序（O(n) 分配 + O(n log n) 排序，
+# n = 驻留页数）。该路径 0.1.16 引入（0.1.11 / 0.1.13 / 0.1.15 无此函数），而生产二进制
+# cass 0.6.17 锁的正是 0.1.16；抓栈 4/4 命中该路径。上游最新版仍未修。
+# 详见 ~/projects/cc-workspace/docs/projects/cass-fork/reports/2026-08-04-bugb-root-cause-analysis.md
+#
+# FSQLITE_PAGE_BUFFER_MAX 是 fsqlite-pager 的页缓冲池上限（单位：页，4 KiB/页），默认
+# 262144 = 1 GiB。工作集越过池上限后缓存进入颠簸，每次未命中都要付一次全量排序，于是耗时
+# 随库增长超线性恶化——这解释了为何前置耗时涨得比库体积快十几倍（47 小时 +44% vs 库 +2.3%）。
+#
+# 取 524288（2 GiB）的依据是 2026-08-05 在库副本上的 A-B-A 实测（同一生产二进制、同一驱动；
+# 量 CPU 时间而非墙钟，以排除同机生产负载干扰）：
+#    65536（256 MiB）  CPU 714.9s          ← 池更小 → 颠簸更重，反而差 1.7 倍
+#   262144（默认 1 GiB）CPU 442.9s / 393.0s ← A-B-A 两次，run-to-run 波动 11%
+#   524288（2 GiB）    CPU  15.3s          ← 工作集装得下，逐出几乎不发生，排序路径不执行
+# 四轮扫描工作量一致（同为 20 个 connector、scan_ms 合计约 1 秒），差异全落在扫描之后那段。
+# 缓冲区按需分配、不预留（上限是天花板不是预留量）。RSS 代价按两次默认档分别对照：
+# 2 GiB 档在首个 commit 时刻比它们高 147 MiB 与 284 MiB。**这不是整轮峰值**——测量在首个
+# commit 后即 SIGTERM 收尾，峰值可能更高，部署后按真实整轮采样复核（codex R1-02）。
+#
+# ⚠ 这仍是止血，只是把缓存断崖往后挪，没有消除那个 O(n log n)：库继续长、工作集越过新池
+# 上限时会复发，且因池更大而每次排序更贵。根治是 fork/vendor fsqlite-pager 把全量排序换成
+# 单趟 min_by_key，属 cass-fork 侧另立 PR。
+# ⚠ 生产库比测得的副本大约 17%，而断崖是阈值效应不是平滑曲线——若部署后整点轮观测到前置
+# 未塌到秒级，下一档试 1048576（4 GiB），不要退回去盲抬 stall 阈值。
+# 只作用于词法 index：semantic / backfill 未做同等实测，不外推。
 CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1 \
   CASS_INDEX_STALL_ABORT_SECS=1500 \
+  FSQLITE_PAGE_BUFFER_MAX=524288 \
   "$BIN" index >"$RUN_LOG" 2>&1 \
   || emit_fail "lexical index failed (watermark rolled back)"
 lexical_ok=1   # 词法成功，文件已落库，水位正确——往后失败不回滚（backfill 自带 checkpoint 续跑）
