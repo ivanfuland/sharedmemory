@@ -12,8 +12,20 @@
 #   - 备份文件名改读 `$BIN --version` 动态生成，不再硬编码 0.6.13。
 #   - 新增硬前置：候选二进制版本 + status schema 断言、NEW 目录必须为空、sources 快照留痕。
 #
+# v2.1 变更：
+#   - MIRROR_HOME=<假HOME目录> 时先物化镜像跑一遍摄入（补老库源文件已被本机清理、只剩 raw-mirror
+#     归档的会话），水位重置后再用真 HOME 跑第二遍补差；不设时行为与 v2 完全一致，只跑一遍。
+#   - 两遍法之间必须做水位重置：CASS 按 connector 增量水位扫描，扫过假 HOME 会把 last_scan_ts
+#     推进到镜像那次的时间点，第二遍真 HOME 增量时会把早于该水位的真实新会话当"已扫过"漏摄
+#     （根因见 `~/projects/cc-cass-w1-artifacts/W1_ARTIFACTS/w1c-watermark-bleed-rootcause.md`）。
+#   - conv_count 探针改读 `stats --json` 顶层 conversations，不读 `status --json` 的
+#     `database.conversations`：候选二进制在大库上 `include_counts` 受
+#     `STATUS_COUNT_SCAN_MAX_DB_BYTES` 门控，超阈值 `counts_skipped=true` → 该字段 null →
+#     `or 0` 吃成 0，稳定判据永远不满足；`stats --json` 无此门控，返回真数。
+#
 # 用法：bash full-reingest.sh            # 跑 backup→index→gate（到 gate 停，打印 ready-to-swap）
 #       SWAP=1 bash full-reingest.sh     # gate PASS 后再带 SWAP=1 跑一次，执行 swap
+#       MIRROR_HOME=/path bash full-reingest.sh   # 先跑镜像 HOME 一遍补差，再跑真 HOME 一遍
 # 中断重入：NEW 目录非空时脚本硬拒跑（见下方硬前置②）；`rm -rf "$NEW"` 后重跑（fresh）。
 # 摄入用 --full 探停(external_id 去重幂等)。
 set -euo pipefail
@@ -69,30 +81,78 @@ if [ -d "$CANON" ] && [ ! -e "$BK" ]; then cp -a "$CANON" "$BK"; echo "backed up
 mkdir -p "$NEW"
 export CASS_INDEX_STALL_ABORT_SECS=0   # stall 检测降为只报告(留日志)；死锁靠下面"探停"处理，不靠它中止
 
-# ① 摄入：--full 后台跑，轮询 conv 数稳定即停 --full（探针改读 status --json，脚本内不直读 sqlite3）
-rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true
-CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --full --json >/tmp/cc-reingest-ingest.log 2>&1 &
-ING=$!
+# conv_count()：探针改读 stats --json 顶层 conversations（探针为何用 stats 不用 status，见头部注释）
 conv_count() {
-  CASS_DATA_DIR="$NEW" "$BIN" status --json 2>/dev/null \
-    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('database',{}).get('conversations') or 0)" 2>/dev/null \
+  CASS_DATA_DIR="$NEW" "$BIN" stats --json 2>/dev/null \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('conversations') or 0)" 2>/dev/null \
     || echo 0
 }
-prev=-1; stable=0
-while kill -0 "$ING" 2>/dev/null; do
-  sleep 8
-  cur=$(conv_count)
-  if [ "${cur:-0}" -gt 0 ] && [ "$cur" = "$prev" ]; then
-    stable=$((stable+1))
-    if [ "$stable" -ge 3 ]; then echo "摄入稳定在 $cur conv，停 --full（绕 #244/#305 finalize 死锁族）"; kill "$ING" 2>/dev/null || true; break; fi
-  else stable=0; fi
-  prev="$cur"
-done
-wait "$ING" 2>/dev/null || true
-ncv=$(conv_count)
-[ "${ncv:-0}" -gt 0 ] || { echo "FAIL: 摄入无数据"; exit 1; }
-echo "摄入完成: $ncv conv"
-rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true   # 清被杀 --full 的残留锁
+
+# ① 摄入：--full 后台跑，轮询 conv 数稳定即停 --full（探针 conv_count 见上；脚本内不直读 sqlite3）
+#    抽成函数 ingest_pass LABEL，供 MIRROR_HOME 两遍法复用；单遍行为与 v2 完全一致，只多了 LABEL 分日志。
+ingest_pass() {
+  local LABEL="$1"
+  rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true
+  CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --full --json >"/tmp/cc-reingest-ingest-$LABEL.log" 2>&1 &
+  local ING=$!
+  local prev=-1 stable=0 cur ncv
+  while kill -0 "$ING" 2>/dev/null; do
+    sleep 8
+    cur=$(conv_count)
+    if [ "${cur:-0}" -gt 0 ] && [ "$cur" = "$prev" ]; then
+      stable=$((stable+1))
+      if [ "$stable" -ge 3 ]; then echo "[$LABEL] 摄入稳定在 $cur conv，停 --full（绕 #244/#305 finalize 死锁族）"; kill "$ING" 2>/dev/null || true; break; fi
+    else stable=0; fi
+    prev="$cur"
+  done
+  wait "$ING" 2>/dev/null || true
+  ncv=$(conv_count)
+  [ "${ncv:-0}" -gt 0 ] || { echo "FAIL: 摄入无数据[$LABEL]"; exit 1; }
+  echo "摄入完成[$LABEL]: $ncv conv"
+  rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true   # 清被杀 --full 的残留锁
+}
+
+# 水位重置：跨 HOME 两遍法之间必须做（C3 实证的跨 HOME 串味修法，exec20 交接件原句；为何要重置见头部注释）
+reset_watermarks() {
+  python3 - "$NEW/agent_search.db" <<'PYEOF'
+import sqlite3, sys
+
+db = sys.argv[1]
+con = sqlite3.connect(db, timeout=30)
+con.execute("PRAGMA busy_timeout=30000")
+
+
+def dump(label):
+    print(f"水位{label} ({db}):")
+    for row in con.execute(
+        "SELECT key, value FROM meta WHERE key='last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'"
+    ):
+        print(" ", row)
+
+
+dump("重置前 SELECT")
+con.execute(
+    "UPDATE meta SET value='0' WHERE key='last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'"
+)
+con.commit()
+dump("重置后 SELECT")
+con.close()
+PYEOF
+}
+
+# MIRROR_HOME 非空：先物化假 HOME 跑一遍摄入补老库源文件已被清理但仍在库里的差量（archive 覆盖），
+# 水位重置后再用真 HOME 跑第二遍补差；为空则行为与 v2 完全一致，只跑一遍。
+MIRROR_HOME="${MIRROR_HOME:-}"
+if [ -n "$MIRROR_HOME" ]; then
+  { [ -d "$MIRROR_HOME" ] && { [ -d "$MIRROR_HOME/.claude" ] || [ -d "$MIRROR_HOME/.codex" ]; }; } \
+    || { echo "FAIL: MIRROR_HOME=$MIRROR_HOME 不存在或不含 .claude/.codex 子目录，拒跑（防空树静默漏摄）"; exit 1; }
+  echo "MIRROR_HOME=$MIRROR_HOME 文件数: $(find "$MIRROR_HOME" -type f | wc -l)"
+  HOME="$MIRROR_HOME" ingest_pass mirror
+  reset_watermarks
+  ingest_pass live
+else
+  ingest_pass live
+fi
 
 # ② 词法：force-rebuild（从 DB 重建 Tantivy，绕 --full finalize 死锁族；判据改读 status --json）
 CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --force-rebuild --json >/tmp/cc-reingest-lexical.log 2>&1 \
