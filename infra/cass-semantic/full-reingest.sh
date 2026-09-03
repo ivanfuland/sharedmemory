@@ -12,6 +12,8 @@
 #   - 备份文件名改读 `$BIN --version` 动态生成，不再硬编码 0.6.13。
 #   - 新增硬前置：候选二进制版本 + status schema 断言、NEW 目录必须为空、sources 快照留痕。
 #
+# v2.2 变更：摄入两遍改为等 --full 自然退出（去掉「稳定即 kill」探停，它会误杀第二遍），并断言收尾汇总存在。
+#
 # v2.1 变更：
 #   - MIRROR_HOME=<假HOME目录> 时先物化镜像跑一遍摄入（补老库源文件已被本机清理、只剩 raw-mirror
 #     归档的会话），水位重置后再用真 HOME 跑第二遍补差；不设时行为与 v2 完全一致，只跑一遍。
@@ -95,20 +97,22 @@ ingest_pass() {
   rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true
   CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --full --json >"/tmp/cc-reingest-ingest-$LABEL.log" 2>&1 &
   local ING=$!
-  local prev=-1 stable=0 cur ncv
+  # v2.2：不再「稳定即 kill」——第二遍(live)对已入库文件重扫时 conv 数长时间不变，探停会在 24s 内误杀
+  #        --full（2026-09-03 08:22 生产实证：live 遍 0 新会话、日志止于 progress 事件）；mirror 遍同样被截断。
+  #        0.6.17 在本语料上 --full 可自然退出（同日首跑 896s 收尾汇总完整），改为等自然退出 + 收尾汇总断言。
+  local cur ncv ing_rc=0
   while kill -0 "$ING" 2>/dev/null; do
-    sleep 8
+    sleep 60
     cur=$(conv_count)
-    if [ "${cur:-0}" -gt 0 ] && [ "$cur" = "$prev" ]; then
-      stable=$((stable+1))
-      if [ "$stable" -ge 3 ]; then echo "[$LABEL] 摄入稳定在 $cur conv，停 --full（绕 #244/#305 finalize 死锁族）"; kill "$ING" 2>/dev/null || true; break; fi
-    else stable=0; fi
-    prev="$cur"
+    echo "[$LABEL] 进行中: $cur conv $(date +%H:%M:%S)"
   done
-  wait "$ING" 2>/dev/null || true
+  wait "$ING" || ing_rc=$?
+  [ "$ing_rc" = "0" ] || { echo "FAIL: index --full[$LABEL] 退出码 $ing_rc"; tail -3 "/tmp/cc-reingest-ingest-$LABEL.log"; exit 1; }
+  grep -q '"total_conversations"' "/tmp/cc-reingest-ingest-$LABEL.log" \
+    || { echo "FAIL: index --full[$LABEL] 日志无收尾汇总（可能被外部中断）"; exit 1; }
   ncv=$(conv_count)
   [ "${ncv:-0}" -gt 0 ] || { echo "FAIL: 摄入无数据[$LABEL]"; exit 1; }
-  echo "摄入完成[$LABEL]: $ncv conv"
+  echo "摄入完成[$LABEL]: $ncv conv（--full 自然退出，收尾汇总在）"
   rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true   # 清被杀 --full 的残留锁
 }
 
