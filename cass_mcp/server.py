@@ -45,15 +45,36 @@ def _audit(tool, params, status, dur_ms):
 
 
 def _readiness():
-    """P1-3: 查询前就绪校验（契约 cass-semantic-prod.md §20/§50）。"""
-    dd = os.environ.get("CASS_DATA_DIR", "")
-    checks = {}
+    """P1-3: 查询前就绪校验（契约 cass-semantic-prod.md §20/§50）。
+    改读 `cass status --json`（权威自述）取代旧的盲读文件/目录存在性检查——
+    波3 起向量域迁入 DB vec0（vector_index/semantic_manifest.json 不复存在），
+    波2 起词法域迁入 DB FTS5（index/ 目录不复存在），旧检查在新世界恒为 False。
+    semantic 门用顶层 db_vector_domain 段；lexical 门用顶层 index 段——
+    该段虽名为 index，但由内部 lexical asset 状态填充（实测 reason 文案含
+    "lexical Tantivy metadata"，源码 state_index_freshness() 亦从 "index" 键
+    读取 lexical 字段），是词法域迁库后仍存在的权威自述键，取代已消失的
+    index/ 目录判断。"""
+    checks = {"semantic": False, "lexical": False, "semantic_audit_status": None}
     try:
-        m = json.load(open(os.path.join(dd, "vector_index", "semantic_manifest.json")))["quality_tier"]
-        checks["semantic"] = bool(m.get("ready")) and m.get("embedder_id") == "bge-m3"
+        st = runner.run_cass("status", [], want_json=True, cass_bin=config.CASS_BIN)
     except Exception:
-        checks["semantic"] = False
-    checks["lexical"] = os.path.isdir(os.path.join(dd, "index"))
+        st = {"error": "cass_exception"}
+    if isinstance(st, dict) and "error" not in st:
+        dvd = st.get("db_vector_domain")
+        if isinstance(dvd, dict):
+            checks["semantic_audit_status"] = dvd.get("audit_status")
+            embedder = dvd.get("embedder_id") or ""
+            # R1-B3: audit_status 不作为门（代际 pending 期间搜索仍服务上一通过版），
+            # 只观测透出；error 非 null 时其它字段不可信（R1-N7），一律判 False。
+            checks["semantic"] = (
+                dvd.get("error") is None
+                and dvd.get("active") is True
+                and isinstance(embedder, str) and embedder.endswith("bge-m3")
+            )
+        # dvd 为 None/缺失（老二进制无此字段，或 db 未打开）→ semantic 保持 False，不抛
+        idx = st.get("index")
+        if isinstance(idx, dict):
+            checks["lexical"] = idx.get("exists") is True and idx.get("status") != "error"
     try:
         url = os.environ.get("CASS_INFINITY_URL", "").rstrip("/") + "/health"
         with urllib.request.urlopen(url, timeout=2) as r:
@@ -104,9 +125,9 @@ CASS_SEARCH_DESC = (
 @mcp.tool(description=CASS_SEARCH_DESC)
 def cass_search(query: str, agent: str = "", workspace: str = "", limit: int = 10,
                 max_content_length: int = 2000):
-    # P1-3: 查询前就绪校验
+    # P1-3: 查询前就绪校验（gate 只看三道布尔门；semantic_audit_status 是观测字段，不参与 all()）
     checks = _readiness()
-    if not all(checks.values()):
+    if not (checks["semantic"] and checks["lexical"] and checks["infinity"]):
         _audit("cass_search", [query], "not_ready", 0)
         return {"error": "not_ready", "checks": checks}
     user_limit, overfetch = overfetch_limit(limit)          # ② clamp ≤50 + overfetch ≥ user_limit
