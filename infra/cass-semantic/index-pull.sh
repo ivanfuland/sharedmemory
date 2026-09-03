@@ -5,6 +5,16 @@
 # 失败回滚 scan watermark：fork mid-batch 每 10s 存 scan_start_ts 到 last_scan_ts（mod.rs:12706，
 # OOM-loop 规避），若词法摄入被杀于水位推进后/落库前，下轮 delta 扫描会跳过未落库文件→静默漏会话
 # （codex P0#2）。本脚本词法失败时回滚水位；SIGKILL 无解但拆分后词法极快、窗口极小。
+#
+# v2（2026-09-03，单库新世界适配）：换库后 `$CANON/vector_index/semantic_manifest.json` 不再产出，
+# 旧判据 `sem_matches()` 读它的 `quality_tier.ready`/`db_fingerprint` 恒读不到文件、恒判 `no`，
+# 于是 2a watch-once 复核必假、每小时无条件回落 2b 全量重建。新判据 `sem_ok()` 改读
+# `cass status --json` 的顶层 `db_vector_domain`（active/audit_status/embedded_count/error）——
+# 这是二进制自己对「语义与 DB 是否一致」给出的权威读数，不依赖任何本地文件的存在与格式。
+# 2b 回落语义同步换成一次完整 `index --semantic` catch-up（原地追平，不做多轮 offset 分页）；
+# 旧的 `models backfill --scheduled --batch-conversations` 循环连带 `published/last_offset`
+# 解析一并删除——`models backfill --embedder` 当前二进制只认 `hash`/`fastembed`，`infinity`
+# 已不是文档化的合法值。
 set -euo pipefail
 # 该逃生阀只属于下面的词法命令；拒绝继承父进程的同名值污染 semantic/backfill。
 unset CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES
@@ -14,7 +24,7 @@ unset FSQLITE_PAGE_BUFFER_MAX
 CANON="${CASS_DATA_DIR:-$HOME/.local/share/coding-agent-search}"
 URL="${CASS_INFINITY_URL:-http://127.0.0.1:7997}"
 BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
-LOCK="$HOME/.local/share/.cass-write.lock"   # 全局写锁，与 full-reingest.sh 共用（codex P1#1）
+LOCK="${CASS_WRITE_LOCK:-$HOME/.local/share/.cass-write.lock}"   # 全局写锁，与 full-reingest.sh 共用（codex P1#1）；env 缝仅供干跑隔离，默认路径不变（同 full-reingest.sh 的缝）
 DB="$CANON/agent_search.db"
 
 emit_fail() { printf '{"ok":false,"error":"%s"}\n' "$1"; exit "${2:-1}"; }
@@ -128,29 +138,27 @@ else
   emit_fail "structure probe: $(printf '%s' "$probe_out" | head -2 | tr '\n' ';' | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')" 3
 fi
 
-# 2) bge-m3 语义。先判语义是否已与 DB 一致（manifest fp 的 conv/msg == DB）——一致则跳过，
-#    避免无新内容时每日 backfill 空转重 walk 整语料（~12min CPU；codex 之外的效率加固）。
+# 2) bge-m3 语义。先判语义是否已与 DB 一致——一致则跳过，避免无新内容时每日 backfill
+#    空转重 walk 整语料（~12min CPU；codex 之外的效率加固）。
 pub=""
 
-# manifest 指纹 == DB 指纹？CASS 的 `content-v1:<会话总数>:<max(conversations.id)>:<max(messages.id)>`
-# （注意第三段是 **max(messages.id)**，不是 COUNT(*)——两者只在 id 稠密无删除时相等；
-#  原实现拿 COUNT(*) 比，一旦有删除就永久失配 → 每小时触发一次全量重建。）
-sem_matches() {
-  python3 -c "
-import json,sqlite3
+# 单库新世界：语义与 DB 是否一致，直接问二进制自己（`status --json` 的 `db_vector_domain`），
+# 不再靠本地 manifest 文件的指纹字符串比对（换库后该文件不产出，旧判据恒 no）。
+# active=true 且 audit_status=passed 且 error=null 且 embedded_count>0 ⇒ 最近一次 catch-up
+# 已激活且过审——洞账由二进制自管，不需要额外的指纹比对。
+sem_ok() {
+  CASS_DATA_DIR="$CANON" "$BIN" status --json 2>/dev/null | python3 -c "
+import sys,json
 try:
-    m=json.load(open('$CANON/vector_index/semantic_manifest.json'))['quality_tier']
-    c=sqlite3.connect('file:$DB?mode=ro',uri=True)
-    nc=c.execute('SELECT COUNT(*) FROM conversations').fetchone()[0]
-    mc=c.execute('SELECT COALESCE(MAX(id),0) FROM conversations').fetchone()[0]
-    mm=c.execute('SELECT COALESCE(MAX(id),0) FROM messages').fetchone()[0]; c.close()
-    want=f'content-v1:{nc}:{mc}:{mm}'
-    print('yes' if (m.get('ready') and m.get('db_fingerprint')==want) else 'no')
+    d=json.load(sys.stdin)['db_vector_domain']
+    ok = (d.get('active') is True and d.get('audit_status') == 'passed'
+          and d.get('error') is None and (d.get('embedded_count') or 0) > 0)
+    print('yes' if ok else 'no')
 except Exception: print('no')
 " 2>/dev/null || echo no
 }
 
-if [ "$(sem_matches)" = yes ]; then
+if [ "$(sem_ok)" = yes ]; then
   echo "semantic 已与 DB 一致，跳过"; pub=True
 else
   # 2a) **优先增量追加**（秒级）：`index --semantic --watch-once` 走 TargetedSemanticWatchOnceMode::
@@ -166,34 +174,37 @@ else
   if [ -n "$SENTINEL" ]; then
     if CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" CASS_INDEX_STALL_ABORT_SECS=0 \
          "$BIN" index --semantic --embedder infinity --watch-once "$SENTINEL" >>"$RUN_LOG" 2>&1; then
-      # 追加"成功退出"不等于"追上了"——必须用指纹复核，否则会把陈旧索引当新的
-      [ "$(sem_matches)" = yes ] && { pub=True; echo "semantic 增量追加完成"; }
+      # 追加"成功退出"不等于"追上了"——必须用 sem_ok 复核，否则会把陈旧索引当新的
+      [ "$(sem_ok)" = yes ] && { pub=True; echo "semantic 增量追加完成"; }
     fi
     [ "$pub" = "True" ] || echo "semantic 增量追加不可用，回落全量 backfill" >&2
   else
     echo "semantic 找不到可用的 watch-once 触发路径，回落全量 backfill" >&2
   fi
 
-  # 2b) 回落：全量重建（前缀被破坏 / artifact 缺失 / 追加失败时的唯一出路）
+  # 2b) 回落：一次完整 catch-up（前缀被破坏 / artifact 缺失 / 追加失败时的唯一出路）。
+  #     单库新世界没有 offset 分页语义——`index --semantic` 一趟追平到当前 DB，不是
+  #     分批 backfill；成功后仍用 sem_ok 复核（同 2a，"退出成功" 不等于 "追上了"）。
+  #     env -u：同词法段注释，backfill/semantic 段不得继承 stall abort 阈值。
   if [ "$pub" != "True" ]; then
-    prev=-1
-    for i in $(seq 1 200); do
-      # env -u:backfill 必须拿不到 stall abort 阈值——真实 runner 整份继承进程环境,
-      # 不显式清除的话父环境同名值会漏进来(接线契约由 wiring 测试带毒父环境锁定)。
-      out=$(CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" env -u CASS_INDEX_STALL_ABORT_SECS "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>"$RUN_LOG") \
-        || emit_fail "backfill errored"
-      read -r pub off < <(printf '%s' "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('published'),d.get('last_offset'))" 2>/dev/null) \
-        || emit_fail "backfill parse"
-      [ "$pub" = "True" ] && break
-      [ "$off" = "$prev" ] && emit_fail "backfill stalled at offset $off"
-      prev=$off
-    done
-    [ "$pub" = "True" ] || emit_fail "bge-m3 not published"
+    if CASS_DATA_DIR="$CANON" CASS_INFINITY_URL="$URL" env -u CASS_INDEX_STALL_ABORT_SECS \
+         "$BIN" index --semantic --embedder infinity --json >>"$RUN_LOG" 2>&1; then
+      [ "$(sem_ok)" = yes ] && pub=True
+    fi
+    [ "$pub" = "True" ] || emit_fail "semantic catch-up not activated"
   fi
 fi
 
-# 3) 末行 JSON 报告（conv/msg 计数供观测增量进展）
+# 3) 末行 JSON 报告（conv/msg 计数供观测增量进展）。semantic_ready 同 sem_ok 改读
+#    `status --json` 的 db_vector_domain，不再读已不产出的 manifest 文件；输出契约不变
+#    （true/false/unknown 三值字符串）。
 conv=$(sqlite3 "$DB" 'SELECT COUNT(*) FROM conversations' 2>/dev/null || echo -1)
 msg=$(sqlite3 "$DB" 'SELECT COUNT(*) FROM messages' 2>/dev/null || echo -1)
-ready=$(python3 -c "import json;print(str(json.load(open('$CANON/vector_index/semantic_manifest.json'))['quality_tier'].get('ready')).lower())" 2>/dev/null || echo unknown)
+ready=$(CASS_DATA_DIR="$CANON" "$BIN" status --json 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)['db_vector_domain']
+    print('true' if (d.get('active') is True and d.get('audit_status') == 'passed') else 'false')
+except Exception: print('unknown')
+" 2>/dev/null || echo unknown)
 printf '{"ok":true,"conversations":%s,"messages":%s,"semantic_ready":"%s"}\n' "$conv" "$msg" "$ready"
