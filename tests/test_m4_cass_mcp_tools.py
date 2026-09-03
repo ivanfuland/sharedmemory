@@ -147,6 +147,57 @@ def test_cass_search_blocks_when_not_ready(monkeypatch, tmp_path):
     assert called["n"] == 0, "readiness 失败时不应调用 run_cass"
 
 
+# ---- exec67 任务书#74: _readiness() 改读 `cass status --json`（db_vector_domain / index 段） ----
+
+def test_readiness_status_active_semantic_and_lexical_true(monkeypatch):
+    """正例：status --json 返回 active+error null+embedder 以 bge-m3 结尾，index 段健康
+    → semantic/lexical 均 True；audit_status 原样透出观测，不参与门。"""
+    fake_status = {
+        "db_vector_domain": {
+            "active": True, "embedder_id": "BAAI/bge-m3", "dim": 1024,
+            "audit_status": "pending", "embedded_count": 100,
+            "any_generation": True, "error": None,
+        },
+        "index": {"exists": True, "status": "ready"},
+    }
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: fake_status)
+    checks = S._readiness()
+    assert checks["semantic"] is True
+    assert checks["lexical"] is True
+    assert checks["semantic_audit_status"] == "pending"
+
+
+def test_readiness_semantic_false_when_error_present(monkeypatch):
+    """反例1：R1-N7 反吞错——db_vector_domain.error 非 null 时其它字段不可信，一律 semantic False。"""
+    fake_status = {
+        "db_vector_domain": {"active": True, "embedder_id": "bge-m3", "error": "query failed against opened db"},
+        "index": {"exists": True, "status": "ready"},
+    }
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: fake_status)
+    checks = S._readiness()
+    assert checks["semantic"] is False
+
+
+def test_readiness_semantic_false_when_active_false(monkeypatch):
+    """反例2：active 为 false（域未启用/代际未生效）→ semantic False。"""
+    fake_status = {
+        "db_vector_domain": {"active": False, "embedder_id": "bge-m3", "error": None},
+        "index": {"exists": True, "status": "ready"},
+    }
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: fake_status)
+    checks = S._readiness()
+    assert checks["semantic"] is False
+
+
+def test_readiness_semantic_false_when_fields_missing_old_binary(monkeypatch):
+    """反例3：老二进制无 db_vector_domain 字段（键整体缺失）→ semantic False，不抛异常。"""
+    fake_status = {"index": {"exists": True, "status": "ready"}}   # db_vector_domain 键不存在
+    monkeypatch.setattr(S.runner, "run_cass", lambda *a, **k: fake_status)
+    checks = S._readiness()
+    assert checks["semantic"] is False
+    assert checks["semantic_audit_status"] is None
+
+
 def test_server_module_refuses_import_without_bearer():
     env = {k: v for k, v in os.environ.items() if k != "CASS_MCP_BEARER"}
     r = subprocess.run([sys.executable, "-c", "import cass_mcp.server"],
