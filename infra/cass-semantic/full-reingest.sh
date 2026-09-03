@@ -1,91 +1,165 @@
 #!/usr/bin/env bash
-# CASS 单版本全新重摄入：备份老库 → fork 全量 index(JSONL→DB+词法+bge-m3 语义) 进临时新目录
-# → serving dir 完整性 → 召回门 ≥0.55 → 原子 swap 进规范路径。零迁移（不碰老 0.6.13 库）。
-# 幂等 + flock + fail-loud。SWAP 仅在召回门 PASS 后执行。
+# CASS 单库新世界全新重摄入 v2：备份老库 → fork 全量 index(JSONL→DB+词法+bge-m3语义,DB向量域)
+# 进临时新目录 → serving readiness(status --json) → 召回门≥0.55(四分退出码) → 原子 swap 进规范路径。
+# 零迁移（不碰老库）。幂等 + flock + fail-loud。SWAP 仅在召回门 PASS 后执行。
+#
+# v2 变更(适配单库新世界，骨架/锁/备份/swap 逻辑原样保留，只换新世界不成立的判据)：
+#   - 词法/语义判据统一改读 `status --json`（index.exists / db_vector_domain），脚本内不再直读
+#     sqlite3 或看 index/ 目录大小 —— 新世界词法在 DB 内 FTS5(fts_lex)，语义在 DB 向量域，无 index/ 目录。
+#   - 语义摄入改用 `index --semantic --embedder infinity`（=db_vector_catchup：genesis 播种→洞驱动
+#     嵌入→七项审计→事务内切换激活），不用旧世界 `models backfill --scheduled --batch-conversations` 循环。
+#   - 召回门退出码四分（0 过/1 回归/2 前置/3 陈旧），不再一刀切 `|| FAIL`。
+#   - 备份文件名改读 `$BIN --version` 动态生成，不再硬编码 0.6.13。
+#   - 新增硬前置：候选二进制版本 + status schema 断言、NEW 目录必须为空、sources 快照留痕。
 #
 # 用法：bash full-reingest.sh            # 跑 backup→index→gate（到 gate 停，打印 ready-to-swap）
 #       SWAP=1 bash full-reingest.sh     # gate PASS 后再带 SWAP=1 跑一次，执行 swap
-# 中断重入：rm "$NEW" 后重跑（fresh）。摄入用 --full 探停(external_id 去重幂等)，词法走 force-rebuild。
+# 中断重入：NEW 目录非空时脚本硬拒跑（见下方硬前置②）；`rm -rf "$NEW"` 后重跑（fresh）。
+# 摄入用 --full 探停(external_id 去重幂等)。
 set -euo pipefail
 CANON="${CANON_DATA_DIR:-$HOME/.local/share/coding-agent-search}"
 NEW="${NEW_DATA_DIR:-$CANON.new}"
 URL="${CASS_INFINITY_URL:-http://127.0.0.1:7997}"
 BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
 RECALL="${RECALL_RUN:-$HOME/projects/cc-workspace/docs/projects/shared-memory/recall-regression/run.py}"
-LOCK="$HOME/.local/share/.cass-write.lock"   # 全局写锁，与 index-pull.sh 共用（codex P1#1：防 pull 在 swap 窗口写 canonical）
+LOCK="${CASS_WRITE_LOCK:-$HOME/.local/share/.cass-write.lock}"   # 全局写锁，与 index-pull.sh 共用（codex P1#1：防 pull 在 swap 窗口写 canonical）；可覆盖以便沙盒干跑不碰生产锁
+MIN_VERSION="0.6.17"   # 单库新世界（db_vector_domain / index --semantic）的最低版本线
 
 exec 9>"$LOCK"; flock -n 9 || { echo "another cass write holds lock (reingest/pull)"; exit 0; }
 curl -sf -m5 "$URL/health" >/dev/null || { echo "FAIL: Infinity down"; exit 2; }
 
+# 0a) 硬前置①：候选二进制必须是「单库新世界」版本，老二进制直接拒跑
+BIN_VERSION="$("$BIN" --version 2>/dev/null | awk '{print $2}')"
+[ -n "$BIN_VERSION" ] || { echo "FAIL: 读不到 $BIN --version"; exit 1; }
+if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$BIN_VERSION" | sort -V | head -1)" != "$MIN_VERSION" ]; then
+  echo "FAIL: $BIN 版本 $BIN_VERSION < $MIN_VERSION，拒跑（老二进制没有 db_vector_domain / index --semantic）"
+  exit 1
+fi
+PROBE_DIR="$(mktemp -d)"
+trap 'rm -rf "$PROBE_DIR"' EXIT
+CASS_DATA_DIR="$PROBE_DIR" "$BIN" status --json 2>/dev/null \
+  | python3 -c "import sys,json; sys.exit(0 if 'db_vector_domain' in json.load(sys.stdin) else 1)" \
+  || { echo "FAIL: $BIN status --json 缺 db_vector_domain 键，非单库新世界二进制"; exit 1; }
+echo "前置①通过：$BIN 版本 $BIN_VERSION ≥ $MIN_VERSION，status schema 含 db_vector_domain"
+
+# 0b) 硬前置②：NEW 目录必须不存在或为空 —— 新二进制绝不对旧世界残留库跑增量（PR2-R2-2 死亡判据）
+if [ -e "$NEW" ] && [ -n "$(ls -A "$NEW" 2>/dev/null)" ]; then
+  echo "FAIL: $NEW 已存在且非空——可能是旧世界残留库，新二进制绝不能对它跑增量。请核实内容后手动清理再重跑"
+  exit 1
+fi
+
+# 0c) sources 快照留痕（只读，不改配置；语料排除项由二进制+源配置负责，这里只存证）
+"$BIN" sources list --json > /tmp/cc-reingest-sources-snapshot.json 2>&1 \
+  || echo "警告：sources list 快照失败（不阻断，继续）"
+echo "sources 快照 -> /tmp/cc-reingest-sources-snapshot.json"
+
 # 1) 备份老库（回滚后路；幂等：当日已备份则跳过）
-BK="$CANON.0.6.13.bak.$(date +%Y%m%d)"
+BK="$CANON.$BIN_VERSION.bak.$(date +%Y%m%d)"
 if [ -d "$CANON" ] && [ ! -e "$BK" ]; then cp -a "$CANON" "$BK"; echo "backed up -> $BK"; else echo "backup skip ($BK or no canon)"; fi
 
-# 2a) 摄入 + 词法。⚠ 绝不用 `index --full` 一把梭：它的并行 Tantivy rebuild 管线在 finalize 阶段
-#     会因内存压力降档**死锁**（upstream #244；实测 2026-06-27 连栽两次，tantivy_segment_files=0、
-#     current 计数永不推进、120s 零进展）。可靠流程分两步：
-#       ① `--full` 只借来「摄入 JSONL→DB」(indexing 阶段正常)，探到 conv 数稳定即停（不等它死锁的 finalize）
-#       ② 词法走 `index --force-rebuild`（从已摄入 DB 重建 Tantivy 的轻量路径，不走死锁管线，实测 6s）
+# 2a) 摄入 + 词法。⚠ 绝不用 `index --full` 一把梭跑到底：finalize 阶段的并行 Tantivy/frankensqlite FTS5
+#     归并在内存压力/大语料下有史可查的死锁族——upstream #244（`index --full` 25h finalize 卡死，
+#     2026-05 修复）的姊妹问题 #305（`index --semantic` 同一 finalize 病灶：0.6.16 复现、本脚本最低版本线
+#     0.6.17 修过、但 0.6.22 在更大语料上再次复现）说明这类死锁在该版本族没被彻底根除，只是触发阈值变了。
+#     小语料干跑里 `--full` 顺利秒退不能当作已解决的证据（干跑语料太小，压不出这个 bug），故仍分两步：
+#       ① `--full` 只借来「摄入 JSONL→DB」，探到 conv 数稳定即停（不等它可能撞上 finalize 死锁）
+#       ② 词法走 `index --force-rebuild`（候选二进制自报 lexical_strategy_reason=
+#          "force_rebuild_uses_readonly_authoritative_canonical_db_rebuild_only"，证实这是与 --full
+#          finalize 不同的轻量只读重建路径，0.6.17 实测仍存在且可用）
 mkdir -p "$NEW"
 export CASS_INDEX_STALL_ABORT_SECS=0   # stall 检测降为只报告(留日志)；死锁靠下面"探停"处理，不靠它中止
 
-# ① 摄入：--full 后台跑，轮询 conv 数稳定即停 --full
+# ① 摄入：--full 后台跑，轮询 conv 数稳定即停 --full（探针改读 status --json，脚本内不直读 sqlite3）
 rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true
 CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --full --json >/tmp/cc-reingest-ingest.log 2>&1 &
 ING=$!
+conv_count() {
+  CASS_DATA_DIR="$NEW" "$BIN" status --json 2>/dev/null \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('database',{}).get('conversations') or 0)" 2>/dev/null \
+    || echo 0
+}
 prev=-1; stable=0
 while kill -0 "$ING" 2>/dev/null; do
   sleep 8
-  cur=$(sqlite3 "$NEW/agent_search.db" 'SELECT COUNT(*) FROM conversations' 2>/dev/null || echo 0)
+  cur=$(conv_count)
   if [ "${cur:-0}" -gt 0 ] && [ "$cur" = "$prev" ]; then
     stable=$((stable+1))
-    if [ "$stable" -ge 3 ]; then echo "摄入稳定在 $cur conv，停 --full（绕 #244 finalize 死锁）"; kill "$ING" 2>/dev/null || true; break; fi
+    if [ "$stable" -ge 3 ]; then echo "摄入稳定在 $cur conv，停 --full（绕 #244/#305 finalize 死锁族）"; kill "$ING" 2>/dev/null || true; break; fi
   else stable=0; fi
   prev="$cur"
 done
 wait "$ING" 2>/dev/null || true
-ncv=$(sqlite3 "$NEW/agent_search.db" 'SELECT COUNT(*) FROM conversations' 2>/dev/null || echo 0)
+ncv=$(conv_count)
 [ "${ncv:-0}" -gt 0 ] || { echo "FAIL: 摄入无数据"; exit 1; }
 echo "摄入完成: $ncv conv"
 rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true   # 清被杀 --full 的残留锁
 
-# ② 词法：force-rebuild（从 DB 重建 Tantivy，绕死锁）
-CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --force-rebuild >/tmp/cc-reingest-lexical.log 2>&1 \
+# ② 词法：force-rebuild（从 DB 重建 Tantivy，绕 --full finalize 死锁族；判据改读 status --json）
+CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --force-rebuild --json >/tmp/cc-reingest-lexical.log 2>&1 \
   || { echo "FAIL: 词法 force-rebuild"; tail -3 /tmp/cc-reingest-lexical.log; exit 1; }
-idxk=$(du -sk "$NEW/index" 2>/dev/null | cut -f1)
-[ "${idxk:-0}" -gt 500 ] || { echo "FAIL: 词法索引空/缺 (${idxk}KB)"; exit 1; }
-echo "词法建好: $(du -sh "$NEW/index" | cut -f1)"
+lex_ok=$(CASS_DATA_DIR="$NEW" "$BIN" status --json 2>/dev/null \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('1' if d.get('index',{}).get('exists') else '0')")
+[ "$lex_ok" = "1" ] || { echo "FAIL: 词法索引未就绪(status.index.exists=false)"; exit 1; }
+echo "词法建好: status.index.exists=true"
 
-# 2b) bge-m3 语义：backfill 循环至 published（proven 路径，resilient，绕过整合 --semantic 的 stall-abort）
-prev=-1; pub=""
-for i in $(seq 1 200); do
-  out=$(CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" models backfill --tier quality --embedder infinity --scheduled --batch-conversations 999999 --json 2>>/tmp/cc-reingest-backfill.err) || { echo "FAIL: backfill errored"; exit 1; }
-  read -r pub off < <(printf '%s' "$out" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('published'),d.get('last_offset'))") || { echo "FAIL: parse"; exit 1; }
-  echo "[semantic iter $i] published=$pub offset=$off"
-  [ "$pub" = "True" ] && break
-  [ "$off" = "$prev" ] && { echo "FAIL: STALLED at $off"; exit 1; }
-  prev=$off
-done
-[ "$pub" = "True" ] || { echo "FAIL: bge-m3 not published"; exit 1; }
+# 2b) 语义：DB 向量域（新世界）。`index --semantic --embedder infinity` = db_vector_catchup
+#     (genesis 播种→洞驱动嵌入→七项审计→事务内切换激活)，一次调用跑完；
+#     `models backfill --tier quality --embedder infinity` 指向同一 catchup，二选一，这里选前者。
+sem_out=$(CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --semantic --embedder infinity --json 2>>/tmp/cc-reingest-semantic.err) \
+  || { echo "FAIL: 语义摄入 index --semantic 出错"; tail -5 /tmp/cc-reingest-semantic.err; exit 1; }
+printf '%s' "$sem_out" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+ok = bool(d.get('success')) and bool(d.get('activated'))
+print('index --semantic: success=%s activated=%s' % (d.get('success'), d.get('activated')))
+sys.exit(0 if ok else 1)
+" || { echo "FAIL: 语义摄入未 activated（success/activated 字段不满足）"; exit 1; }
 
-# 3) serving dir 完整性（词法 index/ + bge-m3 .fsvi + manifest ready）
-[ -d "$NEW/index" ] && [ -f "$NEW/vector_index/index-bge-m3.fsvi" ] || { echo "FAIL: serving dir 不完整（词法/语义缺）"; exit 1; }
-python3 -c "import json,sys;m=json.load(open('$NEW/vector_index/semantic_manifest.json'))['quality_tier'];sys.exit(0 if m.get('ready') and m.get('embedder_id')=='bge-m3' else 1)" \
-  || { echo "FAIL: bge-m3 quality tier 未 ready"; exit 1; }
+# 3) serving 完整性（status --json 为唯一判据 oracle：词法 + 语义 DB 向量域）
+CASS_DATA_DIR="$NEW" "$BIN" status --json > /tmp/cc-reingest-status.json 2>&1
+python3 -c "
+import json
+d = json.load(open('/tmp/cc-reingest-status.json'))
+idx = d.get('index', {})
+dv = d.get('db_vector_domain', {})
+ok = (idx.get('exists') is True
+      and dv.get('active') is True
+      and dv.get('audit_status') == 'passed'
+      and dv.get('error') is None
+      and (dv.get('embedded_count') or 0) > 0)
+import sys
+sys.exit(0 if ok else 1)
+" || { echo "FAIL: serving dir 不完整（index.exists / db_vector_domain 未同时就绪）"; cat /tmp/cc-reingest-status.json; exit 1; }
+echo "serving 完整性通过：index.exists=true, db_vector_domain.active=true/audit=passed"
 
-# 4) 召回门 ≥0.55（FAIL 则不 swap）
-CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" python3 "$RECALL" "$BIN" || { echo "FAIL: 召回门未过，不 swap"; exit 1; }
-echo "GATE PASSED."
+# 4) 召回门 ≥0.55（退出码四分：0 过/1 回归/2 前置/3 陈旧；非 0 一律不 swap，但只有 1 是真回归）
+set +e
+CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" python3 "$RECALL" "$BIN"
+rc=$?
+set -e
+case "$rc" in
+  0) echo "GATE PASSED." ;;
+  1) echo "FAIL: 召回门回归(semantic relevance@5 退化)，真 regression，不 swap"; exit 1 ;;
+  2) echo "HOLD: 召回门 PRECONDITION（环境/索引未就绪，非回归），不 swap，先修前置再重跑"; exit 2 ;;
+  3) echo "HOLD: 召回门 INDEX_STALE（manifest/db 指纹不一致，非回归），不 swap，需重建后重跑"; exit 3 ;;
+  *) echo "FAIL: 召回门未知退出码 rc=$rc，按不可判定处理，不 swap"; exit "$rc" ;;
+esac
 
 # 5) swap（仅 SWAP=1）。老库已在步骤1另备份，此处再留一份 .swapped 双保险。
 #    并发安全：全脚本持全局写锁 → index-pull/另一次 reingest 不能并发写 canonical（codex P1#1 writer 竞争已堵）。
 #    残留：两次 mv 间 canonical 短暂不存在（亚毫秒），仅影响并发 READER（search）——失败重试即可，不损坏。
 #    单用户 + swap 仅全量重建(罕见/手动)，不值得为此上 renameat2(RENAME_EXCHANGE)。
 if [ "${SWAP:-0}" = "1" ]; then
-  [ -d "$CANON" ] && mv "$CANON" "$CANON.0.6.13.bak.swapped.$(date +%Y%m%d-%H%M%S)"
+  [ -d "$CANON" ] && mv "$CANON" "$CANON.$BIN_VERSION.bak.swapped.$(date +%Y%m%d-%H%M%S)"
   mv "$NEW" "$CANON"
-  CASS_DATA_DIR="$CANON" "$BIN" status --json | python3 -c "import sys,json;print('canon opened:',json.load(sys.stdin).get('database',{}).get('opened'))"
-  echo "OK: swapped -> $CANON 现为 0.6.17 fork 库"
+  CASS_DATA_DIR="$CANON" "$BIN" status --json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+opened = d.get('database', {}).get('opened')
+dv = d.get('db_vector_domain', {})
+print('canon opened:', opened, '| db_vector_domain.active:', dv.get('active'))
+"
+  echo "OK: swapped -> $CANON 现为 $BIN_VERSION fork 库"
 else
   echo "READY TO SWAP: 召回门已过。带 SWAP=1 再跑一次执行 swap，或手动 mv。"
 fi
