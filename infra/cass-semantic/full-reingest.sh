@@ -12,6 +12,17 @@
 #   - 备份文件名改读 `$BIN --version` 动态生成，不再硬编码 0.6.13。
 #   - 新增硬前置：候选二进制版本 + status schema 断言、NEW 目录必须为空、sources 快照留痕。
 #
+# v2.3 变更（PR4 T13：reingest 隔离与可核验，伴随子 PR）：
+#   - 新 env `REINGEST_LOG_ROOT`（缺省 /tmp）：所有 cc-reingest-* 日志与 mktemp -d 落到其下，
+#     使沙盒/隔离跑不再散落到共享 /tmp。
+#   - 新 env `RECALL_ARGS`（缺省空）：透传给召回门 run.py 的额外参数。
+#   - 锁竞争失败改 `exit 75`（EX_TEMPFAIL，可重试的临时失败），不再假装成功退出 0。
+#   - 开场打印一行 JSON（run_id/bin/exec_bin/bin_sha256/canon/new/lock/log_root/mirror_home）到
+#     stdout 与 `$REINGEST_LOG_ROOT/reingest-run.json`；哈希对象是真执行二进制
+#     `${CASS_CAND_BIN:-$BIN}`（经 wrapper 时 `$BIN` 是 wrapper 本身）。
+#   - 终态哨兵行 `READY TO SWAP run_id=<id>` / `SWAPPED run_id=<id>`；
+#     每遍摄入结束打印 `PASS <mirror|live> conversations=<n>`，供外部脚本核验无需解析散文日志。
+#
 # v2.2 变更：摄入两遍改为等 --full 自然退出（去掉「稳定即 kill」探停，它会误杀第二遍），并断言收尾汇总存在。
 #
 # v2.1 变更：
@@ -38,8 +49,29 @@ BIN="${CASS_BIN:-$HOME/.local/bin/cass-infinity}"
 RECALL="${RECALL_RUN:-$HOME/projects/cc-workspace/docs/projects/shared-memory/recall-regression/run.py}"
 LOCK="${CASS_WRITE_LOCK:-$HOME/.local/share/.cass-write.lock}"   # 全局写锁，与 index-pull.sh 共用（codex P1#1：防 pull 在 swap 窗口写 canonical）；可覆盖以便沙盒干跑不碰生产锁
 MIN_VERSION="0.6.17"   # 单库新世界（db_vector_domain / index --semantic）的最低版本线
+REINGEST_LOG_ROOT="${REINGEST_LOG_ROOT:-/tmp}"   # T13：所有 cc-reingest-* 日志与 mktemp -d 的落盘根，缺省行为与旧版一致
+RECALL_ARGS="${RECALL_ARGS:-}"   # T13：透传给召回门 run.py 的额外参数，缺省空
+mkdir -p "$REINGEST_LOG_ROOT"
 
-exec 9>"$LOCK"; flock -n 9 || { echo "another cass write holds lock (reingest/pull)"; exit 0; }
+exec 9>"$LOCK"; flock -n 9 || { echo "another cass write holds lock (reingest/pull)"; exit 75; }   # EX_TEMPFAIL：锁竞争是可重试的临时失败，不再假装成功退出
+
+# T13 interface④：开场留痕——run_id、二者二进制身份（wrapper 时 $BIN 是 wrapper，真执行对象是 exec_bin）、
+# canon/new 目录、锁与日志根、mirror_home，一行 JSON 落 stdout 与 reingest-run.json 供事后核验。
+RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"
+EXEC_BIN="${CASS_CAND_BIN:-$BIN}"
+BIN_SHA256="$(sha256sum "$EXEC_BIN" | awk '{print $1}')"
+CANON_REAL="$(realpath -m "$CANON")"
+NEW_REAL="$(realpath -m "$NEW")"
+python3 -c '
+import json, sys
+run_id, bin_, exec_bin, bin_sha256, canon, new, lock, log_root, mirror_home = sys.argv[1:10]
+print(json.dumps({
+    "run_id": run_id, "bin": bin_, "exec_bin": exec_bin, "bin_sha256": bin_sha256,
+    "canon": canon, "new": new, "lock": lock, "log_root": log_root, "mirror_home": mirror_home,
+}))
+' "$RUN_ID" "$BIN" "$EXEC_BIN" "$BIN_SHA256" "$CANON_REAL" "$NEW_REAL" "$LOCK" "$REINGEST_LOG_ROOT" "${MIRROR_HOME:-}" \
+  | tee "$REINGEST_LOG_ROOT/reingest-run.json"
+
 curl -sf -m5 "$URL/health" >/dev/null || { echo "FAIL: Infinity down"; exit 2; }
 
 # 0a) 硬前置①：候选二进制必须是「单库新世界」版本，老二进制直接拒跑
@@ -49,7 +81,7 @@ if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$BIN_VERSION" | sort -V | head -1)" !=
   echo "FAIL: $BIN 版本 $BIN_VERSION < $MIN_VERSION，拒跑（老二进制没有 db_vector_domain / index --semantic）"
   exit 1
 fi
-PROBE_DIR="$(mktemp -d)"
+PROBE_DIR="$(mktemp -d "$REINGEST_LOG_ROOT/cc-reingest-probe.XXXXXX")"
 trap 'rm -rf "$PROBE_DIR"' EXIT
 CASS_DATA_DIR="$PROBE_DIR" "$BIN" status --json 2>/dev/null \
   | python3 -c "import sys,json; sys.exit(0 if 'db_vector_domain' in json.load(sys.stdin) else 1)" \
@@ -63,9 +95,9 @@ if [ -e "$NEW" ] && [ -n "$(ls -A "$NEW" 2>/dev/null)" ]; then
 fi
 
 # 0c) sources 快照留痕（只读，不改配置；语料排除项由二进制+源配置负责，这里只存证）
-"$BIN" sources list --json > /tmp/cc-reingest-sources-snapshot.json 2>&1 \
+"$BIN" sources list --json > "$REINGEST_LOG_ROOT/cc-reingest-sources-snapshot.json" 2>&1 \
   || echo "警告：sources list 快照失败（不阻断，继续）"
-echo "sources 快照 -> /tmp/cc-reingest-sources-snapshot.json"
+echo "sources 快照 -> $REINGEST_LOG_ROOT/cc-reingest-sources-snapshot.json"
 
 # 1) 备份老库（回滚后路；幂等：当日已备份则跳过）
 BK="$CANON.$BIN_VERSION.bak.$(date +%Y%m%d)"
@@ -95,7 +127,7 @@ conv_count() {
 ingest_pass() {
   local LABEL="$1"
   rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true
-  CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --full --json >"/tmp/cc-reingest-ingest-$LABEL.log" 2>&1 &
+  CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --full --json >"$REINGEST_LOG_ROOT/cc-reingest-ingest-$LABEL.log" 2>&1 &
   local ING=$!
   # v2.2：不再「稳定即 kill」——第二遍(live)对已入库文件重扫时 conv 数长时间不变，探停会在 24s 内误杀
   #        --full（2026-09-03 08:22 生产实证：live 遍 0 新会话、日志止于 progress 事件）；mirror 遍同样被截断。
@@ -107,12 +139,13 @@ ingest_pass() {
     echo "[$LABEL] 进行中: $cur conv $(date +%H:%M:%S)"
   done
   wait "$ING" || ing_rc=$?
-  [ "$ing_rc" = "0" ] || { echo "FAIL: index --full[$LABEL] 退出码 $ing_rc"; tail -3 "/tmp/cc-reingest-ingest-$LABEL.log"; exit 1; }
-  grep -q '"total_conversations"' "/tmp/cc-reingest-ingest-$LABEL.log" \
+  [ "$ing_rc" = "0" ] || { echo "FAIL: index --full[$LABEL] 退出码 $ing_rc"; tail -3 "$REINGEST_LOG_ROOT/cc-reingest-ingest-$LABEL.log"; exit 1; }
+  grep -q '"total_conversations"' "$REINGEST_LOG_ROOT/cc-reingest-ingest-$LABEL.log" \
     || { echo "FAIL: index --full[$LABEL] 日志无收尾汇总（可能被外部中断）"; exit 1; }
   ncv=$(conv_count)
   [ "${ncv:-0}" -gt 0 ] || { echo "FAIL: 摄入无数据[$LABEL]"; exit 1; }
   echo "摄入完成[$LABEL]: $ncv conv（--full 自然退出，收尾汇总在）"
+  echo "PASS $LABEL conversations=$ncv"
   rm -f "$NEW/index-run.lock" "$NEW/index-run.lock.meta" 2>/dev/null || true   # 清被杀 --full 的残留锁
 }
 
@@ -159,8 +192,8 @@ else
 fi
 
 # ② 词法：force-rebuild（从 DB 重建 Tantivy，绕 --full finalize 死锁族；判据改读 status --json）
-CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --force-rebuild --json >/tmp/cc-reingest-lexical.log 2>&1 \
-  || { echo "FAIL: 词法 force-rebuild"; tail -3 /tmp/cc-reingest-lexical.log; exit 1; }
+CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --force-rebuild --json >"$REINGEST_LOG_ROOT/cc-reingest-lexical.log" 2>&1 \
+  || { echo "FAIL: 词法 force-rebuild"; tail -3 "$REINGEST_LOG_ROOT/cc-reingest-lexical.log"; exit 1; }
 lex_ok=$(CASS_DATA_DIR="$NEW" "$BIN" status --json 2>/dev/null \
   | python3 -c "import sys,json;d=json.load(sys.stdin);print('1' if d.get('index',{}).get('exists') else '0')")
 [ "$lex_ok" = "1" ] || { echo "FAIL: 词法索引未就绪(status.index.exists=false)"; exit 1; }
@@ -169,8 +202,8 @@ echo "词法建好: status.index.exists=true"
 # 2b) 语义：DB 向量域（新世界）。`index --semantic --embedder infinity` = db_vector_catchup
 #     (genesis 播种→洞驱动嵌入→七项审计→事务内切换激活)，一次调用跑完；
 #     `models backfill --tier quality --embedder infinity` 指向同一 catchup，二选一，这里选前者。
-sem_out=$(CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --semantic --embedder infinity --json 2>>/tmp/cc-reingest-semantic.err) \
-  || { echo "FAIL: 语义摄入 index --semantic 出错"; tail -5 /tmp/cc-reingest-semantic.err; exit 1; }
+sem_out=$(CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" "$BIN" index --semantic --embedder infinity --json 2>>"$REINGEST_LOG_ROOT/cc-reingest-semantic.err") \
+  || { echo "FAIL: 语义摄入 index --semantic 出错"; tail -5 "$REINGEST_LOG_ROOT/cc-reingest-semantic.err"; exit 1; }
 printf '%s' "$sem_out" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -180,10 +213,15 @@ sys.exit(0 if ok else 1)
 " || { echo "FAIL: 语义摄入未 activated（success/activated 字段不满足）"; exit 1; }
 
 # 3) serving 完整性（status --json 为唯一判据 oracle：词法 + 语义 DB 向量域）
-CASS_DATA_DIR="$NEW" "$BIN" status --json > /tmp/cc-reingest-status.json 2>&1
+# T13 既有缺陷经 wrapper 首次暴露：此前 `2>&1` 把 stderr 合流进这份要被当 JSON 解析的文件——
+# 直接 cass-infinity 从不往 stderr 打诊断行，问题一直潜伏；经 wrapper（会往 stderr 打一行
+# {db_path,home,binary_sha256,...} 诊断 JSON）跑就必崩：文件变两段 JSON 拼接，json.load 报
+# "Extra data"。改为 stdout/stderr 分流，不用 2>/dev/null 吞掉——wrapper 的诊断行是 T12
+# 核对 home/binary_sha256 的证据，单独落盘保留。
+CASS_DATA_DIR="$NEW" "$BIN" status --json > "$REINGEST_LOG_ROOT/cc-reingest-status.json" 2>"$REINGEST_LOG_ROOT/cc-reingest-status.stderr"
 python3 -c "
 import json
-d = json.load(open('/tmp/cc-reingest-status.json'))
+d = json.load(open('$REINGEST_LOG_ROOT/cc-reingest-status.json'))
 idx = d.get('index', {})
 dv = d.get('db_vector_domain', {})
 ok = (idx.get('exists') is True
@@ -193,12 +231,12 @@ ok = (idx.get('exists') is True
       and (dv.get('embedded_count') or 0) > 0)
 import sys
 sys.exit(0 if ok else 1)
-" || { echo "FAIL: serving dir 不完整（index.exists / db_vector_domain 未同时就绪）"; cat /tmp/cc-reingest-status.json; exit 1; }
+" || { echo "FAIL: serving dir 不完整（index.exists / db_vector_domain 未同时就绪）"; cat "$REINGEST_LOG_ROOT/cc-reingest-status.json"; exit 1; }
 echo "serving 完整性通过：index.exists=true, db_vector_domain.active=true/audit=passed"
 
 # 4) 召回门 ≥0.55（退出码四分：0 过/1 回归/2 前置/3 陈旧；非 0 一律不 swap，但只有 1 是真回归）
 set +e
-CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" python3 "$RECALL" "$BIN"
+CASS_DATA_DIR="$NEW" CASS_INFINITY_URL="$URL" python3 "$RECALL" "$BIN" $RECALL_ARGS
 rc=$?
 set -e
 case "$rc" in
@@ -224,6 +262,8 @@ dv = d.get('db_vector_domain', {})
 print('canon opened:', opened, '| db_vector_domain.active:', dv.get('active'))
 "
   echo "OK: swapped -> $CANON 现为 $BIN_VERSION fork 库"
+  echo "SWAPPED run_id=$RUN_ID"
 else
   echo "READY TO SWAP: 召回门已过。带 SWAP=1 再跑一次执行 swap，或手动 mv。"
+  echo "READY TO SWAP run_id=$RUN_ID"
 fi
