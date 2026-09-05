@@ -9,6 +9,8 @@ WorkingDirectory=%h/projects/sharedmemory
 EnvironmentFile=%h/projects/sharedmemory/infra/cass-mcp/cass-mcp.env
 ExecStart=%h/.local/bin/uv run python -m cass_mcp.server
 Restart=on-failure
+# uvicorn exits 143 on SIGTERM (graceful stop); declare it clean so `systemctl stop` does not mark the unit failed
+SuccessExitStatus=143
 RestartSec=2
 
 [Install]
